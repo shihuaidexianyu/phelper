@@ -294,6 +294,14 @@ pub(crate) fn mchbar_image() -> Result<Vec<u8>, PlatformError> {
     module_image("PHELPER_INTELMCHBAR", "IntelMCHBAR.bin")
 }
 
+/// PL4 power-limit register, offset into the MCHBAR window. Settled
+/// empirically on 8BAB (M4-mini, 2026-08-26): the sweep anchored on the
+/// RAPL power-unit register at 0x5938 (exact match to MSR 0x606), the
+/// write spike moved this offset and only this offset (0x29 byte2 →
+/// 0x59B0 readback, first 250 ms poll). Same bits-14:0 × power-unit
+/// layout as the MSR 0x610 PL1/PL2 fields.
+pub(crate) const MCHBAR_PL4_OFFSET: u32 = 0x59B0;
+
 /// Decode one power-limit field (bits 14:0, ×unit) — the layout MSR 0x610
 /// uses for PL1/PL2, reused by the MCHBAR power-block scan: candidate PL4
 /// fields share this encoding on Intel client platforms.

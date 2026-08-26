@@ -42,6 +42,14 @@ pub trait ThermalFeed {
     /// (pl1_w, pl2_w, when it was taken). The 0x29 verification channel —
     /// the coordinator reads the telemetry store, never the MSR itself.
     fn power_limits_w(&self) -> Option<(f64, f64, Instant)>;
+    /// Latest PL4 readback via the MCHBAR telemetry collector (0x59B0):
+    /// (pl4_w, when it was taken). None when the IntelMCHBAR channel is
+    /// absent — a 0x29 byte2 write then cannot be readback-verified and
+    /// the coordinator reports that honestly (fail closed, AR-11).
+    /// Default None: feeds without the channel need no change.
+    fn pl4_w(&self) -> Option<(f64, Instant)> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,11 +118,25 @@ impl SafetySupervisor {
                 if caps.power_limits != Support::Experimental {
                     return Err(ControlError::Unsupported);
                 }
-                if l.pl4_w != 0 || l.cpu_gpu_concurrent_w != 0 {
+                if l.cpu_gpu_concurrent_w != 0 {
                     return Err(ControlError::UnsafeRequest {
-                        reason: "pl4/cpu_gpu_concurrent writes are unverified on 8BAB; \
+                        reason: "cpu_gpu_concurrent (0x29 byte3) has NO readback channel and no \
+                                 restore semantics on 8BAB — permanently rejected; \
                                  set 0 (= leave unchanged, wire 0xFF)"
                             .into(),
+                    });
+                }
+                // PL4 (0x29 byte2, M4.1): explicit writes are verified via the
+                // MCHBAR 0x59B0 readback. Envelope: 30 W (plausible floor) up
+                // to the FACTORY value 200 W (SDD 0x28 byte5) — a protection
+                // limit is never raised above what HP shipped. 0 = not
+                // requested (wire 0xFF NO_CHANGE).
+                if l.pl4_w != 0 && !(30..=200).contains(&l.pl4_w) {
+                    return Err(ControlError::UnsafeRequest {
+                        reason: format!(
+                            "PL4 {}W outside envelope 30..=200 (factory ceiling, SDD byte5)",
+                            l.pl4_w
+                        ),
                     });
                 }
                 // 13900HX envelope: PL1 15..=130 (default 55), PL2 15..=157
@@ -669,10 +691,21 @@ mod tests {
         bad = pl(90, 45); // PL2 < PL1 (kernel invariant)
         assert!(matches!(check(bad), Err(ControlError::UnsafeRequest { .. })));
         bad = pl(45, 90);
-        bad.pl4_w = 200; // pl4 unverified
+        bad.cpu_gpu_concurrent_w = 65; // cc: no readback, no restore — rejected forever
+        assert!(matches!(check(bad), Err(ControlError::UnsafeRequest { .. })));
+
+        // PL4 ladder (M4.1): 0 = NO_CHANGE pass; 30..=200 (factory ceiling)
+        // pass; outside → UnsafeRequest.
+        let mut ok = pl(45, 90);
+        ok.pl4_w = 30;
+        check(ok).unwrap();
+        ok.pl4_w = 200;
+        check(ok).unwrap();
+        bad = pl(45, 90);
+        bad.pl4_w = 29; // below plausible floor
         assert!(matches!(check(bad), Err(ControlError::UnsafeRequest { .. })));
         bad = pl(45, 90);
-        bad.cpu_gpu_concurrent_w = 65; // cc unverified
+        bad.pl4_w = 201; // ABOVE factory — never raise a protection limit
         assert!(matches!(check(bad), Err(ControlError::UnsafeRequest { .. })));
     }
 

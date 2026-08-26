@@ -11,7 +11,7 @@
 
 use phelper_domain::error::HpWmiError;
 use phelper_domain::hp::{FanTable, FanTableEntry, SystemDesignData};
-use phelper_domain::policy::{FanLevels, GpuPlatformPolicy, MuxMode, ThermalMode};
+use phelper_domain::policy::{CpuPowerLimits, FanLevels, GpuPlatformPolicy, MuxMode, ThermalMode};
 
 /// "SECU" little-endian (hp-wmi.c args->signature = 0x55434553).
 pub(crate) const SIGNATURE: u32 = u32::from_le_bytes(*b"SECU");
@@ -314,13 +314,25 @@ pub(crate) fn encode_power_limits_swapped(pl1_w: u8, pl2_w: u8) -> [u8; 4] {
 
 /// THE 0x29 encoder for 8BAB — byte order settled on-device by the M3 S2
 /// arbitration (2026-08-26, double A/B): **byte0 = PL2, byte1 = PL1** on
-/// this firmware, the OPPOSITE of the kernel struct. pl4/cc always go out
-/// as 0xFF (NO_CHANGE): their explicit-write behavior was not part of the
-/// arbitration, so they stay unwritable (§57). Do not "fix" this to the
-/// kernel order — that is exactly the trap §25's mandatory three-step
-/// verification exists for.
-pub(crate) fn encode_power_limits(pl1_w: u8, pl2_w: u8) -> [u8; 4] {
-    encode_power_limits_swapped(pl1_w, pl2_w)
+/// this firmware, the OPPOSITE of the kernel struct. Do not "fix" this to
+/// the kernel order — that is exactly the trap §25's mandatory three-step
+/// verification exists for. cc always goes out as 0xFF (NO_CHANGE): it has
+/// no readback channel and no restore semantics — permanently unwritable.
+pub(crate) fn encode_power_limits(l: &CpuPowerLimits) -> [u8; 4] {
+    [
+        l.pl2_w,
+        l.pl1_w,
+        // byte2 = PL4: 0 means "not requested" in the domain → NO_CHANGE on
+        // the wire (M4.1: explicit pl4 writes are verified via MCHBAR 0x59B0
+        // readback; the 0x00 DEFAULT sentinel is never emitted — proven
+        // ineffective on this firmware).
+        if l.pl4_w == 0 {
+            POWER_LIMIT_NO_CHANGE
+        } else {
+            l.pl4_w
+        },
+        POWER_LIMIT_NO_CHANGE,
+    ]
 }
 
 /// Restore firmware default PL1/PL2: `{0x00, 0x00, 0xFF, 0xFF}` — the exact
@@ -463,10 +475,20 @@ mod tests {
 
     #[test]
     fn power_limits_encoders() {
+        fn pl(pl1_w: u8, pl2_w: u8, pl4_w: u8) -> CpuPowerLimits {
+            CpuPowerLimits {
+                pl1_w,
+                pl2_w,
+                pl4_w,
+                cpu_gpu_concurrent_w: 0,
+            }
+        }
         assert_eq!(encode_power_limits_kernel(45, 90), [45, 90, 0xFF, 0xFF]);
         assert_eq!(encode_power_limits_swapped(45, 90), [90, 45, 0xFF, 0xFF]);
-        // The canonical encoder is the S2-arbitrated one (swapped on 8BAB).
-        assert_eq!(encode_power_limits(45, 90), [90, 45, 0xFF, 0xFF]);
+        // The canonical encoder is the S2-arbitrated one (swapped on 8BAB);
+        // pl4_w = 0 → byte2 NO_CHANGE, nonzero → explicit PL4 (M4.1).
+        assert_eq!(encode_power_limits(&pl(45, 90, 0)), [90, 45, 0xFF, 0xFF]);
+        assert_eq!(encode_power_limits(&pl(45, 90, 150)), [90, 45, 150, 0xFF]);
         assert_eq!(encode_power_limits_restore_default(), [0, 0, 0xFF, 0xFF]);
         assert_eq!(encode_power_limits_pl4_only(150), [0xFF, 0xFF, 150, 0xFF]);
     }

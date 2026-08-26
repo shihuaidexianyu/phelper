@@ -1160,7 +1160,7 @@ insize    : 本机 Zero 模式（Size=0）读正常（hp-wmi.c zero_if_sup 行�
 | `0x26` | Max Fan Get | **不可靠，诊断专用**：内核标记此命令在 Victus S 系固件误报（commit 46be1453e6），并已停止调用；max-fan 状态一律由应用自追踪（ObservedValue::TrustedWrite） |
 | `0x27` | Max Fan Set | Very High |
 | `0x28` | System Design Data | Very High（8BAB 实测 ✓） |
-| `0x29` | CPU / Platform Power Limits | **字节序已定案**（byte0=PL2/byte1=PL1，见 §25），三步验证通过，仍 Experimental 门禁 |
+| `0x29` | CPU / Platform Power Limits | **字节序已定案**（byte0=PL2/byte1=PL1，见 §25），三步验证通过；byte2=PL4 亦已写+回读验证（MCHBAR 0x59B0，M4.1 进控制面）；仅 byte3=cc 永久拒绝；仍 Experimental 门禁 |
 | `0x2D` | Fan Level Get | High（8BAB 实测 ✓） |
 | `0x2E` | Fan Level Set | High |
 | `0x2F` | Fan Table Get | High（8BAB 实测 ✓） |
@@ -1254,13 +1254,15 @@ struct victus_power_limits {
 
 **byte2=PL4 回读通道已定案（2026-08-26，M4-mini 纯读探针 + byte2 写 spike）**：PL4 无架构 MSR，但 MCHBAR 窗口（签名 IntelMCHBAR 模块，源码级无写 ioctl，基址 0xFEDC0000）内含 RAPL MMIO 块——**0x5938 = 功耗单位寄存器**（0xA0E03，与 MSR 0x606 精确一致，锚点），**0x59B0 = PL4 寄存器**（布局 bits 14:0 × 1/8W）。spike 证据：写 `{FF,FF,96,FF}`（PL4=150W）→ 首个 250ms 轮询 0x59B0 = 150.0W；**同 poll 0x610 全程 55/130 不动——0xFF NO_CHANGE 在字节 0/1 上语义证实**（M3 未单独隔离验证的附带空白就此补齐）；显式写回 200W → 0x59B0 = 200.0W（恢复确认）。"0x59A0 = 0x610 镜像"的文献假设在本平台被证伪（读出 130/130）——布局结论全部来自实机扫描。注意：0x59B0 位于 0x59A0 qword 之外，MMIO 读 PL4 必须用 0x59B0 dword。PL4 证据等级 = **写+回读 Verified，瞬态跳闸行为未验证**（超出 250ms 采样能力，如实标注）；cc（byte3）仍无任何回读通道 + 恢复语义无解 → 维持永久拒绝。
 
+**byte2 已进入控制面（2026-08-26，M4.1）**：`power-limits --pl1 W --pl2 W [--pl4 W]`（pl4 可选，30..=200——上限 = SDD byte5 出厂天花板，保护性限制永不高于出厂值；省略 = 0xFF NO_CHANGE）。验证升级为**双通道收敛**：0x610（pl1/pl2）+ MCHBAR 0x59B0（pl4，仅在写入请求了 pl4 时参与裁决；MCHBAR 通道缺失时 pl4 写永不收敛 → 诚实 Failed，绝不静默跳过 byte2）。基线捕获含 pl4（通道缺失记 0 = "未测量" → 恢复时 byte2 保持 NO_CHANGE：绝不写回一个从未测量过的字段）；keepalive 重断言经 ObservedState 自动携带 byte2；遥测新指标 `cpu.pl4_w`（250ms，与 0x610 同 collector、IntelMCHBAR 模块缺失即缺测、不抖动 provider）。**M4.1 HIL**：三字节写 45/90/150 → 双通道 1013ms Verified；61s 处 keepalive 重断言（含 byte2）；停机恢复三字节基线 → 遥测回读 55/130/200 确认。**附带观察（如实记录，机制未定性）**：无自定义功耗墙时本机 0x610 并非恒定——实测 55/130 ↔ 90/90 之间出现过一次约 20 分钟的自发漂移（无 phelper 写入），随后自行回落；这正印证了"写入前捕获活基线 + 显式恢复 + 持有时 keepalive 重断言"三步设计的必要性，切勿在代码里硬编码 55/130。
+
 **`{0,0,FF,FF}`（`HP_POWER_LIMIT_DEFAULT`）恢复写在本固件 500ms 内不生效**（仲裁实验中实测：写后 0x610 保持原值）。因此停机恢复 = 显式写回首次写入前捕获的 0x610 基线，绝不依赖 0x00。
 
 **三步验证已于 M3 全部通过（HIL-4）**：0x29 写 → 0x610 回读 Verified → 32 线程 RAPL 负载 200s：持续段被钳在均值 44W 长达 160s（PL1=45 生效；默认 55W 基线 settle ~53-55W），turbo 段封顶 ~90-100W（PL2=90；默认峰值 108W）→ 停机恢复 55/130（journal rc=0 + 遥测回读）。
 
 **固件 clawback 风险（R1）**：OmenMon issue #37 在真实 8BAB 上记录——OGH 退出后 CPU 被锁 55W、风扇锁自动。对策：KeepAliveService 在 dirty 期间每次心跳重断言 0x29（保险），停机恢复写回基线。**实测（HIL-5）**：Balanced 模式下 300s hold 期间经历完整拔电→电池→回插，0x610 全程平在写入值，无任何跌落——内核 victus 的 AC/DC 重实际化是 Performance 模式专属路径，本机 Balanced 下不发生；0x29 也不像风扇/thermal 那样有 ~120s clawback。
 
-0x29 仍永久保持 `Support::Experimental` + cargo feature 双门禁：三步验证证明了 PL1/PL2 写-读-执行闭环，但 pl4/cc 未验证、长期固件行为（重启持久性等）未表征，稳定 UI 不出现。
+0x29 仍永久保持 `Support::Experimental` + cargo feature 双门禁：三步验证证明了 PL1/PL2 写-读-执行闭环、M4.1 补上了 PL4 写-回读闭环（瞬态跳闸行为仍未验证），但 cc 无任何回读通道（永久拒绝）、长期固件行为（重启持久性、默认值自发漂移的机制）未表征，稳定 UI 不出现。
 
 验证手段（Phase 2 的**强制门禁**，不是可选项）：
 
@@ -2828,6 +2830,52 @@ victus 重实际化是 Performance 专属路径），keepalive 重断言留作�
 
 明确未做（留 M4+）：MUX 写（需重启）、profiles、风扇曲线、pl4/cc 显式
 写（未验证）、MUX/0x29 稳定 UI。
+
+---
+
+## Phase 2.6 — M4-mini / M4.1 PL4 专题（已完成，8BAB 实机验证）
+
+动机：用户原则——"精细控制意味着我可以不用，但是我知道我能操纵"。
+能力放行的门槛是**验证**而非对用途的判断。PL4 因此获得与 PL1/PL2 相同
+的 §57 五阶段铺开：参考扫描 → 资产 → 纯读探针 → 写 spike → 控制面。
+
+```text
+M4-mini（回读通道定案，§57 Stage 1-2）：
+  签名 IntelMCHBAR 模块（PawnIO.Modules 0.2.10，源码级无写 ioctl，
+  Raptor Lake 在 CPU 白名单，窗口 0x10000）→ 资产 assets/pawnio/
+  IntelMCHBAR.bin；AR-09 修订为"只读签名模块基础设施 + 按操作白名单"
+  （write_mchbar 列入禁止清单，信任模型不变）
+  mchbar-probe（dev 纯读）：基址 0xFEDC0000；"0x59A0=0x610 镜像"文献
+  假设证伪（读 130/130）；0x5938=0xA0E03 锚定功耗单位寄存器 →
+  0x59B0=PL4 寄存器（bits 14:0 × 1/8W，出厂 200W = SDD byte5）
+  pl4-spike（dev，只降不升）：写 {FF,FF,96,FF} → 0x59B0=150.0W 首个
+  轮询即中；0x610 全程不动（0xFF NO_CHANGE 语义隔离证实）；显式
+  写回 200W 确认；双模块共存（IntelMSR+IntelMCHBAR 分句柄同询）实证
+M4.1（控制面，§57 Stage 3）：
+  编码器 byte2 = pl4_w（0 = NO_CHANGE；cc 维持永久拒绝）；
+  safety 区间 30..=200（上限 = 出厂天花板：保护性限制永不高于出厂值）；
+  遥测 cpu.pl4_w（250ms，PawnioCollector 加载第二模块；模块缺失即
+  缺测，永不抖动 provider——EPP1 同款规则）；
+  协调器：验证升级为双通道（0x610 + 0x59B0；pl4 仅在请求时参与裁决，
+  通道缺失 → 诚实 Failed 绝不静默跳过 byte2）；基线捕获含 pl4（0 =
+  未测量 → 恢复时 byte2 保持 NO_CHANGE）；keepalive 重断言经
+  ObservedState 自动携带 byte2；停机恢复三字节显式写回；
+  CLI power-limits 增加 [--pl4 W]（30..=200 引擎启动前校验）
+```
+
+M4.1 HIL（提权，2026-08-26）：三字节写 45/90/150 → 双通道 1013ms
+Verified（步骤名 "verify power limits (MSR 0x610 + MCHBAR 0x59B0)"）；
+61s 处 keepalive 重断言（0x29，含 byte2）；hold 70s 到期 → 优雅恢复
+三字节基线 → 遥测回读 55/130/200 确认；负向 --pl4 29/201 → 引擎启动
+前拒绝；默认编译无 power-limits 子命令。**附带观察**：无自定义功耗墙
+时本机 0x610 曾自发漂移 55/130 → 90/90 约 20 分钟后自行回落（无
+phelper 写入；机制未定性，如实记录）——印证基线捕获/显式恢复/keepalive
+三步设计，切勿硬编码默认值。
+单元测试 70（默认）/ 78（全 feature）全绿，clippy 双配置零警告。
+
+PL4 证据等级（如实标注）：写+回读 Verified；**瞬态跳闸行为未验证**
+（PL4 是 μs 级保护限制，250ms 遥测无法观测其执行）——0x29 维持永久
+Experimental 门禁的理由之一。
 
 ---
 

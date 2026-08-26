@@ -201,11 +201,14 @@ pub(crate) struct ControlCoordinator<H, P, F> {
     /// shutdown (only written back when this session changed the policy).
     gpu_policy_startup: Option<GpuPlatformPolicy>,
     gpu_policy_dirty: bool,
-    /// 0x610 feed values captured right BEFORE this session's first 0x29
-    /// write — the shutdown restore point. (The {0,0,FF,FF} DEFAULT write
-    /// was observed NOT to take effect on this firmware within 500 ms in
-    /// the S2 spike, so restore = explicit write-back of captured values.)
-    power_limits_baseline: Option<(u8, u8)>,
+    /// 0x610 + MCHBAR feed values captured right BEFORE this session's
+    /// first 0x29 write — the shutdown restore point (pl1, pl2, pl4).
+    /// (The {0,0,FF,FF} DEFAULT write was observed NOT to take effect on
+    /// this firmware within 500 ms in the S2 spike, so restore = explicit
+    /// write-back of captured values. pl4 = 0 means the MCHBAR channel was
+    /// absent at capture time → byte2 stays NO_CHANGE on restore: never
+    /// touch a field we never measured.)
+    power_limits_baseline: Option<(u8, u8, u8)>,
     power_limits_dirty: bool,
 }
 
@@ -794,17 +797,28 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 },
             };
         };
-        let before = match self.feed.power_limits_w() {
+        let mut before = match self.feed.power_limits_w() {
             Some((p1, p2, at)) => format!(
                 "pl1={p1:.1}W pl2={p2:.1}W (0x610, {:.1}s ago)",
                 at.elapsed().as_secs_f64()
             ),
             None => "0x610 readback unavailable".to_string(),
         };
+        if let Some((p4, at)) = self.feed.pl4_w() {
+            before.push_str(&format!(
+                "; pl4={p4:.1}W (MCHBAR, {:.1}s ago)",
+                at.elapsed().as_secs_f64()
+            ));
+        }
         if self.power_limits_baseline.is_none()
             && let Some((p1, p2, _)) = self.feed.power_limits_w()
         {
-            self.power_limits_baseline = Some((p1.round() as u8, p2.round() as u8));
+            let p4 = self
+                .feed
+                .pl4_w()
+                .map(|(v, _)| v.round() as u8)
+                .unwrap_or(0);
+            self.power_limits_baseline = Some((p1.round() as u8, p2.round() as u8, p4));
         }
         let written_at = Instant::now();
         match hp.set_power_limits(l) {
@@ -831,7 +845,11 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                     self.power_limits_dirty = true;
                 }
                 steps.push(StepOutcome {
-                    step: "verify power limits (MSR 0x610)".into(),
+                    step: if l.pl4_w != 0 {
+                        "verify power limits (MSR 0x610 + MCHBAR 0x59B0)".into()
+                    } else {
+                        "verify power limits (MSR 0x610)".into()
+                    },
                     backend: "pawnio telemetry feed".into(),
                     firmware_return: None,
                     before: Some(before.clone()),
@@ -856,7 +874,10 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
     }
 
     /// Runbook step 2: poll the 0x610 telemetry feed (250 ms cadence) until
-    /// a sample TAKEN AFTER the write sits within ±1 W of the targets.
+    /// a sample TAKEN AFTER the write sits within ±1 W of the targets. PL4
+    /// joins the verdict only when the write requested it (pl4_w != 0); a
+    /// missing MCHBAR channel then never converges — honest Failed, not a
+    /// silent skip of byte2.
     fn verify_power_limits(&self, l: CpuPowerLimits, written_at: Instant) -> Verification {
         let mut last = String::new();
         for _ in 0..self.verify_polls {
@@ -868,17 +889,37 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                         last.push_str(" (pre-write sample)");
                         continue;
                     }
-                    if (p1 - f64::from(l.pl1_w)).abs() <= 1.0
-                        && (p2 - f64::from(l.pl2_w)).abs() <= 1.0
-                    {
-                        return Verification::Verified;
+                    let pl12_ok = (p1 - f64::from(l.pl1_w)).abs() <= 1.0
+                        && (p2 - f64::from(l.pl2_w)).abs() <= 1.0;
+                    if l.pl4_w == 0 {
+                        if pl12_ok {
+                            return Verification::Verified;
+                        }
+                        continue;
+                    }
+                    match self.feed.pl4_w() {
+                        Some((p4, p4_at)) => {
+                            last.push_str(&format!(" pl4={p4:.1}W"));
+                            if p4_at < written_at {
+                                last.push_str(" (pre-write pl4 sample)");
+                                continue;
+                            }
+                            if pl12_ok && (p4 - f64::from(l.pl4_w)).abs() <= 1.0 {
+                                return Verification::Verified;
+                            }
+                        }
+                        None => last.push_str(" pl4 feed unavailable"),
                     }
                 }
                 None => last = "0x610 feed unavailable".into(),
             }
         }
         Verification::Failed {
-            expected: format!("pl1={}W pl2={}W", l.pl1_w, l.pl2_w),
+            expected: if l.pl4_w != 0 {
+                format!("pl1={}W pl2={}W pl4={}W", l.pl1_w, l.pl2_w, l.pl4_w)
+            } else {
+                format!("pl1={}W pl2={}W", l.pl1_w, l.pl2_w)
+            },
             actual: last,
         }
     }
@@ -1339,25 +1380,29 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 }
             }
             if self.power_limits_dirty
-                && let Some((b1, b2)) = self.power_limits_baseline
+                && let Some((b1, b2, b4)) = self.power_limits_baseline
             {
                 let baseline = CpuPowerLimits {
                     pl1_w: b1,
                     pl2_w: b2,
-                    pl4_w: 0,
+                    pl4_w: b4,
                     cpu_gpu_concurrent_w: 0,
                 };
                 match hp.set_power_limits(baseline) {
                     Ok(()) => steps.push(StepOutcome {
-                        step: "restore power limits (0x610 baseline)".into(),
+                        step: "restore power limits (captured baseline)".into(),
                         backend: "hp-wmi 0x29".into(),
                         firmware_return: Some("rc=0".into()),
                         before: Some("restore".into()),
-                        after: Some(format!("pl1={b1}W pl2={b2}W")),
+                        after: Some(if b4 != 0 {
+                            format!("pl1={b1}W pl2={b2}W pl4={b4}W")
+                        } else {
+                            format!("pl1={b1}W pl2={b2}W (pl4 untouched)")
+                        }),
                         verification: Verification::TrustedNoReadback,
                     }),
                     Err(e) => steps.push(failed_step(
-                        "restore power limits (0x610 baseline)",
+                        "restore power limits (captured baseline)",
                         "hp-wmi 0x29",
                         &e,
                         "restore".into(),
@@ -1403,13 +1448,13 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 };
             }
             if self.power_limits_dirty
-                && let Some((b1, b2)) = self.power_limits_baseline
+                && let Some((b1, b2, b4)) = self.power_limits_baseline
             {
                 o.power_limits = ObservedValue::TrustedWrite {
                     value: CpuPowerLimits {
                         pl1_w: b1,
                         pl2_w: b2,
-                        pl4_w: 0,
+                        pl4_w: b4,
                         cpu_gpu_concurrent_w: 0,
                     },
                     at: Instant::now(),
@@ -1540,6 +1585,12 @@ impl ThermalFeed for SnapshotFeed {
         let at = pl1.timestamp.min(pl2.timestamp);
         Some((pl1.value.as_f64()?, pl2.value.as_f64()?, at))
     }
+
+    fn pl4_w(&self) -> Option<(f64, Instant)> {
+        let snap = self.telemetry.snapshot();
+        let s = snap.samples.get(&ids::CPU_PL4_W)?;
+        Some((s.value.as_f64()?, s.timestamp))
+    }
 }
 
 #[cfg(test)]
@@ -1573,9 +1624,11 @@ mod tests {
         gpu_policy_pin: Option<GpuPlatformPolicy>,
         power_limits_writes: Vec<CpuPowerLimits>,
         /// When set, a set_power_limits write also moves this shared
-        /// "MSR 0x610" pair — the test's ThermalFeed reads it, simulating
-        /// the firmware applying the write (the verification converges).
-        msr_link: Option<std::sync::Arc<Mutex<(f64, f64)>>>,
+        /// "MSR 0x610 + MCHBAR PL4" triple — the test's ThermalFeed reads
+        /// it, simulating the firmware applying the write (the verification
+        /// converges). pl4 moves only when the write requests it
+        /// (pl4_w != 0) — mirroring the wire-level NO_CHANGE semantics.
+        msr_link: Option<std::sync::Arc<Mutex<(f64, f64, f64)>>>,
     }
 
     impl Default for MockHpState {
@@ -1681,7 +1734,12 @@ mod tests {
             let mut s = self.state();
             s.power_limits_writes.push(l);
             if let Some(link) = &s.msr_link {
-                *link.lock().unwrap() = (f64::from(l.pl1_w), f64::from(l.pl2_w));
+                let mut g = link.lock().unwrap();
+                g.0 = f64::from(l.pl1_w);
+                g.1 = f64::from(l.pl2_w);
+                if l.pl4_w != 0 {
+                    g.2 = f64::from(l.pl4_w);
+                }
             }
             Ok(())
         }
@@ -2124,7 +2182,12 @@ mod tests {
     // ---------------------------- 0x29 power limits (feature-gated) ----
 
     #[cfg(feature = "experimental-hp-power-limits")]
-    struct PlFeed(std::sync::Arc<Mutex<(f64, f64)>>);
+    struct PlFeed {
+        link: std::sync::Arc<Mutex<(f64, f64, f64)>>,
+        /// false = the MCHBAR channel is absent (pl4_w() → None): a pl4
+        /// write can then never verify, and a pl4-less write must not care.
+        has_pl4: bool,
+    }
 
     #[cfg(feature = "experimental-hp-power-limits")]
     impl ThermalFeed for PlFeed {
@@ -2135,19 +2198,25 @@ mod tests {
             Some((FanLevels::new(30, 30), Instant::now()))
         }
         fn power_limits_w(&self) -> Option<(f64, f64, Instant)> {
-            let v = *self.0.lock().unwrap();
+            let v = *self.link.lock().unwrap();
             Some((v.0, v.1, Instant::now()))
+        }
+        fn pl4_w(&self) -> Option<(f64, Instant)> {
+            self.has_pl4
+                .then(|| (*self.link.lock().unwrap()).2)
+                .map(|v| (v, Instant::now()))
         }
     }
 
-    /// Custom rig with a live "MSR 0x610" pair the feed reads; with_link
-    /// wires MockHp's 0x29 writes into it (simulating firmware applying the
-    /// write so verification can converge).
+    /// Custom rig with a live "MSR 0x610 + MCHBAR" triple the feed reads;
+    /// with_link wires MockHp's 0x29 writes into it (simulating firmware
+    /// applying the write so verification can converge).
     #[cfg(feature = "experimental-hp-power-limits")]
     fn start_pl_rig(
         tag: &str,
-        link: std::sync::Arc<Mutex<(f64, f64)>>,
+        link: std::sync::Arc<Mutex<(f64, f64, f64)>>,
         with_link: bool,
+        has_pl4: bool,
     ) -> (ControlHandle, MockHp) {
         let dir = std::env::temp_dir().join(format!(
             "phelper-coord-test-{tag}-{}",
@@ -2164,7 +2233,7 @@ mod tests {
             test_identity(tag),
             Some(hp.clone()),
             MockPpm::default(),
-            PlFeed(link),
+            PlFeed { link, has_pl4 },
             journal_path,
         );
         cfg.verify_poll_interval = Duration::from_millis(5);
@@ -2185,10 +2254,18 @@ mod tests {
     }
 
     #[cfg(feature = "experimental-hp-power-limits")]
+    fn pl4(pl1: u8, pl2: u8, pl4: u8) -> CpuPowerLimits {
+        CpuPowerLimits {
+            pl4_w: pl4,
+            ..pl(pl1, pl2)
+        }
+    }
+
+    #[cfg(feature = "experimental-hp-power-limits")]
     #[test]
     fn power_limits_write_verified_via_0610_feed() {
-        let link = std::sync::Arc::new(Mutex::new((55.0_f64, 130.0_f64)));
-        let (handle, hp) = start_pl_rig("pl-verified", std::sync::Arc::clone(&link), true);
+        let link = std::sync::Arc::new(Mutex::new((55.0_f64, 130.0_f64, 200.0_f64)));
+        let (handle, hp) = start_pl_rig("pl-verified", std::sync::Arc::clone(&link), true, true);
         let o = block(&handle, ControlCommand::SetPowerLimits(pl(45, 90)));
         assert!(matches!(
             o.status,
@@ -2207,8 +2284,8 @@ mod tests {
     #[test]
     fn power_limits_no_convergence_is_honest_failure() {
         // Firmware "ignores" the write: feed never moves off the baseline.
-        let link = std::sync::Arc::new(Mutex::new((55.0_f64, 130.0_f64)));
-        let (handle, hp) = start_pl_rig("pl-noconv", std::sync::Arc::clone(&link), false);
+        let link = std::sync::Arc::new(Mutex::new((55.0_f64, 130.0_f64, 200.0_f64)));
+        let (handle, hp) = start_pl_rig("pl-noconv", std::sync::Arc::clone(&link), false, true);
         let o = block(&handle, ControlCommand::SetPowerLimits(pl(45, 90)));
         assert!(matches!(
             o.status,
@@ -2227,8 +2304,8 @@ mod tests {
     #[cfg(feature = "experimental-hp-power-limits")]
     #[test]
     fn shutdown_restores_power_limits_baseline() {
-        let link = std::sync::Arc::new(Mutex::new((55.0_f64, 130.0_f64)));
-        let (handle, hp) = start_pl_rig("pl-restore", std::sync::Arc::clone(&link), true);
+        let link = std::sync::Arc::new(Mutex::new((55.0_f64, 130.0_f64, 200.0_f64)));
+        let (handle, hp) = start_pl_rig("pl-restore", std::sync::Arc::clone(&link), true, true);
         let o = block(&handle, ControlCommand::SetPowerLimits(pl(45, 90)));
         assert!(matches!(
             o.status,
@@ -2238,18 +2315,19 @@ mod tests {
         ));
         handle.shutdown();
         let writes = hp.state().power_limits_writes.clone();
-        // write #1 = the user's change, write #2 = baseline restore (55/130
-        // captured from the feed BEFORE our first write).
+        // write #1 = the user's change, write #2 = baseline restore
+        // (55/130/200 captured from the feeds BEFORE our first write; the
+        // MCHBAR channel was live, so pl4 is restored explicitly too).
         assert_eq!(writes.len(), 2);
-        assert_eq!(writes[1], pl(55, 130));
-        assert_eq!(*link.lock().unwrap(), (55.0, 130.0));
+        assert_eq!(writes[1], pl4(55, 130, 200));
+        assert_eq!(*link.lock().unwrap(), (55.0, 130.0, 200.0));
     }
 
     #[cfg(feature = "experimental-hp-power-limits")]
     #[test]
     fn keepalive_reasserts_power_limits() {
-        let link = std::sync::Arc::new(Mutex::new((55.0_f64, 130.0_f64)));
-        let (handle, hp) = start_pl_rig("pl-keepalive", std::sync::Arc::clone(&link), true);
+        let link = std::sync::Arc::new(Mutex::new((55.0_f64, 130.0_f64, 200.0_f64)));
+        let (handle, hp) = start_pl_rig("pl-keepalive", std::sync::Arc::clone(&link), true, true);
         let o = block(&handle, ControlCommand::SetPowerLimits(pl(45, 90)));
         assert!(matches!(
             o.status,
@@ -2262,6 +2340,77 @@ mod tests {
         let n = hp.state().power_limits_writes.len();
         handle.shutdown();
         assert!(n >= 2, "expected keepalive re-asserts, got {n} writes");
+    }
+
+    #[cfg(feature = "experimental-hp-power-limits")]
+    #[test]
+    fn power_limits_pl4_write_verified_via_mchbar_feed() {
+        let link = std::sync::Arc::new(Mutex::new((55.0_f64, 130.0_f64, 200.0_f64)));
+        let (handle, hp) = start_pl_rig("pl4-verified", std::sync::Arc::clone(&link), true, true);
+        let o = block(&handle, ControlCommand::SetPowerLimits(pl4(45, 90, 150)));
+        assert!(matches!(
+            o.status,
+            ControlStatus::Applied {
+                verification: Verification::Verified
+            }
+        ));
+        let observed = handle.observed();
+        assert_eq!(observed.power_limits.value(), Some(&pl4(45, 90, 150)));
+        assert!(observed.power_limits.is_verified());
+        assert_eq!(hp.state().power_limits_writes, vec![pl4(45, 90, 150)]);
+        // keepalive re-asserts must carry byte2 (the observed value
+        // includes pl4_w) — let ~3 ticks pass and check the last write.
+        std::thread::sleep(Duration::from_millis(400));
+        let n = hp.state().power_limits_writes.len();
+        let last = hp.state().power_limits_writes.last().copied();
+        handle.shutdown();
+        assert!(n >= 2, "expected keepalive re-asserts, got {n} writes");
+        assert_eq!(last, Some(pl4(45, 90, 150)));
+        // Restore covered all three fields (baseline incl. pl4=200).
+        let writes = hp.state().power_limits_writes.clone();
+        assert_eq!(writes.last(), Some(&pl4(55, 130, 200)));
+        assert_eq!(*link.lock().unwrap(), (55.0, 130.0, 200.0));
+    }
+
+    #[cfg(feature = "experimental-hp-power-limits")]
+    #[test]
+    fn power_limits_pl4_without_mchbar_feed_is_honest_failure() {
+        // The write requests pl4 but the PL4 readback channel is absent:
+        // byte2 can never be verified → honest Failed, never Verified.
+        let link = std::sync::Arc::new(Mutex::new((55.0_f64, 130.0_f64, 200.0_f64)));
+        let (handle, hp) = start_pl_rig("pl4-nofeed", std::sync::Arc::clone(&link), true, false);
+        let o = block(&handle, ControlCommand::SetPowerLimits(pl4(45, 90, 150)));
+        assert!(matches!(
+            o.status,
+            ControlStatus::Applied {
+                verification: Verification::Failed { .. }
+            }
+        ));
+        assert!(!handle.observed().power_limits.is_verified());
+        handle.shutdown();
+        // Not dirty → no restore write.
+        assert_eq!(hp.state().power_limits_writes.len(), 1);
+    }
+
+    #[cfg(feature = "experimental-hp-power-limits")]
+    #[test]
+    fn shutdown_restore_leaves_pl4_untouched_when_baseline_unknown() {
+        // No MCHBAR channel at capture time → the baseline's pl4 component
+        // is 0 = "unknown" → the restore payload keeps byte2 = NO_CHANGE
+        // (never write a field we never measured).
+        let link = std::sync::Arc::new(Mutex::new((55.0_f64, 130.0_f64, 200.0_f64)));
+        let (handle, hp) = start_pl_rig("pl4-nobase", std::sync::Arc::clone(&link), true, false);
+        let o = block(&handle, ControlCommand::SetPowerLimits(pl(45, 90)));
+        assert!(matches!(
+            o.status,
+            ControlStatus::Applied {
+                verification: Verification::Verified
+            }
+        ));
+        handle.shutdown();
+        let writes = hp.state().power_limits_writes.clone();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[1], pl(55, 130));
     }
 
     /// HIL-13 regression: after the hysteresis release, observed.max_fan

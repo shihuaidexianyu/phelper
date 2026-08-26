@@ -77,6 +77,13 @@ pub(crate) const REGISTRY: &[MetricMeta] = &[
         "MSR 0x610[46:32] × power unit — PL2 readback"
     ),
     m!(
+        ids::CPU_PL4_W,
+        "W",
+        MetricSource::PawnIoMsr,
+        250,
+        "MCHBAR 0x59B0[14:0] × power unit — PL4 readback (0x29 byte2 verification; absent without IntelMCHBAR)"
+    ),
+    m!(
         ids::CPU_POWER_LIMIT_RAW,
         "raw",
         MetricSource::PawnIoMsr,

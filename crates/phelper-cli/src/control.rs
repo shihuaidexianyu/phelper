@@ -86,9 +86,11 @@ enum ControlCmd {
         #[command(subcommand)]
         mode: FanCmd,
     },
-    /// Set CPU power limits PL1/PL2 (0x29, EXPERIMENTAL — only in
-    /// `--features experimental` builds; byte order S2-arbitrated on 8BAB).
-    /// pl4/concurrent are left unchanged (wire 0xFF). Hold keeps the
+    /// Set CPU power limits PL1/PL2[/PL4] (0x29, EXPERIMENTAL — only in
+    /// `--features experimental` builds; byte order S2-arbitrated on 8BAB,
+    /// byte2=PL4 settled by the M4-mini MCHBAR spike). PL4 is optional;
+    /// omitted = wire 0xFF NO_CHANGE. cpu_gpu_concurrent stays permanently
+    /// rejected (no readback, no restore semantics). Hold keeps the
     /// heartbeat alive (AC/DC transitions can drop custom limits).
     #[cfg(feature = "experimental")]
     PowerLimits {
@@ -98,6 +100,11 @@ enum ControlCmd {
         /// PL2 (turbo) watts, 15..=157, must be >= PL1.
         #[arg(long)]
         pl2: u8,
+        /// PL4 (peak protection) watts, 30..=200 (factory ceiling, SDD
+        /// byte5 — a protection limit is never raised above factory).
+        /// Verified via MCHBAR 0x59B0 readback.
+        #[arg(long)]
+        pl4: Option<u8>,
         #[arg(long, default_value_t = 120)]
         hold: u64,
     },
@@ -264,7 +271,7 @@ fn plan(args: &ControlArgs) -> Result<Plan> {
             Plan::HpState(ControlCommand::SetThermalMode((*mode).into()), *hold)
         }
         #[cfg(feature = "experimental")]
-        ControlCmd::PowerLimits { pl1, pl2, hold } => {
+        ControlCmd::PowerLimits { pl1, pl2, pl4, hold } => {
             if !(15..=130).contains(pl1) {
                 bail!("--pl1: {pl1}W out of 13900HX envelope 15..=130");
             }
@@ -274,11 +281,16 @@ fn plan(args: &ControlArgs) -> Result<Plan> {
             if pl2 < pl1 {
                 bail!("--pl2 must be >= --pl1 (kernel-validated invariant)");
             }
+            if let Some(p4) = pl4
+                && !(30..=200).contains(p4)
+            {
+                bail!("--pl4: {p4}W outside envelope 30..=200 (factory ceiling, SDD byte5)");
+            }
             Plan::HpState(
                 ControlCommand::SetPowerLimits(phelper_core::domain::policy::CpuPowerLimits {
                     pl1_w: *pl1,
                     pl2_w: *pl2,
-                    pl4_w: 0,
+                    pl4_w: pl4.unwrap_or(0),
                     cpu_gpu_concurrent_w: 0,
                 }),
                 *hold,

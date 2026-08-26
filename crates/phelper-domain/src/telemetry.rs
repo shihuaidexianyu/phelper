@@ -23,6 +23,12 @@ pub mod ids {
     /// also step 2 of the 0x29 three-step verification runbook (§25).
     pub const CPU_PL1_W: MetricId = MetricId("cpu.pl1_w");
     pub const CPU_PL2_W: MetricId = MetricId("cpu.pl2_w");
+    /// PL4 readback via MCHBAR 0x59B0 (PawnIO IntelMCHBAR module — the
+    /// register offset was settled empirically on 8BAB, M4-mini 2026-08-26;
+    /// "0x59A0 = 0x610 mirror" does NOT hold on this platform). Same
+    /// bits 14:0 × power-unit layout as the 0x610 fields. Also the AR-10
+    /// verification source for 0x29 byte2 writes (M4.1).
+    pub const CPU_PL4_W: MetricId = MetricId("cpu.pl4_w");
     pub const CPU_POWER_LIMIT_RAW: MetricId = MetricId("cpu.power_limit_raw");
     // NOTE: MSR_CORE_PERF_LIMIT_REASONS (0x64F) is NOT exposed — verified
     // on-device 2026-08-25: the signed IntelMSR module's allow-list rejects

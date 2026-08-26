@@ -39,6 +39,12 @@ fn fresh(
 #[cfg(feature = "pawnio")]
 pub(crate) struct PawnioCollector {
     io: crate::platform::pawnio::PawnIo,
+    /// Second signed module (IntelMCHBAR) for the PL4 readback. Optional:
+    /// if the module is missing or the CPU is not in its allow-list, the
+    /// cpu.pl4_w metric is simply absent — the MSR provider status is NOT
+    /// affected (same rule as EPP1: a supplementary channel never flaps
+    /// the primary provider).
+    mchbar: Option<crate::platform::pawnio::PawnIo>,
     tsc_mhz: u32,
     tj_max_raw: u64,
     energy_unit_j: f64,
@@ -61,8 +67,23 @@ impl PawnioCollector {
         let io = PawnIo::load_module(&image)?;
         let tj_max_raw = pawnio::read_msr(&io, pawnio::MSR_TEMPERATURE_TARGET)?;
         let unit_raw = pawnio::read_msr(&io, pawnio::MSR_RAPL_POWER_UNIT)?;
+        // Best-effort second module for cpu.pl4_w (MCHBAR 0x59B0, M4.1).
+        // Dual-module coexistence verified on-device 2026-08-26 (separate
+        // handles polling simultaneously without interference).
+        let mchbar = match pawnio::mchbar_image().map(|img| PawnIo::load_module(&img)) {
+            Ok(Ok(io)) => Some(io),
+            Ok(Err(e)) => {
+                warn!(%e, "IntelMCHBAR module load failed — cpu.pl4_w unavailable");
+                None
+            }
+            Err(e) => {
+                warn!(%e, "IntelMCHBAR module image missing — cpu.pl4_w unavailable");
+                None
+            }
+        };
         Ok(Self {
             io,
+            mchbar,
             tsc_mhz,
             tj_max_raw,
             energy_unit_j: pawnio::energy_unit_j(unit_raw),
@@ -94,7 +115,7 @@ impl Collector for PawnioCollector {
     fn collect(&mut self) -> Vec<MetricSample> {
         use crate::platform::pawnio as p;
         let src = MetricSource::PawnIoMsr;
-        let mut out = Vec::with_capacity(11);
+        let mut out = Vec::with_capacity(12);
         let now = Instant::now();
         self.ticks = self.ticks.wrapping_add(1);
 
@@ -170,6 +191,21 @@ impl Collector for PawnioCollector {
             Err(e) => {
                 debug!(%e, "0x610 power-limit read failed");
                 self.status = ProviderStatus::Degraded(format!("0x610 read: {e}"));
+            }
+        }
+
+        // PL4 readback via MCHBAR 0x59B0 (the AR-10 verification source for
+        // 0x29 byte2 writes). Supplementary channel: a read failure here
+        // alone never flaps the provider status (same rule as EPP1).
+        if let Some(mchbar) = &self.mchbar {
+            match p::mchbar_read_dword(mchbar, p::MCHBAR_PL4_OFFSET) {
+                Ok(raw) => {
+                    let pl4 = p::power_limit_field_w(raw, self.power_unit_w);
+                    out.push(fresh(ids::CPU_PL4_W, pl4.into(), src));
+                }
+                Err(e) => {
+                    debug!(%e, "MCHBAR PL4 read failed");
+                }
             }
         }
 

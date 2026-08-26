@@ -384,15 +384,16 @@ mod imp {
         }
 
         fn set_power_limits(&self, l: phelper_domain::policy::CpuPowerLimits) -> Result<(), HpWmiError> {
-            // Defense in depth after the safety layer: only the S2-verified
-            // pl1/pl2 bytes may go on the wire; pl4/cc stay NO_CHANGE (0xFF)
-            // until their explicit-write behavior is arbitrated too.
-            if l.pl4_w != 0 || l.cpu_gpu_concurrent_w != 0 {
+            // Defense in depth after the safety layer: pl1/pl2 (M3) and pl4
+            // (M4.1, MCHBAR 0x59B0 readback) may go on the wire; cc has no
+            // readback channel AND no restore semantics — permanently
+            // NO_CHANGE here (a domain 0 means "not requested").
+            if l.cpu_gpu_concurrent_w != 0 {
                 return Err(HpWmiError::InvalidInput(
-                    "pl4/cpu_gpu_concurrent unverified on 8BAB — 0 (= NO_CHANGE) only",
+                    "cpu_gpu_concurrent unverifiable on 8BAB (no readback, no restore) — 0 (= NO_CHANGE) only",
                 ));
             }
-            let payload = commands::encode_power_limits(l.pl1_w, l.pl2_w);
+            let payload = commands::encode_power_limits(&l);
             self.write_execute(HpCommandGroup::Gaming, cmd::POWER_LIMITS, &payload)
         }
     }
