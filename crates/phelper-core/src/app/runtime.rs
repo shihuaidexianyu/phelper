@@ -168,6 +168,14 @@ fn pump_main(
     let mut last_observed_reprobe = Instant::now();
 
     loop {
+        // v0.2-e: stage timing. The M6 HIL saw ONE ~38 s window-close whose
+        // root cause was never isolated (every call in this loop is
+        // non-blocking by audit). Any iteration over SLOW_ITER logs its
+        // per-stage durations — a recurrence names the stage in the log.
+        const SLOW_ITER: Duration = Duration::from_secs(2);
+        let iter_start = Instant::now();
+        let mut stages = [Duration::ZERO; 6];
+
         // 1. Telemetry: drain to the latest snapshot only.
         match snap_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(latest) => {
@@ -188,6 +196,8 @@ fn pump_main(
                 return;
             }
         }
+        stages[0] = iter_start.elapsed();
+        let t = Instant::now();
 
         // 2. UI messages.
         while let Ok(msg) = rx.try_recv() {
@@ -219,14 +229,21 @@ fn pump_main(
                     state.write().expect("appstate poisoned").set_profiles(&registry);
                 }
                 PumpMsg::Shutdown(ack) => {
+                    let t_sd = Instant::now();
                     if let Some(e) = engine.take() {
                         e.shutdown();
                     }
+                    tracing::info!(
+                        elapsed_ms = t_sd.elapsed().as_millis(),
+                        "app-pump: engine.shutdown() completed (AR-12 restore path)"
+                    );
                     let _ = ack.send(());
                     return;
                 }
             }
         }
+        stages[1] = t.elapsed();
+        let t = Instant::now();
 
         // 3. Dispatch whatever the coalescer releases.
         let now = Instant::now();
@@ -281,6 +298,8 @@ fn pump_main(
                 }
             }
         }
+        stages[2] = t.elapsed();
+        let t = Instant::now();
 
         // 4. Outcome sweep.
         let mut finished: Vec<(u64, KnobId, Option<ControlOutcome>)> = Vec::new();
@@ -318,6 +337,8 @@ fn pump_main(
                 s.observed = c.observed();
             }
         }
+        stages[3] = t.elapsed();
+        let t = Instant::now();
 
         // 5. Periodic desired/observed refresh (~2 s).
         if last_state_refresh.elapsed() >= Duration::from_secs(2) {
@@ -339,6 +360,8 @@ fn pump_main(
                 c.refresh_observed();
             }
         }
+        stages[4] = t.elapsed();
+        let t = Instant::now();
 
         // 6. Journal live tail (~1 s; cross-process — CLI writes show up).
         if last_journal.elapsed() >= Duration::from_secs(1) {
@@ -350,6 +373,21 @@ fn pump_main(
                     .expect("appstate poisoned")
                     .apply_journal(entries);
             }
+        }
+        stages[5] = t.elapsed();
+
+        let total = iter_start.elapsed();
+        if total > SLOW_ITER {
+            tracing::warn!(
+                total_ms = total.as_millis(),
+                snap_ms = stages[0].as_millis(),
+                ui_msgs_ms = stages[1].as_millis(),
+                dispatch_ms = stages[2].as_millis(),
+                sweep_ms = stages[3].as_millis(),
+                refresh_ms = stages[4].as_millis(),
+                journal_ms = stages[5].as_millis(),
+                "app-pump iteration exceeded 2 s — stage timings above"
+            );
         }
     }
 }

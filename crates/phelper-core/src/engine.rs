@@ -187,14 +187,23 @@ impl Engine {
     /// automatic state: 0x2E{0,0} + 0x27 off + thermal Balanced), then
     /// telemetry (stops issuing firmware calls), then the HP actor.
     pub fn shutdown(self) {
+        // v0.2-e: per-stage timing — the M6 HIL saw one ~38 s window-close
+        // that never got a root cause; if a stage ever stalls again, the
+        // log names it instead of leaving a silent gap.
+        let t = std::time::Instant::now();
         #[cfg(feature = "control")]
         if let Some(c) = &self.control {
             c.shutdown();
+            info!(elapsed_ms = t.elapsed().as_millis(), "shutdown stage: control coordinator done");
         }
+        let t = std::time::Instant::now();
         self.telemetry.shutdown();
+        info!(elapsed_ms = t.elapsed().as_millis(), "shutdown stage: telemetry done");
+        let t = std::time::Instant::now();
         if let Some(hp) = &self.hp {
             hp.shutdown();
         }
+        info!(elapsed_ms = t.elapsed().as_millis(), "shutdown stage: hp actor done");
         info!("engine stopped");
     }
 }

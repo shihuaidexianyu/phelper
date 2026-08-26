@@ -3,6 +3,7 @@
 //! chart never touches collectors). Series are index-aligned after
 //! bucket-downsampling to ≤120 points (fmt::downsample).
 
+use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 use gpui::{App, Hsla, IntoElement, ParentElement, Styled, div, linear_color_stop, linear_gradient, px};
@@ -13,6 +14,29 @@ use phelper_domain::telemetry::MetricId;
 
 const WINDOW: Duration = Duration::from_secs(300);
 const MAX_POINTS: usize = 120;
+/// Design pull cadence for chart data (§39 note in the M6 plan): the page
+/// re-renders at the 250 ms tick, but history pulls + downsampling +
+/// label formatting happen at 1 Hz behind this cache (v0.2 — v0.1
+/// re-pulled every tick, 4× the designed rate).
+const PULL_EVERY: Duration = Duration::from_secs(1);
+
+/// One chart's cached points. Interior-mutable so page render functions
+/// keep their `&` signatures.
+#[derive(Default)]
+pub struct ChartCache(RefCell<Option<(Instant, Vec<TrendPoint>)>>);
+
+impl ChartCache {
+    pub fn points(&self, app: &AppHandle, id_a: MetricId, id_b: MetricId) -> Vec<TrendPoint> {
+        if let Some((at, pts)) = &*self.0.borrow()
+            && at.elapsed() < PULL_EVERY
+        {
+            return pts.clone();
+        }
+        let pts = trend_points(app, id_a, id_b);
+        *self.0.borrow_mut() = Some((Instant::now(), pts.clone()));
+        pts
+    }
+}
 
 #[derive(Clone)]
 pub struct TrendPoint {

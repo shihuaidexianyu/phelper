@@ -23,6 +23,9 @@ pub struct DiagState {
     pub expanded: BTreeSet<String>,
     /// (message, ok) after an export attempt; None until first click.
     pub export_note: Option<(String, bool)>,
+    /// Journal rows rendered before the 显示更多 expander (v0.2: the page
+    /// re-renders at the 250 ms tick; 200 full rows was its heaviest cost).
+    pub journal_limit: usize,
 }
 
 /// Performance page view-state: the six slider entities (local intent —
@@ -48,6 +51,9 @@ pub struct ThermalState {
     pub cpu_rpm: u16,
     pub gpu_rpm: u16,
     pub banner_expanded: bool,
+    /// 1 Hz chart pull caches (v0.2; see trend_chart::ChartCache).
+    pub temp_chart: crate::widgets::trend_chart::ChartCache,
+    pub fan_chart: crate::widgets::trend_chart::ChartCache,
 }
 
 /// Profiles page view-state: selected card + outcome banner + transient
@@ -82,9 +88,15 @@ pub struct ExpState {
 }
 
 pub struct ShellView {
-    app: AppHandle,
-    state: AppState,
-    page: PageId,
+    pub(crate) app: AppHandle,
+    pub(crate) state: AppState,
+    pub(crate) page: PageId,
+    /// v0.2-d: last painted visual fingerprint + paint time — the tick
+    /// skips cx.notify() while the current page's displayed values are
+    /// unchanged (5 s forced-refresh backstop, see fingerprint.rs).
+    pub(crate) last_fp: Option<u64>,
+    pub(crate) last_paint: std::time::Instant,
+    pub dash: dashboard::DashState,
     pub diag: DiagState,
     pub perf: PerfState,
     pub thermal: ThermalState,
@@ -107,9 +119,12 @@ fn knob_slider(
     map: fn(f32) -> ControlCommand,
 ) -> Entity<SliderState> {
     let e = cx.new(|_| SliderState::new().min(min).max(max).step(step).default_value(0.));
-    cx.subscribe(&e, move |this: &mut ShellView, _, ev: &SliderEvent, _| {
+    cx.subscribe(&e, move |this: &mut ShellView, _, ev: &SliderEvent, cx| {
         if let SliderEvent::Change(SliderValue::Single(v)) = ev {
             this.app.dispatch(knob, map(*v));
+            // Drag feedback paints immediately (v0.2-d: the tick skips
+            // unchanged frames, so interactive events notify themselves).
+            cx.notify();
         }
     })
     .detach();
@@ -130,21 +145,23 @@ fn fan_sliders(
     // intermediate (2000, 100) state (on-device crash D7). max FIRST.
     let cpu = cx.new(|_| SliderState::new().max(max_rpm).min(min_rpm).step(100.).default_value(min_rpm));
     let gpu = cx.new(|_| SliderState::new().max(max_rpm).min(min_rpm).step(100.).default_value(min_rpm));
-    cx.subscribe(&cpu, |this: &mut ShellView, _, ev: &SliderEvent, _| {
+    cx.subscribe(&cpu, |this: &mut ShellView, _, ev: &SliderEvent, cx| {
         if let SliderEvent::Change(SliderValue::Single(v)) = ev {
             this.thermal.cpu_rpm = (*v / 100.).round() as u16;
             let levels = FanLevels::new(this.thermal.cpu_rpm, this.thermal.gpu_rpm);
             this.app
                 .dispatch(KnobId::FanMode, ControlCommand::SetFanMode(FanMode::Manual(levels)));
+            cx.notify();
         }
     })
     .detach();
-    cx.subscribe(&gpu, |this: &mut ShellView, _, ev: &SliderEvent, _| {
+    cx.subscribe(&gpu, |this: &mut ShellView, _, ev: &SliderEvent, cx| {
         if let SliderEvent::Change(SliderValue::Single(v)) = ev {
             this.thermal.gpu_rpm = (*v / 100.).round() as u16;
             let levels = FanLevels::new(this.thermal.cpu_rpm, this.thermal.gpu_rpm);
             this.app
                 .dispatch(KnobId::FanMode, ControlCommand::SetFanMode(FanMode::Manual(levels)));
+            cx.notify();
         }
     })
     .detach();
@@ -160,7 +177,17 @@ impl ShellView {
                     .await;
                 let r = this.update(cx, |this, cx| {
                     this.state = this.app.state();
-                    cx.notify();
+                    // v0.2-d: repaint only when the current page's displayed
+                    // values actually moved (interactive events notify on
+                    // their own; 5 s backstop fails open toward painting).
+                    let fp = this.fingerprint();
+                    if Some(fp) != this.last_fp
+                        || this.last_paint.elapsed() >= Duration::from_secs(5)
+                    {
+                        this.last_fp = Some(fp);
+                        this.last_paint = std::time::Instant::now();
+                        cx.notify();
+                    }
                 });
                 if r.is_err() {
                     break;
@@ -174,19 +201,26 @@ impl ShellView {
             }
         })
         .detach();
-        // OS theme flipped while we run: re-resolve "跟随系统" live.
+        // OS theme flipped while we run: re-resolve "跟随系统" live. The
+        // notify matters now: the v0.2-d tick skips unchanged frames, and
+        // a theme flip is not part of any page fingerprint.
         let appearance_sub = cx.observe_window_appearance(window, |this, _window, cx| {
             if this.settings.theme == phelper_core::app::settings::ThemePref::System {
                 settings::apply_pref(this.settings.theme, cx);
             }
+            cx.notify();
         });
         Self {
             app,
             state: AppState::default(),
             page: PageId::Dashboard,
+            last_fp: None,
+            last_paint: std::time::Instant::now(),
+            dash: Default::default(),
             diag: DiagState {
                 expanded: BTreeSet::new(),
                 export_note: None,
+                journal_limit: 50,
             },
             perf: PerfState {
                 epp_ac: knob_slider(cx, 0., 100., 5., KnobId::EppAc, performance::epp_ac_cmd),
@@ -203,6 +237,8 @@ impl ShellView {
                 cpu_rpm: 0,
                 gpu_rpm: 0,
                 banner_expanded: false,
+                temp_chart: Default::default(),
+                fan_chart: Default::default(),
             },
             prof: ProfileState {
                 selected: None,
@@ -326,7 +362,7 @@ impl Render for ShellView {
         }));
 
         let content: gpui::AnyElement = match self.page {
-            PageId::Dashboard => dashboard::render(&self.state, &self.app, cx).into_any_element(),
+            PageId::Dashboard => dashboard::render(&self.state, &self.app, &self.dash, cx).into_any_element(),
             PageId::Performance => {
                 performance::render(&self.state, &self.app, &self.perf, &self.exp, cx).into_any_element()
             }

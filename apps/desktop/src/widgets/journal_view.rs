@@ -19,9 +19,11 @@ pub fn key_of(e: &JournalEntry, index: usize) -> String {
 pub fn render<V: 'static>(
     entries: &VecDeque<JournalEntry>,
     expanded: &BTreeSet<String>,
+    limit: usize,
     empty_hint: &str,
     cx: &mut Context<V>,
     on_toggle: impl Fn(&mut V, String) + 'static + Copy,
+    on_more: impl Fn(&mut V) + 'static + Copy,
 ) -> impl IntoElement {
     let theme = cx.theme();
     let now = phelper_core::app::now_epoch_ms();
@@ -39,7 +41,12 @@ pub fn render<V: 'static>(
             );
     }
 
-    for (i, e) in entries.iter().rev().enumerate() {
+    // v0.2: render at most `limit` rows — the Diagnostics page re-renders
+    // at the 250 ms tick and a full 200-entry tail (each row a multi-div
+    // tree with per-row listeners) was the page's heaviest element cost.
+    // The remaining rows sit one click away behind 显示更多.
+    let total = entries.len();
+    for (i, e) in entries.iter().rev().take(limit).enumerate() {
         let key = key_of(e, i);
         let is_open = expanded.contains(&key);
 
@@ -159,6 +166,29 @@ pub fn render<V: 'static>(
             row = row.child(steps);
         }
         list = list.child(row);
+    }
+    if total > limit {
+        list = list.child(
+            div()
+                .id("jr-more")
+                .h_flex()
+                .justify_center()
+                .w_full()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.list_hover))
+                .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _: &mut Window, cx| {
+                    on_more(this);
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.info)
+                        .child(format!("显示更多（还有 {} 条）", total - limit)),
+                ),
+        );
     }
     list
 }

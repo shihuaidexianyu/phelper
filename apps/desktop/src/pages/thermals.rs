@@ -199,8 +199,8 @@ pub fn render(
     };
 
     // ---- trends ----
-    let temp_pts = trend_chart::trend_points(app, ids::CPU_PKG_TEMP_C, ids::GPU_TEMP_C);
-    let fan_pts = trend_chart::trend_points(app, ids::FAN_CPU_RPM, ids::FAN_GPU_RPM);
+    let temp_pts = thermal.temp_chart.points(app, ids::CPU_PKG_TEMP_C, ids::GPU_TEMP_C);
+    let fan_pts = thermal.fan_chart.points(app, ids::FAN_CPU_RPM, ids::FAN_GPU_RPM);
     let charts = div()
         .h_flex()
         .w_full()

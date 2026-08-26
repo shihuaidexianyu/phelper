@@ -7,6 +7,7 @@
 //! reads `AppState` snapshots and enqueues commands (AR-01). This file is
 //! the shell bootstrap; pages live in `pages/`, widgets in `widgets/`.
 
+mod fingerprint;
 mod pages;
 mod shell;
 mod tray;
@@ -161,7 +162,13 @@ fn main() {
                                 // Same graceful path as the window close
                                 // button (AR-12): engine restore, then quit.
                                 cx.update(|cx| {
+                                    let t = std::time::Instant::now();
+                                    tracing::info!("ui shutdown begin (tray quit)");
                                     app_t.shutdown(Duration::from_secs(40));
+                                    tracing::info!(
+                                        elapsed_ms = t.elapsed().as_millis(),
+                                        "ui shutdown end (tray quit)"
+                                    );
                                     cx.quit();
                                 });
                                 break;
@@ -178,11 +185,19 @@ fn main() {
         .detach();
 
         // AR-12: closing the last window drives the full graceful engine
-        // shutdown (firmware-auto restore) BEFORE process exit.
+        // shutdown (firmware-auto restore) BEFORE process exit. Timed
+        // (v0.2-e): the M6 HIL's one ~38 s close now has a begin/end
+        // bracket on the UI side to pair with the pump's stage logs.
         let app_c = app.clone();
         cx.on_window_closed(move |cx, _| {
             if cx.windows().is_empty() {
+                let t = std::time::Instant::now();
+                tracing::info!("ui shutdown begin (window closed)");
                 app_c.shutdown(Duration::from_secs(40));
+                tracing::info!(
+                    elapsed_ms = t.elapsed().as_millis(),
+                    "ui shutdown end (window closed)"
+                );
                 cx.quit();
             }
         })

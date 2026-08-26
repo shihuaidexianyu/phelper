@@ -40,7 +40,14 @@ fn badge(cx: &App, label: String, provenance: Option<&'static str>) -> Div {
         })
 }
 
-pub fn render(state: &AppState, app: &AppHandle, cx: &App) -> impl IntoElement {
+/// Per-page view state (§42): just the two chart 1 Hz caches (v0.2).
+#[derive(Default)]
+pub struct DashState {
+    pub cpu_chart: trend_chart::ChartCache,
+    pub gpu_chart: trend_chart::ChartCache,
+}
+
+pub fn render(state: &AppState, app: &AppHandle, dash: &DashState, cx: &App) -> impl IntoElement {
     let theme = cx.theme();
     let snap = state.telemetry.as_deref();
     let sample = |id: phelper_domain::telemetry::MetricId| snap.and_then(|s| s.samples.get(&id));
@@ -114,8 +121,8 @@ pub fn render(state: &AppState, app: &AppHandle, cx: &App) -> impl IntoElement {
     let fan_card = MetricCard::custom("风扇 CPU / GPU", fan_value, "RPM", fan_mode_label).render(cx);
 
     // ---- trend charts ----
-    let cpu_pts = trend_chart::trend_points(app, ids::CPU_PKG_TEMP_C, ids::CPU_PKG_POWER_W);
-    let gpu_pts = trend_chart::trend_points(app, ids::GPU_TEMP_C, ids::GPU_POWER_W);
+    let cpu_pts = dash.cpu_chart.points(app, ids::CPU_PKG_TEMP_C, ids::CPU_PKG_POWER_W);
+    let gpu_pts = dash.gpu_chart.points(app, ids::GPU_TEMP_C, ids::GPU_POWER_W);
 
     page_root("dashboard-scroll").child(
         div()

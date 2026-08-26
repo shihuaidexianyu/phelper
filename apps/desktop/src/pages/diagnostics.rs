@@ -354,12 +354,16 @@ pub fn render(
         let body = div().v_flex().w_full().child(journal_view::render(
             &state.journal_tail,
             diag_expanded,
+            diag.journal_limit,
             "暂无日志条目——执行任意控制命令后出现",
             cx,
             |this: &mut ShellView, key: String| {
                 if !this.diag.expanded.remove(&key) {
                     this.diag.expanded.insert(key);
                 }
+            },
+            |this: &mut ShellView| {
+                this.diag.journal_limit += 50;
             },
         ));
         section(cx, "控制日志（实时 · 新→旧 · 点击展开步骤证据）", body)

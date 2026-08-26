@@ -152,9 +152,16 @@ pub struct AppState {
     pub profile_warnings: Vec<String>,
     pub ogh_findings: Vec<OghFinding>,
     pub knobs: BTreeMap<KnobId, KnobStatus>,
-    pub evidence: VecDeque<OutcomeRecord>,
+    /// Arc-wrapped (v0.2): the UI receives one AppState clone per 250 ms
+    /// tick — with a plain VecDeque that clone deep-copies up to
+    /// EVIDENCE_CAP records 4×/s even though the strip changes only when a
+    /// command finishes. Steady ticks are now pointer bumps; the reducers
+    /// pay one real copy (Arc::make_mut) per actual change.
+    pub evidence: Arc<VecDeque<OutcomeRecord>>,
+    /// Arc-wrapped for the same reason (cap JOURNAL_CAP = 200 full
+    /// entries with step evidence — the single heaviest field).
     #[cfg(feature = "control")]
-    pub journal_tail: VecDeque<crate::control::journal::JournalEntry>,
+    pub journal_tail: Arc<VecDeque<crate::control::journal::JournalEntry>>,
     pub experimental: ExperimentalUi,
 }
 
@@ -196,10 +203,11 @@ impl AppState {
             ControlStatus::Partial => KnobStatus::Partial { at_epoch_ms: at },
         };
         self.knobs.insert(knob, status);
-        if self.evidence.len() >= EVIDENCE_CAP {
-            self.evidence.pop_front();
+        let ev = Arc::make_mut(&mut self.evidence);
+        if ev.len() >= EVIDENCE_CAP {
+            ev.pop_front();
         }
-        self.evidence.push_back(OutcomeRecord {
+        ev.push_back(OutcomeRecord {
             at_epoch_ms: at,
             knob,
             outcome,
@@ -208,11 +216,12 @@ impl AppState {
 
     #[cfg(feature = "control")]
     pub fn apply_journal(&mut self, entries: impl IntoIterator<Item = crate::control::journal::JournalEntry>) {
+        let tail = Arc::make_mut(&mut self.journal_tail);
         for e in entries {
-            if self.journal_tail.len() >= JOURNAL_CAP {
-                self.journal_tail.pop_front();
+            if tail.len() >= JOURNAL_CAP {
+                tail.pop_front();
             }
-            self.journal_tail.push_back(e);
+            tail.push_back(e);
         }
     }
 
