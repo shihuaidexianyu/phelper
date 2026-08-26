@@ -68,6 +68,9 @@ pub(crate) struct ControlConfig<H, P, F> {
     pub ppm: P,
     pub feed: F,
     pub journal_path: std::path::PathBuf,
+    /// Profile registry for ApplyProfile expansion (built-ins + user TOML;
+    /// empty = profiles unresolvable, ApplyProfile rejects UnknownProfile).
+    pub profiles: crate::profiles::ProfileRegistry,
     /// Test knobs — prod code leaves these at the defaults.
     pub verify_polls: u32,
     pub verify_poll_interval: Duration,
@@ -91,6 +94,7 @@ impl<H, P, F> ControlConfig<H, P, F> {
             ppm,
             feed,
             journal_path,
+            profiles: crate::profiles::ProfileRegistry::empty(),
             verify_polls: FAN_VERIFY_POLLS,
             verify_poll_interval: Duration::from_secs(1),
             keepalive_period: super::keepalive::PERIOD,
@@ -192,6 +196,7 @@ pub(crate) struct ControlCoordinator<H, P, F> {
     journal: ControlJournal,
     safety: SafetySupervisor,
     keepalive: KeepAliveService,
+    profiles: crate::profiles::ProfileRegistry,
     verify_polls: u32,
     verify_poll_interval: Duration,
     safety_tick: Duration,
@@ -250,6 +255,7 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             journal,
             safety: SafetySupervisor::new(),
             keepalive: KeepAliveService::with_period(cfg.keepalive_period),
+            profiles: cfg.profiles,
             verify_polls: cfg.verify_polls,
             verify_poll_interval: cfg.verify_poll_interval,
             safety_tick: cfg.safety_tick,
@@ -367,40 +373,89 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         let started = Instant::now();
         info!(receipt = receipt.0, ?cmd, "control dispatch");
 
-        // 1. Validate (safety layer; capability + range + freshness gates).
-        let observed = self.observed();
-        if let Err(error) = self
-            .safety
-            .validate(&cmd, &self.caps, &self.feed, &observed)
-        {
-            let outcome = ControlOutcome {
-                receipt,
-                command: cmd,
-                status: ControlStatus::Rejected { error },
-                steps: Vec::new(),
-                duration: started.elapsed(),
-            };
-            self.journal(JournalOrigin::User, &outcome);
-            return outcome;
-        }
-
-        // 2. Execute + verify (per command kind).
-        let mut steps = Vec::new();
-        let status = match &cmd {
-            ControlCommand::SetThermalMode(mode) => self.exec_thermal(*mode, &mut steps),
-            ControlCommand::SetFanMode(mode) => self.exec_fan_mode(*mode, &mut steps),
-            ControlCommand::SetCpuPolicy(policy) => self.exec_cpu_policy(policy, &mut steps),
-            ControlCommand::SetGpuPlatformPolicy(p) => self.exec_gpu_policy(*p, &mut steps),
-            ControlCommand::SetPowerLimits(l) => self.exec_power_limits(*l, &mut steps),
-            // validate() already rejected these; unreachable in practice.
-            _ => ControlStatus::Rejected {
-                error: ControlError::Unsupported,
+        // 1. Expand into an ordered plan (a single command is a 1-step plan;
+        //    a profile resolves into its concrete Set* sequence). Expansion
+        //    failures (unknown name, unmergeable 0x21) reject pre-write.
+        let plan: Vec<ControlCommand> = match &cmd {
+            ControlCommand::ApplyProfile { profile } => match self.expand_profile(profile) {
+                Ok(p) => p,
+                Err(error) => {
+                    let outcome = ControlOutcome {
+                        receipt,
+                        command: cmd,
+                        status: ControlStatus::Rejected { error },
+                        steps: Vec::new(),
+                        duration: started.elapsed(),
+                    };
+                    self.journal(JournalOrigin::User, &outcome);
+                    return outcome;
+                }
             },
+            _ => vec![cmd.clone()],
         };
 
-        // 3. Desired state records intent for accepted commands.
-        if !matches!(status, ControlStatus::Rejected { .. }) {
-            self.record_desired(&cmd);
+        // 2. Validate ALL plan steps upfront (safety layer; capability +
+        //    range + freshness gates). A profile whose any field fails its
+        //    per-command gate is rejected WHOLE — never apply half of a
+        //    rejected intent (AR-11).
+        let observed = self.observed();
+        for step_cmd in &plan {
+            if let Err(error) =
+                self.safety
+                    .validate(step_cmd, &self.caps, &self.feed, &observed)
+            {
+                let outcome = ControlOutcome {
+                    receipt,
+                    command: cmd,
+                    status: ControlStatus::Rejected { error },
+                    steps: Vec::new(),
+                    duration: started.elapsed(),
+                };
+                self.journal(JournalOrigin::User, &outcome);
+                return outcome;
+            }
+        }
+
+        // 3. Execute + verify in plan order; stop at the first failing step.
+        //    A failure on the FIRST step rejects the whole command (nothing
+        //    applied); a failure later leaves earlier steps applied — Partial
+        //    carries the truth, the journal has the per-step evidence; no
+        //    M2 rollback.
+        let mut steps = Vec::new();
+        let mut weakest = Verification::Skipped;
+        let mut status = ControlStatus::Applied {
+            verification: Verification::Skipped,
+        };
+        for (i, step_cmd) in plan.iter().enumerate() {
+            match self.exec_one(step_cmd, &mut steps) {
+                ControlStatus::Applied { verification } => {
+                    weakest = weakest_verification(&weakest, &verification);
+                    status = ControlStatus::Applied {
+                        verification: weakest.clone(),
+                    };
+                    self.record_desired(step_cmd);
+                }
+                ControlStatus::Rejected { error } => {
+                    status = if i == 0 {
+                        ControlStatus::Rejected { error }
+                    } else {
+                        ControlStatus::Partial
+                    };
+                    break;
+                }
+                ControlStatus::Partial => {
+                    status = ControlStatus::Partial;
+                    break;
+                }
+            }
+        }
+        if matches!(status, ControlStatus::Applied { .. })
+            && let ControlCommand::ApplyProfile { profile } = &cmd
+        {
+            self.desired
+                .write()
+                .expect("desired poisoned")
+                .profile = Some(profile.clone());
         }
 
         // 4. Reschedule keep-alive against the new observed state.
@@ -418,6 +473,61 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         outcome
     }
 
+    /// Per-command execution dispatch (one plan step).
+    fn exec_one(&mut self, cmd: &ControlCommand, steps: &mut Vec<StepOutcome>) -> ControlStatus {
+        match cmd {
+            ControlCommand::SetThermalMode(mode) => self.exec_thermal(*mode, steps),
+            ControlCommand::SetFanMode(mode) => self.exec_fan_mode(*mode, steps),
+            ControlCommand::SetCpuPolicy(policy) => self.exec_cpu_policy(policy, steps),
+            ControlCommand::SetGpuPlatformPolicy(p) => self.exec_gpu_policy(*p, steps),
+            ControlCommand::SetPowerLimits(l) => self.exec_power_limits(*l, steps),
+            // validate() rejects these; a plan never contains them.
+            _ => ControlStatus::Rejected {
+                error: ControlError::Unsupported,
+            },
+        }
+    }
+
+    /// Resolve a profile name into its ordered concrete plan (M5):
+    /// PPM policy → 0x29 power limits → 0x22 GPU policy → thermal → fan.
+    /// Fan runs LAST by design: manual/max fan suspends the firmware
+    /// thermal curve, so everything else must already be in place. The 0x22
+    /// step merges unspecified fields from the LIVE 0x21 readback
+    /// (read-modify-write, same semantics as the gpu-policy command).
+    fn expand_profile(&mut self, name: &str) -> Result<Vec<ControlCommand>, ControlError> {
+        let p = self
+            .profiles
+            .get(name)
+            .ok_or_else(|| ControlError::UnknownProfile { name: name.into() })?
+            .clone();
+        let mut plan = Vec::new();
+        if p.cpu != CpuPolicy::default() {
+            plan.push(ControlCommand::SetCpuPolicy(p.cpu));
+        }
+        if let Some(l) = p.power_limits {
+            plan.push(ControlCommand::SetPowerLimits(l));
+        }
+        if let Some(patch) = p.gpu_policy {
+            let hp = self.hp.as_ref().ok_or_else(|| ControlError::BackendUnavailable {
+                what: "HP platform (0x21 merge source)".into(),
+            })?;
+            let current = hp.gpu_platform_policy().map_err(map_hp_error)?;
+            plan.push(ControlCommand::SetGpuPlatformPolicy(patch.apply(current)));
+        }
+        if let Some(m) = p.thermal_mode {
+            plan.push(ControlCommand::SetThermalMode(m));
+        }
+        if let Some(f) = p.fan {
+            plan.push(ControlCommand::SetFanMode(f));
+        }
+        if plan.is_empty() {
+            return Err(ControlError::UnsafeRequest {
+                reason: format!("profile '{name}' has no actions"),
+            });
+        }
+        Ok(plan)
+    }
+
     fn record_desired(&mut self, cmd: &ControlCommand) {
         let mut d = self.desired.write().expect("desired poisoned");
         match cmd {
@@ -427,6 +537,12 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             ControlCommand::SetGpuPlatformPolicy(p) => d.gpu_platform_policy = Some(*p),
             ControlCommand::SetPowerLimits(l) => d.power_limits = Some(*l),
             _ => {}
+        }
+        // A direct knob change means the desired state no longer matches
+        // whatever named profile set it up. (ApplyProfile re-stamps the
+        // name after its plan completes — see execute().)
+        if !matches!(cmd, ControlCommand::ApplyProfile { .. }) {
+            d.profile = None;
         }
     }
 
@@ -1500,6 +1616,26 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
 
 // ------------------------------------------------------------ error mapping
 
+/// Aggregate verification for a multi-step plan: the plan is only as
+/// verified as its weakest step. `Skipped` is neutral (a step that needed
+/// no verification doesn't weaken the verdict).
+fn weakest_verification(a: &Verification, b: &Verification) -> Verification {
+    fn rank(v: &Verification) -> u8 {
+        match v {
+            Verification::Failed { .. } => 0,
+            Verification::TrustedNoReadback => 1,
+            Verification::Verified => 2,
+            Verification::Skipped => 3,
+        }
+    }
+    match (rank(a), rank(b)) {
+        (3, _) => b.clone(),
+        (_, 3) => a.clone(),
+        (ra, rb) if ra <= rb => a.clone(),
+        _ => b.clone(),
+    }
+}
+
 fn map_hp_error(e: HpWmiError) -> ControlError {
     match e {
         HpWmiError::FirmwareReturnCode { code } => ControlError::FirmwareRejected {
@@ -1600,6 +1736,7 @@ mod tests {
     use phelper_domain::error::PlatformError;
     use phelper_domain::hp::{FanTable, SystemDesignData};
     use phelper_domain::identity::{CpuIdentity, DeviceIdentity};
+    use phelper_domain::profile::{GpuPolicyPatch, PerformanceProfile};
     use phelper_domain::policy::{BoostPolicy, GpuPlatformPolicy, MuxMode};
     use phelper_domain::ports::{HpControl, HpPlatform};
     use std::sync::Mutex;
@@ -1854,6 +1991,10 @@ mod tests {
         }
 
         fn start_with_hp(tag: &str, hp: MockHp) -> Self {
+            Self::start_with(tag, hp, crate::profiles::ProfileRegistry::empty())
+        }
+
+        fn start_with(tag: &str, hp: MockHp, profiles: crate::profiles::ProfileRegistry) -> Self {
             let dir = std::env::temp_dir()
                 .join(format!("phelper-coord-test-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
@@ -1871,6 +2012,7 @@ mod tests {
             cfg.verify_poll_interval = Duration::from_millis(5);
             cfg.keepalive_period = Duration::from_millis(120);
             cfg.safety_tick = Duration::from_millis(20);
+            cfg.profiles = profiles;
             let handle = ControlCoordinator::start(cfg).unwrap();
             Self {
                 handle,
@@ -2484,5 +2626,267 @@ mod tests {
         let j = std::fs::read_to_string(&journal_path).unwrap_or_default();
         assert!(j.contains("SAFETY max-fan off"));
         handle.shutdown();
+    }
+
+    // ---------------------------- profiles (M5) ----
+
+    fn registry_with(name: &str, p: PerformanceProfile) -> crate::profiles::ProfileRegistry {
+        let mut r = crate::profiles::ProfileRegistry::empty();
+        r.insert(name, p);
+        r
+    }
+
+    #[test]
+    fn profile_apply_expands_and_runs_all_steps_in_order() {
+        let mut p = PerformanceProfile::default();
+        p.cpu.epp_ac = Some(33);
+        p.gpu_policy = Some(GpuPolicyPatch {
+            ctgp: Some(false),
+            ..Default::default()
+        });
+        p.thermal_mode = Some(ThermalMode::Performance);
+        p.fan = Some(FanMode::Max);
+        let rig = TestRig::start_with("prof-happy", MockHp::default(), registry_with("mix", p));
+
+        let o = block(
+            &rig.handle,
+            ControlCommand::ApplyProfile {
+                profile: "mix".into(),
+            },
+        );
+        // Overall verdict can never exceed the weakest step (thermal + max
+        // fan have no readback → TrustedNoReadback).
+        assert!(matches!(
+            o.status,
+            ControlStatus::Applied {
+                verification: Verification::TrustedNoReadback
+            }
+        ));
+        // Plan order: PPM → 0x22 → thermal → fan (fan last).
+        let step_names: Vec<&str> = o.steps.iter().map(|s| s.step.as_str()).collect();
+        let pos = |needle: &str| {
+            step_names
+                .iter()
+                .position(|s| s.contains(needle))
+                .unwrap_or_else(|| panic!("step '{needle}' missing: {step_names:?}"))
+        };
+        assert!(pos("EPP") < pos("gpu policy (0x21)"));
+        assert!(pos("gpu policy (0x21)") < pos("set_thermal_mode"));
+        assert!(pos("set_thermal_mode") < step_names.len() - 1);
+
+        // Effects landed on the mock backends.
+        let s = rig.hp.state();
+        assert_eq!(s.thermal_writes, vec![ThermalMode::Performance]);
+        assert_eq!(s.max_fan_writes, vec![true]);
+        assert_eq!(s.gpu_policy_writes.len(), 1);
+        assert!(!s.gpu_policy_writes[0].ctgp, "patch must merge over live 0x21");
+        assert!(s.gpu_policy_writes[0].ppab, "unset fields preserve live 0x21");
+        drop(s);
+        // Observed + desired stamped; profile name recorded.
+        let observed = rig.handle.observed();
+        assert_eq!(observed.epp_ac.value(), Some(&33));
+        assert_eq!(observed.max_fan.value(), Some(&true));
+        assert_eq!(rig.handle.desired().profile.as_deref(), Some("mix"));
+        rig.handle.shutdown();
+    }
+
+    #[test]
+    fn profile_unknown_name_rejects_without_writes() {
+        let rig = TestRig::start("prof-unknown");
+        let o = block(
+            &rig.handle,
+            ControlCommand::ApplyProfile {
+                profile: "nope".into(),
+            },
+        );
+        assert!(matches!(
+            o.status,
+            ControlStatus::Rejected {
+                error: ControlError::UnknownProfile { .. }
+            }
+        ));
+        let s = rig.hp.state();
+        assert!(s.thermal_writes.is_empty() && s.max_fan_writes.is_empty());
+        drop(s);
+        rig.handle.shutdown();
+    }
+
+    #[test]
+    fn profile_partial_failure_stops_at_failing_step() {
+        // Plan order PPM → … → thermal → fan: with thermal failing, EPP is
+        // already applied (Partial carries it) and fan is NEVER written.
+        let hp = MockHp::default();
+        hp.state().fail_next_thermal = true;
+        let mut p = PerformanceProfile::default();
+        p.cpu.epp_ac = Some(21);
+        p.thermal_mode = Some(ThermalMode::Performance);
+        p.fan = Some(FanMode::Max);
+        let rig = TestRig::start_with("prof-partial", hp, registry_with("boom", p));
+
+        let o = block(
+            &rig.handle,
+            ControlCommand::ApplyProfile {
+                profile: "boom".into(),
+            },
+        );
+        assert!(matches!(o.status, ControlStatus::Partial));
+        let s = rig.hp.state();
+        assert!(s.max_fan_writes.is_empty(), "steps after the failure must not run");
+        drop(s);
+        assert_eq!(rig.handle.observed().epp_ac.value(), Some(&21));
+        // Partial apply does NOT stamp the profile name.
+        assert_eq!(rig.handle.desired().profile, None);
+        rig.handle.shutdown();
+    }
+
+    #[test]
+    fn profile_field_failing_safety_rejects_whole_pre_write() {
+        // EPP 101 is invalid: the whole profile must reject before ANY
+        // step touches hardware (AR-11 — no half-applied intent).
+        let mut p = PerformanceProfile::default();
+        p.cpu.epp_ac = Some(101);
+        p.thermal_mode = Some(ThermalMode::Performance);
+        let rig = TestRig::start_with("prof-unsafe", MockHp::default(), registry_with("bad", p));
+        let o = block(
+            &rig.handle,
+            ControlCommand::ApplyProfile {
+                profile: "bad".into(),
+            },
+        );
+        assert!(matches!(
+            o.status,
+            ControlStatus::Rejected {
+                error: ControlError::UnsafeRequest { .. }
+            }
+        ));
+        assert!(o.steps.is_empty(), "rejected pre-write: no steps may run");
+        let s = rig.hp.state();
+        assert!(s.thermal_writes.is_empty());
+        drop(s);
+        rig.handle.shutdown();
+    }
+
+    #[test]
+    fn direct_knob_change_clears_profile_stamp() {
+        let mut p = PerformanceProfile::default();
+        p.thermal_mode = Some(ThermalMode::Performance);
+        let rig = TestRig::start_with("prof-clear", MockHp::default(), registry_with("t", p));
+        block(
+            &rig.handle,
+            ControlCommand::ApplyProfile {
+                profile: "t".into(),
+            },
+        );
+        assert_eq!(rig.handle.desired().profile.as_deref(), Some("t"));
+        block(
+            &rig.handle,
+            ControlCommand::SetThermalMode(ThermalMode::Balanced),
+        );
+        assert_eq!(rig.handle.desired().profile, None);
+        rig.handle.shutdown();
+    }
+
+    /// Stable build: a profile carrying power_limits must reject the WHOLE
+    /// profile as Unsupported (the experimental feature is compiled out).
+    #[cfg(not(feature = "experimental-hp-power-limits"))]
+    #[test]
+    fn profile_with_power_limits_rejected_in_stable_build() {
+        let mut p = PerformanceProfile::default();
+        p.cpu.epp_ac = Some(33);
+        p.power_limits = Some(CpuPowerLimits {
+            pl1_w: 45,
+            pl2_w: 90,
+            pl4_w: 0,
+            cpu_gpu_concurrent_w: 0,
+        });
+        let rig = TestRig::start_with("prof-exp-gate", MockHp::default(), registry_with("x", p));
+        let o = block(
+            &rig.handle,
+            ControlCommand::ApplyProfile {
+                profile: "x".into(),
+            },
+        );
+        assert!(matches!(
+            o.status,
+            ControlStatus::Rejected {
+                error: ControlError::Unsupported
+            }
+        ));
+        // Whole-profile rejection: even the (valid) EPP step never ran.
+        assert_eq!(rig.handle.observed().epp_ac.value(), Some(&50)); // MockPpm initial
+        rig.handle.shutdown();
+    }
+
+    /// Experimental build: the same profile passes the gate and applies
+    /// all steps (the 0x29 step converges via the linked feed).
+    #[cfg(feature = "experimental-hp-power-limits")]
+    #[test]
+    fn profile_with_power_limits_applies_in_experimental_build() {
+        let link = std::sync::Arc::new(Mutex::new((55.0_f64, 130.0_f64, 200.0_f64)));
+        let hp = MockHp::default();
+        hp.state().msr_link = Some(std::sync::Arc::clone(&link));
+        let mut p = PerformanceProfile::default();
+        p.cpu.epp_ac = Some(33);
+        p.power_limits = Some(CpuPowerLimits {
+            pl1_w: 45,
+            pl2_w: 90,
+            pl4_w: 150,
+            cpu_gpu_concurrent_w: 0,
+        });
+        p.thermal_mode = Some(ThermalMode::Performance);
+        let mut reg = crate::profiles::ProfileRegistry::empty();
+        reg.insert("x", p);
+
+        let dir = std::env::temp_dir().join(format!(
+            "phelper-coord-test-prof-exp-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let journal_path = dir.join("journal.jsonl");
+        let ppm = MockPpm(std::sync::Arc::new(Mutex::new((50, 50, 50, 50))));
+        let mut cfg = ControlConfig::new(
+            caps_full(),
+            test_identity("prof-exp"),
+            Some(hp.clone()),
+            ppm,
+            PlFeed {
+                link: std::sync::Arc::clone(&link),
+                has_pl4: true,
+            },
+            journal_path,
+        );
+        cfg.verify_poll_interval = Duration::from_millis(5);
+        cfg.keepalive_period = Duration::from_millis(120);
+        cfg.safety_tick = Duration::from_millis(20);
+        cfg.profiles = reg;
+        let handle = ControlCoordinator::start(cfg).unwrap();
+
+        let o = block(
+            &handle,
+            ControlCommand::ApplyProfile {
+                profile: "x".into(),
+            },
+        );
+        assert!(
+            matches!(o.status, ControlStatus::Applied { .. }),
+            "expected Applied, got {:?}",
+            o.status
+        );
+        assert_eq!(handle.observed().epp_ac.value(), Some(&33));
+        assert!(handle.observed().power_limits.is_verified());
+        assert_eq!(handle.desired().profile.as_deref(), Some("x"));
+        handle.shutdown();
+        // Restore wrote the captured baseline (55/130/200) back.
+        let writes = hp.state().power_limits_writes.clone();
+        assert!(writes.len() >= 2);
+        assert_eq!(
+            writes.last(),
+            Some(&CpuPowerLimits {
+                pl1_w: 55,
+                pl2_w: 130,
+                pl4_w: 200,
+                cpu_gpu_concurrent_w: 0,
+            })
+        );
     }
 }

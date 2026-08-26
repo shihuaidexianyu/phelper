@@ -13,5 +13,6 @@ pub mod hp;
 pub mod identity;
 pub mod policy;
 pub mod ports;
+pub mod profile;
 pub mod state;
 pub mod telemetry;

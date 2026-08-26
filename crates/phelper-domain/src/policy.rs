@@ -74,10 +74,11 @@ pub struct GpuPlatformPolicy {
 
 /// 0x29 power limits payload. EXPERIMENTAL on 8BAB: the pl1/pl2 byte order
 /// was settled on-device (M3 S2, 2026-08-26 — firmware wants byte0=PL2,
-/// byte1=PL1, OPPOSITE of the kernel struct). `pl4_w` and
-/// `cpu_gpu_concurrent_w` are NOT writable yet (their explicit-write
-/// behavior is unverified): 0 = leave unchanged (wire 0xFF), nonzero is
-/// rejected by safety and transport.
+/// byte1=PL1, OPPOSITE of the kernel struct). `pl4_w` (byte2) is writable
+/// since M4.1 (write+readback verified via MCHBAR 0x59B0; envelope
+/// 30..=200 W, 0 = not requested → wire 0xFF NO_CHANGE).
+/// `cpu_gpu_concurrent_w` (byte3) remains permanently rejected: no readback
+/// channel, no restore semantics — 0 is the only accepted value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CpuPowerLimits {
     pub pl1_w: u8,
@@ -135,7 +136,10 @@ impl TryFrom<u8> for BoostPolicy {
 }
 
 /// Full CPU policy (architecture.md section 16). `None` = leave unchanged.
+/// `default` allows sparse TOML tables (profiles); `deny_unknown_fields`
+/// catches hand-written config typos.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct CpuPolicy {
     /// Energy Performance Preference 0..=100 (0 = favor performance).
     pub epp_ac: Option<u8>,

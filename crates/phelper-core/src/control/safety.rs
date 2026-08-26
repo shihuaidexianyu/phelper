@@ -103,6 +103,11 @@ impl SafetySupervisor {
         observed: &ObservedState,
     ) -> Result<(), ControlError> {
         match cmd {
+            // Unreachable by construction: the coordinator EXPANDS a profile
+            // into concrete Set* commands first and validates each of those
+            // individually (M5) — the whole profile is rejected before any
+            // write if any expanded field fails its per-command gate.
+            // Kept hard-rejecting as the fail-closed guard.
             ControlCommand::ApplyProfile { .. } => Err(ControlError::Unsupported),
             ControlCommand::SetMuxMode(_) => Err(ControlError::Unsupported),
 

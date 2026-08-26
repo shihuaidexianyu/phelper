@@ -10,6 +10,7 @@ pub mod control;
 mod engine;
 pub mod persistence;
 mod platform;
+pub mod profiles;
 pub mod smoke;
 pub mod telemetry;
 

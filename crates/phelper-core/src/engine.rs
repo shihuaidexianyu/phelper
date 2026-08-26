@@ -122,16 +122,24 @@ impl Engine {
             for note in &report.capabilities.notes {
                 info!(note = %note, "capability note");
             }
-            match crate::control::ControlCoordinator::start(crate::control::ControlConfig::new(
-                report.capabilities,
-                identity.clone(),
-                hp.as_deref().cloned(),
-                crate::platform::windows_ppm::PpmBackend,
-                crate::control::SnapshotFeed {
-                    telemetry: telemetry.clone(),
-                },
-                crate::control::journal::ControlJournal::default_path(),
-            )) {
+            match crate::control::ControlCoordinator::start({
+                let mut cfg = crate::control::ControlConfig::new(
+                    report.capabilities,
+                    identity.clone(),
+                    hp.as_deref().cloned(),
+                    crate::platform::windows_ppm::PpmBackend,
+                    crate::control::SnapshotFeed {
+                        telemetry: telemetry.clone(),
+                    },
+                    crate::control::journal::ControlJournal::default_path(),
+                );
+                let registry = crate::profiles::ProfileRegistry::load_default();
+                for w in &registry.warnings {
+                    warn!(warning = %w, "profile load warning");
+                }
+                cfg.profiles = registry;
+                cfg
+            }) {
                 Ok(h) => Some(h),
                 Err(e) => {
                     warn!(%e, "control coordinator unavailable — telemetry-only");

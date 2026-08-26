@@ -1303,6 +1303,8 @@ NVAPI/NVML
 
 **M3 实机记录（0x22 写已实现）**：8BAB 的 0x21 读回 `slowdown_temp_c` 恒为 0（本板无此旋钮）——读改写时按原样保留（safety 层特判 0 = preserve，显式用户值仍需 30..=110°C）。写路径：0x22 → 0x21 延迟回读 Verified（3×1s 轮询全字段相等）；停机恢复写回启动时读回值（仅当本会话写过）。HIL-2 行为证据：cTGP off 期间 GPU 负载功率平台 59.4W vs on 基线 64.4W（NVML 采样，CUDA memset 负载上限本身低于 80W TGP）；复原后 0x21 确认 ctgp=true。
 
+**M5 实机记录（dstate 字段定性，2026-08-26，BIOS F.30）**：`dstate` 在 8BAB 上是**写无效字段**——0x22 写 dstate=1 后 0x21 回读不随之改变（dGPU 空闲与 CUDA 负载下各验证一次，均 rc=0 但回读不动）；且 0x21 的 dstate 回读本身是**动态值**（同日同 BIOS 在 1 与 3 之间自发变化，与 AC/DC 及 GPU 负载均无相关性，机制未定性）。M3 未发现此事的原因：当时所有 gpu-policy 写的 dstate 恰好等于读回值（验证平凡通过）；是 M5 balanced profile 写入与读回不同的值才抓出。处理：内置 profile 一律不含 dstate（不能携带无法验证的旋钮）；`gpu-policy --dstate` 保留为 dev 手段，验证层会如实报 Failed。ctgp/ppab 写+回读 Verified 的地位不受影响。
+
 ---
 
 # 27. Fan Control
@@ -1729,22 +1731,26 @@ fan_count = 2
 
 user-facing。
 
-例如：
+**M5 实现记录（2026-08-26，8BAB 实机验证）**：`PerformanceProfile` 已落地——全字段可选（None = 不动该域）；MUX 按构造不可表达（需重启的旋钮永不被预设触发）；`cpu.power_limits` 维持 R8 毒化（0x29 只走顶层 `power_limits` 字段，隔离写）。应用语义：`ApplyProfile{name}` 一条命令 → 协调器展开为**有序具体计划**（PPM → 0x29 → 0x22（活读 0x21 合并）→ thermal → fan——**风扇恒最后**，手动/max 风扇会暂停固件热曲线，其余旋钮必须先就位）→ **全计划预校验**（任一步不过 = 整个 profile 拒绝，零硬件痕迹，AR-11：绝不应用半个被拒意图）→ 逐步执行 + per-step journal；首步失败 = Rejected，后续步失败 = Partial（不回滚，journal 如实记）。聚合验证 = 最弱步（Skipped 中性）。DesiredState 盖章 profile 名（直接改单旋钮即清除——状态不再对应该档）。内置四档全部 stable-clean（无 experimental 字段）：**silent**（EPP 80/95 + boost EfficientAggressive + balanced + 自动风扇——8BAB 冷机自动=0 RPM，最安静的风扇模式就是固件自动）、**balanced**（出厂参考值一键回原厂）、**gaming**（thermal performance + EPP 0）、**cpu-max**（performance + max fan）。内置档**不含 dstate**（M5 HIL 发现 0x22 dstate 写在 8BAB 无效，见 §26）——不能验证的旋钮不进预设。用户 TOML：`%LOCALAPPDATA%\phelper\profiles\*.toml`（文件名=档名；遮蔽内置档名→跳过+告警；解析失败→告警+跳过，引擎照常启动）；可含 `power_limits`（experimental 双门禁照旧，stable 编译整个 profile 拒绝）。CLI：`control profile list/show/export/apply --hold`（list/show/export 不起引擎）。
+
+概念示例（字段名以导出模板为准，`profile export` 生成）：
 
 ```toml
-name = "Gaming"
+description = "Gaming"
+thermal_mode = "performance"
+fan = "firmware_auto"
 
 [cpu]
-epp_ac = 35
-pl1_w = 45
-pl2_w = 70
+epp_ac = 0
+boost_policy = "aggressive"
 
-[gpu]
+[gpu_policy]
 ctgp = true
 ppab = true
 
-[thermal]
-mode = "performance"
+# [power_limits]  ← 仅 experimental 编译可应用（双门禁）
+# pl1_w = 45
+# pl2_w = 90
 ```
 
 ---
@@ -2879,6 +2885,46 @@ Experimental 门禁的理由之一。
 
 ---
 
+## Phase 2.7 — M5 Profiles（已完成，8BAB 实机验证；Phase 4 提前）
+
+§36 用户档落地（设计与实现记录见 §36 "M5 实现记录"）：
+
+```text
+domain：PerformanceProfile 全 Optional（None=不动该域；MUX 不可表达）+
+  GpuPolicyPatch（0x22 读改写合并）；ControlError::UnknownProfile 新增；
+  CpuPolicy 加 serde default+deny_unknown_fields（TOML 手写字段防呆）
+core：profiles.rs registry（内置四档 + %LOCALAPPDATA%\phelper\profiles
+  \*.toml；遮蔽内置→跳过告警；坏文件→告警不 panic）；协调器 execute()
+  重构——单命令 = 1 步计划，ApplyProfile 展开为有序具体计划
+  （PPM→0x29→0x22→thermal→fan，风扇恒最后）→ 全计划预校验（任一步
+  失败整档拒绝，零硬件痕迹）→ 逐步执行，首步失败=Rejected / 后续失败
+  =Partial；聚合验证=最弱步；desired 盖章档名（单旋钮改动即清除）；
+  恢复语义免费得（复用 exec_* 的 dirty 标志 + 既有停机恢复序列）
+CLI：control profile list/show/export（不起引擎）/ apply --hold；
+  apply 前置校验（未知名带候选列表 / R8 路由 / stable 拒 power_limits
+  档）——全部引擎启动前拒绝
+内置档（全部 stable-clean，值均有实测依据）：silent（EPP 80/95 +
+  EfficientAggressive + balanced + 自动风扇）、balanced（出厂参考值
+  一键回原厂）、gaming（performance + EPP 0）、cpu-max（performance +
+  max fan）；一律不含 dstate（写无效字段，§26 M5 记录）
+```
+
+HIL（提权，2026-08-26）：silent → powercfg /QH 对表 EPP 0x50/0x5F +
+boost 0x04（Efficient* 变体本机可写可读，此前未表征）；balanced 首跑
+**抓出 dstate 写无效**（0x21 回读 3，写 1 不动——AR-10 诚实 Failed 路径
+自证有效，内置档随即剔除 dstate 后全绿）；cpu-max hold 70s 撑过心跳
+（期间温度触 90°C safety ForceMaxFan 重印章，符合设计）→ 关机恢复
+journal origin=shutdown、风扇回自动 0 RPM；gaming 全绿；负向全前置
+（typo TOML 告警+跳过 / stable 拒 power_limits 档 / R8 路由拒 / 未知名
+带候选列表）；experimental 编译 exp-limits.toml（EPP 20 + 45/90/150）
+端到端双通道 Verified 1104ms + 恢复。
+单元测试 81（默认）/ 89（全 feature）全绿，clippy 双配置零警告。
+
+明确未做：profile 热键/托盘切换（属 UI 层）、profile 内自定义风扇曲线
+（Phase 6）、MUX（需重启，永不在 profile 内）。
+
+---
+
 ## Phase 3 — GPUI Shell
 
 建立：
@@ -2897,7 +2943,8 @@ UI 只依赖 AppState。
 
 ## Phase 4 — Profiles
 
-建立：
+**已于 M5（Phase 2.7）提前完成并经 8BAB 实机验证**（core + CLI 层；
+此节原描述的 UI 层档位切换仍属 Phase 3+）。建立：
 
 ```text
 Silent

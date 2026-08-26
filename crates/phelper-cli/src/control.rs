@@ -108,6 +108,12 @@ enum ControlCmd {
         #[arg(long, default_value_t = 120)]
         hold: u64,
     },
+    /// Performance profiles (§36 built-ins + user TOML in
+    /// %LOCALAPPDATA%\phelper\profiles\*.toml).
+    Profile {
+        #[command(subcommand)]
+        cmd: ProfileCmd,
+    },
     /// Set GPU platform policy (0x22: cTGP / PPAB / dstate / slowdown temp).
     /// Unspecified fields keep their current 0x21-readback values
     /// (read-modify-write; slowdown temp is preserved by default).
@@ -118,12 +124,42 @@ enum ControlCmd {
         /// PPAB (power budget balancing) on/off.
         #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
         ppab: Option<bool>,
-        /// GPU power state: 1=100%, 2=50%, 3=25%, 4=12.5%.
+        /// GPU power state: 1=100%, 2=50%, 3=25%, 4=12.5%. NOTE (M5 HIL,
+        /// 2026-08-26): dstate writes are INEFFECTIVE on 8BAB — 0x21 keeps
+        /// reading the firmware's own live value (seen 1 and 3 on the same
+        /// BIOS F.30, same day, unaffected by our writes); verification
+        /// will honestly report Failed when the readback disagrees.
         #[arg(long)]
         dstate: Option<u8>,
         /// GPU slowdown temperature threshold (°C).
         #[arg(long)]
         slowdown_temp: Option<u8>,
+        #[arg(long, default_value_t = 120)]
+        hold: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProfileCmd {
+    /// List built-in and user profiles (no engine start).
+    List,
+    /// Show one profile's full definition (no engine start).
+    Show {
+        /// Profile name (see `profile list`).
+        name: String,
+    },
+    /// Print a profile as TOML on stdout — a template for your own files
+    /// (redirect into %LOCALAPPDATA%\phelper\profiles\<name>.toml).
+    Export {
+        /// Profile name (see `profile list`).
+        name: String,
+    },
+    /// Apply a profile: validated whole, then executed as an ordered
+    /// multi-step plan (PPM → power limits → GPU policy → thermal → fan).
+    /// Hold keeps the heartbeat alive; exit restores HP-state (AR-12).
+    Apply {
+        /// Profile name (see `profile list`).
+        name: String,
         #[arg(long, default_value_t = 120)]
         hold: u64,
     },
@@ -218,6 +254,12 @@ enum Plan {
         slowdown_temp: Option<u8>,
         hold: u64,
     },
+    /// Profile actions that never touch hardware (no engine start).
+    ProfileList,
+    ProfileShow(String),
+    ProfileExport(String),
+    /// Dispatch ApplyProfile, hold for the heartbeat, graceful restore.
+    ProfileApply { name: String, hold: u64 },
 }
 
 /// Pure argument → command mapping. All rejections happen HERE, before
@@ -355,11 +397,49 @@ fn plan(args: &ControlArgs) -> Result<Plan> {
                 )
             }
         },
+        ControlCmd::Profile { cmd } => match cmd {
+            ProfileCmd::List => Plan::ProfileList,
+            ProfileCmd::Show { name } => Plan::ProfileShow(name.clone()),
+            ProfileCmd::Export { name } => Plan::ProfileExport(name.clone()),
+            ProfileCmd::Apply { name, hold } => {
+                // Everything rejectable is rejected HERE, before Engine::start.
+                let registry = phelper_core::profiles::ProfileRegistry::load_default();
+                let Some(profile) = registry.get(name) else {
+                    let known: Vec<&str> = registry.iter().map(|(n, _, _)| n).collect();
+                    bail!("unknown profile '{name}' (available: {})", known.join(", "));
+                };
+                if profile.cpu.power_limits.is_some() {
+                    bail!(
+                        "profile '{name}' sets cpu.power_limits — that route is R8-poisoned \
+                         (0x29 never rides a CpuPolicy batch); use the top-level \
+                         `power_limits` field instead"
+                    );
+                }
+                if profile.power_limits.is_some() && !cfg!(feature = "experimental") {
+                    bail!(
+                        "profile '{name}' carries power_limits (0x29, EXPERIMENTAL) but this \
+                         build lacks the feature — rebuild with `--features experimental` \
+                         (double gate: feature + Experimental caps)"
+                    );
+                }
+                Plan::ProfileApply {
+                    name: name.clone(),
+                    hold: *hold,
+                }
+            }
+        },
     })
 }
 
 pub fn run(args: ControlArgs) -> Result<()> {
     let plan = plan(&args)?;
+    // No-engine plans first: list/show/export never touch hardware.
+    match plan {
+        Plan::ProfileList => return profile_list(),
+        Plan::ProfileShow(name) => return profile_show(&name),
+        Plan::ProfileExport(name) => return profile_export(&name),
+        _ => {}
+    }
     let engine = Engine::start().context("engine start")?;
     match plan {
         Plan::Status => {
@@ -373,6 +453,12 @@ pub fn run(args: ControlArgs) -> Result<()> {
             r
         }
         Plan::HpState(cmd, hold) => run_hp_state(engine, cmd, hold),
+        Plan::ProfileApply { name, hold } => {
+            run_hp_state(engine, ControlCommand::ApplyProfile { profile: name }, hold)
+        }
+        Plan::ProfileList | Plan::ProfileShow(_) | Plan::ProfileExport(_) => {
+            unreachable!("handled before engine start")
+        }
         Plan::GpuPolicyMerge {
             ctgp,
             ppab,
@@ -405,6 +491,64 @@ pub fn run(args: ControlArgs) -> Result<()> {
             run_hp_state(engine, ControlCommand::SetGpuPlatformPolicy(merged), hold)
         }
     }
+}
+
+fn profile_list() -> Result<()> {
+    let registry = phelper_core::profiles::ProfileRegistry::load_default();
+    println!(
+        "profiles (user dir: {}):",
+        phelper_core::profiles::profiles_dir().display()
+    );
+    for (name, p, builtin) in registry.iter() {
+        let tag = if builtin { "built-in" } else { "user    " };
+        let mut touches: Vec<&str> = Vec::new();
+        if p.cpu != Default::default() {
+            touches.push("ppm");
+        }
+        if p.power_limits.is_some() {
+            touches.push("0x29!");
+        }
+        if p.gpu_policy.is_some() {
+            touches.push("gpu");
+        }
+        if p.thermal_mode.is_some() {
+            touches.push("thermal");
+        }
+        if p.fan.is_some() {
+            touches.push("fan");
+        }
+        println!("  {name:<12} [{tag}] {:<24} {}", touches.join("+"), p.description);
+    }
+    for w in &registry.warnings {
+        eprintln!("  warning: {w}");
+    }
+    Ok(())
+}
+
+fn profile_show(name: &str) -> Result<()> {
+    let registry = phelper_core::profiles::ProfileRegistry::load_default();
+    let Some(p) = registry.get(name) else {
+        let known: Vec<&str> = registry.iter().map(|(n, _, _)| n).collect();
+        bail!("unknown profile '{name}' (available: {})", known.join(", "));
+    };
+    let kind = if registry.is_builtin(name) {
+        "built-in"
+    } else {
+        "user"
+    };
+    println!("profile '{name}' [{kind}]: {}", p.description);
+    println!("{p:#?}");
+    Ok(())
+}
+
+fn profile_export(name: &str) -> Result<()> {
+    let registry = phelper_core::profiles::ProfileRegistry::load_default();
+    let Some(p) = registry.get(name) else {
+        let known: Vec<&str> = registry.iter().map(|(n, _, _)| n).collect();
+        bail!("unknown profile '{name}' (available: {})", known.join(", "));
+    };
+    print!("{}", phelper_core::profiles::to_toml(p)?);
+    Ok(())
 }
 
 /// HP-state change + optional heartbeat hold + graceful restore. The engine

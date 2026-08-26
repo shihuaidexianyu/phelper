@@ -25,6 +25,8 @@ pub enum ControlError {
     BackendUnavailable { what: String },
     #[error("another control operation is in progress")]
     Busy,
+    #[error("unknown profile: {name}")]
+    UnknownProfile { name: String },
 }
 
 /// Engine init/probe failures.
