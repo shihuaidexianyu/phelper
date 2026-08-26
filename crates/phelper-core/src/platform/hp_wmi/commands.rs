@@ -335,6 +335,20 @@ pub(crate) fn encode_power_limits_restore_default() -> [u8; 4] {
     ]
 }
 
+/// DEV-SPIKE ONLY (M4-mini): byte2-only PL4 write `{FF, FF, pl4, FF}`, all
+/// other bytes NO_CHANGE. Used by `pl4-spike` to verify the MCHBAR 0x59B0
+/// readback channel; NOT wired into any stable path (the transport rejects
+/// pl4≠0 until that verification lands).
+#[allow(dead_code)] // M4-mini spike
+pub(crate) fn encode_power_limits_pl4_only(pl4_w: u8) -> [u8; 4] {
+    [
+        POWER_LIMIT_NO_CHANGE,
+        POWER_LIMIT_NO_CHANGE,
+        pl4_w,
+        POWER_LIMIT_NO_CHANGE,
+    ]
+}
+
 // ---------------------------------------------------------------- tests
 
 #[cfg(test)]
@@ -454,6 +468,7 @@ mod tests {
         // The canonical encoder is the S2-arbitrated one (swapped on 8BAB).
         assert_eq!(encode_power_limits(45, 90), [90, 45, 0xFF, 0xFF]);
         assert_eq!(encode_power_limits_restore_default(), [0, 0, 0xFF, 0xFF]);
+        assert_eq!(encode_power_limits_pl4_only(150), [0xFF, 0xFF, 150, 0xFF]);
     }
 
     #[test]

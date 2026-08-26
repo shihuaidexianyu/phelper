@@ -252,22 +252,27 @@ EC 在第一版中最多是：
 
 ---
 
-## AR-09 — PawnIO 在第一阶段只作为受约束的 read infrastructure
+## AR-09 — PawnIO 只作为受约束的 read infrastructure
 
-PawnIO 的角色是读取：
+PawnIO 的角色是读取，信任模型 = **签名模块 + 按操作白名单**：
 
-- Intel architectural / documented MSR；
+- Intel architectural / documented MSR（IntelMSR 模块）；
 - thermal status；
 - RAPL energy；
 - APERF / MPERF；
+- MCHBAR 只读窗口（IntelMCHBAR 模块，M4-mini 加入：该模块源码级无写
+  ioctl——CPU 白名单 + 偏移边界 + 对齐检查全部模块内强制；用于 PL4
+  回读通道与 SA 功耗块诊断）；
 - 必要的低层 telemetry。
 
+任何模块引入都必须满足：模块本身签名、操作面只读、有显式 allow-list。
 Application 层不暴露 generic：
 
 ```rust
 write_msr()
 write_io_port()
 write_ec()
+write_mchbar()
 ```
 
 接口。
@@ -1245,7 +1250,9 @@ struct victus_power_limits {
 };
 ```
 
-**字节序冲突已定案（2026-08-26，8BAB 实机双重 A/B 仲裁，spike S2）**：8BAB 固件要求 **byte0=PL2、byte1=PL1——与内核 struct 相反**。证据：内核序写 `{2D(45), 5A(90), FF, FF}` → MSR 0x610 读出 PL1=90/PL2=45；交换序写 `{82(130), 37(55), FF, FF}` → 0x610 读出 PL1=55/PL2=130。效果即时（写后第一个 250ms 轮询即变）。OSH 的 `SetCpuPowerLimit(v,v)` 两字节同值，对顺序零举证——冲突曾经真实存在但只有 bytes 0/1 需要仲裁。`0xFF` = 按字节 NO_CHANGE（内核常量 `HP_POWER_LIMIT_NO_CHANGE`），解决 pl4/cc 保留问题；pl4/cc 显式写仍未验证 → 传输层拒绝非零值。
+**字节序冲突已定案（2026-08-26，8BAB 实机双重 A/B 仲裁，spike S2）**：8BAB 固件要求 **byte0=PL2、byte1=PL1——与内核 struct 相反**。证据：内核序写 `{2D(45), 5A(90), FF, FF}` → MSR 0x610 读出 PL1=90/PL2=45；交换序写 `{82(130), 37(55), FF, FF}` → 0x610 读出 PL1=55/PL2=130。效果即时（写后第一个 250ms 轮询即变）。OSH 的 `SetCpuPowerLimit(v,v)` 两字节同值，对顺序零举证——冲突曾经真实存在但只有 bytes 0/1 需要仲裁。`0xFF` = 按字节 NO_CHANGE（内核常量 `HP_POWER_LIMIT_NO_CHANGE`），解决 pl4/cc 保留问题。
+
+**byte2=PL4 回读通道已定案（2026-08-26，M4-mini 纯读探针 + byte2 写 spike）**：PL4 无架构 MSR，但 MCHBAR 窗口（签名 IntelMCHBAR 模块，源码级无写 ioctl，基址 0xFEDC0000）内含 RAPL MMIO 块——**0x5938 = 功耗单位寄存器**（0xA0E03，与 MSR 0x606 精确一致，锚点），**0x59B0 = PL4 寄存器**（布局 bits 14:0 × 1/8W）。spike 证据：写 `{FF,FF,96,FF}`（PL4=150W）→ 首个 250ms 轮询 0x59B0 = 150.0W；**同 poll 0x610 全程 55/130 不动——0xFF NO_CHANGE 在字节 0/1 上语义证实**（M3 未单独隔离验证的附带空白就此补齐）；显式写回 200W → 0x59B0 = 200.0W（恢复确认）。"0x59A0 = 0x610 镜像"的文献假设在本平台被证伪（读出 130/130）——布局结论全部来自实机扫描。注意：0x59B0 位于 0x59A0 qword 之外，MMIO 读 PL4 必须用 0x59B0 dword。PL4 证据等级 = **写+回读 Verified，瞬态跳闸行为未验证**（超出 250ms 采样能力，如实标注）；cc（byte3）仍无任何回读通道 + 恢复语义无解 → 维持永久拒绝。
 
 **`{0,0,FF,FF}`（`HP_POWER_LIMIT_DEFAULT`）恢复写在本固件 500ms 内不生效**（仲裁实验中实测：写后 0x610 保持原值）。因此停机恢复 = 显式写回首次写入前捕获的 0x610 基线，绝不依赖 0x00。
 

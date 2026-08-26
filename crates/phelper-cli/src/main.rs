@@ -40,6 +40,11 @@ enum Cmd {
         #[arg(long, default_value_t = 32)]
         threads: usize,
     },
+    /// DEV ONLY (§57 Stage 1, M4-mini): READ-ONLY MCHBAR cross-check probe.
+    /// Zero writes. Cross-validates the PL4 readback channel: MMIO 0x59A0
+    /// vs MSR 0x610, then sweeps the SA power block for the factory PL4
+    /// (SDD 0x28 byte5 = 200 W). Prerequisite for any future PL4 write.
+    MchbarProbe,
     /// DEV ONLY (§57 Stage 2, spike S2): HP write-transport spike — 0x1A
     /// thermal round-trip + 0x2E manual fan with 0x2D readback, then
     /// restores firmware auto. First hardware write this project ever did.
@@ -51,6 +56,17 @@ enum Cmd {
         /// GPU fan target, RPM (multiple of 100).
         #[arg(long, default_value_t = 5000)]
         gpu: u16,
+    },
+    /// DEV ONLY (§57 Stage 2, M4-mini): PL4 readback decisive spike — 0x29
+    /// byte2-only write {FF,FF,pl4,FF} (DOWNWARD from factory 200 W only),
+    /// polls MCHBAR 0x59B0 + MSR 0x610 (0xFF NO_CHANGE check on bytes 0/1),
+    /// then restores byte2 to the measured baseline. Only in
+    /// `--features experimental` builds.
+    #[cfg(feature = "experimental")]
+    Pl4Spike {
+        /// PL4 watts to write — must be below factory 200 W (downward only).
+        #[arg(long, default_value_t = 150)]
+        pl4: u8,
     },
     /// DEV ONLY (§57 Stage 2, M3 spike S2): 0x29 byte-order ARBITRATION.
     /// Writes asymmetric PL1/PL2 under one candidate encoding, watches MSR
@@ -107,6 +123,12 @@ fn main() -> Result<()> {
         Cmd::Telemetry(args) => telemetry::run(args),
         Cmd::Control(args) => control::run(args),
         Cmd::GpuLoad(args) => gpuload::run(args),
+        Cmd::MchbarProbe => {
+            println!("--- MCHBAR read-only cross-check probe (M4-mini) ---");
+            let report = phelper_core::smoke::mchbar_probe()?;
+            print!("{report}");
+            Ok(())
+        }
         Cmd::CpuLoad { seconds, threads } => {
             let stop = Arc::new(AtomicBool::new(false));
             let mut handles = Vec::with_capacity(threads);
@@ -135,6 +157,13 @@ fn main() -> Result<()> {
             }
             println!("--- HP write-transport spike (S2) ---");
             let report = phelper_core::smoke::hp_write_spike(cpu / 100, gpu / 100)?;
+            print!("{report}");
+            Ok(())
+        }
+        #[cfg(feature = "experimental")]
+        Cmd::Pl4Spike { pl4 } => {
+            println!("--- PL4 readback decisive spike (M4-mini) ---");
+            let report = phelper_core::smoke::pl4_spike(pl4)?;
             print!("{report}");
             Ok(())
         }

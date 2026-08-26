@@ -1,4 +1,9 @@
-//! PawnIO driver binding — read-only MSR telemetry infrastructure (AR-09).
+//! PawnIO driver binding — read-only hardware telemetry infrastructure
+//! (AR-09): signed modules + per-operation allow-lists, never a generic
+//! write primitive. Two modules are used:
+//!   IntelMSR     — allow-listed MSR reads (thermals, RAPL, APERF/MPERF)
+//!   IntelMCHBAR  — MCHBAR window reads (PL4 readback, M4-mini); the module
+//!                  exports NO write ioctls at all (source-verified)
 //!
 //! Protocol constants verified against the public driver interface (the
 //! same shape LibreHardwareMonitor's PawnIo.cs uses; cpu-temp's Rust
@@ -9,8 +14,8 @@
 //!   Execute       (41394<<16) | (0x841<<2)
 //!   execute input [32-byte ASCII fn name][input i64s LE] → output i64s LE
 //!
-//! There is deliberately NO write_msr/write_io_port/write_ec anywhere in
-//! this crate. The IntelMSR module's read function is the only call made.
+//! There is deliberately NO write_msr/write_io_port/write_ec/write_mchbar
+//! anywhere in this crate. Only the modules' read functions are called.
 
 use phelper_domain::error::PlatformError;
 use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE};
@@ -215,33 +220,85 @@ pub(crate) fn effective_clock_mhz(tsc_mhz: u32, prev: (u64, u64), now: (u64, u64
 /// Locate the signed IntelMSR module image (runtime data file, LGPL —
 /// shipped alongside its COPYING text, never embedded in the binary).
 pub(crate) fn intelmsr_image() -> Result<Vec<u8>, PlatformError> {
+    module_image("PHELPER_INTELMSR", "IntelMSR.bin")
+}
+
+fn module_image(env_var: &str, file: &str) -> Result<Vec<u8>, PlatformError> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(p) = std::env::var("PHELPER_INTELMSR") {
+    if let Ok(p) = std::env::var(env_var) {
         candidates.push(p.into());
     }
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        candidates.push(dir.join("assets").join("pawnio").join("IntelMSR.bin"));
+        candidates.push(dir.join("assets").join("pawnio").join(file));
         candidates.push(
             dir.join("..")
                 .join("..")
                 .join("assets")
                 .join("pawnio")
-                .join("IntelMSR.bin"),
+                .join(file),
         );
     }
     if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("assets").join("pawnio").join("IntelMSR.bin"));
+        candidates.push(cwd.join("assets").join("pawnio").join(file));
     }
     for path in &candidates {
         if let Ok(bytes) = std::fs::read(path) {
             return Ok(bytes);
         }
     }
-    Err(PlatformError::NotAvailable(
-        "IntelMSR.bin not found (set PHELPER_INTELMSR or run from repo root)",
-    ))
+    Err(PlatformError::Driver(format!(
+        "{file} not found (set {env_var} or run from repo root)"
+    )))
+}
+
+// ---------------------------------------------------------------------------
+// IntelMCHBAR module surface.
+// ---------------------------------------------------------------------------
+//
+// Read-only BY CONSTRUCTION: the signed module exports exactly three ioctls
+// (source-verified 2026-08-26 against namazso/PawnIO.Modules IntelMCHBAR.p)
+// and NO write ioctls at all:
+//   ioctl_read_dword     in[0]=offset → out[0]=value (4-aligned, bounds-checked)
+//   ioctl_read_qword     in[0]=offset → out[0]=value (8-aligned, bounds-checked)
+//   ioctl_get_mchbar_addr (no input)  → out[0]=physical MCHBAR base
+// The module itself resolves the base from PCI 0/0/0 config 0x48/0x4C
+// (MCHBAREN-checked), enforces a CPU allow-list (Raptor Lake accepted),
+// and bounds-checks offsets against the generation's window (0x10000 on RPL).
+
+/// Read one 32-bit dword at `offset` into the MCHBAR window.
+pub(crate) fn mchbar_read_dword(io: &PawnIo, offset: u32) -> Result<u32, PlatformError> {
+    let mut out = [0i64; 1];
+    io.execute("ioctl_read_dword", &[i64::from(offset)], &mut out)?;
+    Ok(out[0] as u32)
+}
+
+/// Read one 64-bit qword at `offset` into the MCHBAR window.
+pub(crate) fn mchbar_read_qword(io: &PawnIo, offset: u32) -> Result<u64, PlatformError> {
+    let mut out = [0i64; 1];
+    io.execute("ioctl_read_qword", &[i64::from(offset)], &mut out)?;
+    Ok(out[0] as u64)
+}
+
+/// Physical MCHBAR base as resolved by the module (diagnostics).
+pub(crate) fn mchbar_base_addr(io: &PawnIo) -> Result<u64, PlatformError> {
+    let mut out = [0i64; 1];
+    io.execute("ioctl_get_mchbar_addr", &[], &mut out)?;
+    Ok(out[0] as u64)
+}
+
+/// Locate the signed IntelMCHBAR module image (same LGPL runtime-data rules
+/// as IntelMSR.bin; override path via PHELPER_INTELMCHBAR).
+pub(crate) fn mchbar_image() -> Result<Vec<u8>, PlatformError> {
+    module_image("PHELPER_INTELMCHBAR", "IntelMCHBAR.bin")
+}
+
+/// Decode one power-limit field (bits 14:0, ×unit) — the layout MSR 0x610
+/// uses for PL1/PL2, reused by the MCHBAR power-block scan: candidate PL4
+/// fields share this encoding on Intel client platforms.
+pub(crate) fn power_limit_field_w(raw: u32, unit_w: f64) -> f64 {
+    (raw & 0x7FFF) as f64 * unit_w
 }
 
 #[cfg(test)]
@@ -276,6 +333,15 @@ mod tests {
         let (pl1, pl2) = pkg_power_limits_w(raw, 0.125);
         assert!((pl1 - 55.0).abs() < f64::EPSILON);
         assert!((pl2 - 110.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn power_limit_field_decode() {
+        // Factory PL4 on 8BAB: 200 W at 1/8 W units → field 1600 = 0x640.
+        assert!((power_limit_field_w(0x640, 0.125) - 200.0).abs() < f64::EPSILON);
+        assert!((power_limit_field_w(0, 0.125)).abs() < f64::EPSILON);
+        // Only bits 14:0 participate (enable/lock bits masked out).
+        assert!((power_limit_field_w(0x8000_0640, 0.125) - 200.0).abs() < f64::EPSILON);
     }
 
     #[test]
