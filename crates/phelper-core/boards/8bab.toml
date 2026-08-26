@@ -1,0 +1,34 @@
+[device]
+board_id = "8BAB"
+marketing_name = "OMEN Gaming Laptop 16-wf0xxx (2023), e.g. 16-wf0032TX"
+
+# Thermal policy family. 8BAB is statically V1 (hp-wmi.c: 0x30 balanced,
+# 0x31 performance baked into omen_v1_board_params; no runtime detection).
+[hp]
+thermal_policy = "v1"
+supports_gpu_power_mode = true
+supports_mux = true
+# 0x29: kernel never writes explicit values on this board; byte order
+# contested (kernel {pl1,pl2,pl4,cc} vs OmenSuperHub {PL2,PL1,..}).
+# Promote to "supported" ONLY after the three-step verification passes
+# (WMI write -> MSR 0x610 readback -> RAPL under load). See feasibility §3.
+power_limits = "experimental"
+
+[fan]
+count = 2
+# V1 = 100-RPM units (level * 100 = RPM). NEVER send percent to this board
+# (feasibility R2).
+scale = "krpm"
+# Fallback clamp in levels, used only if the 0x2F table probe fails.
+clamp_min = 0
+clamp_max = 55
+
+[cpu]
+# Invariant TSC = P-core base on i9-13900HX; base of APERF/MPERF eff-clock.
+tsc_mhz = 2200
+
+[ec]
+# Feasibility R3: 8BAB is on the EC max-fan-freeze blacklist. No EC write
+# function exists anywhere in the codebase; this documents the prohibition
+# as data.
+write_forbidden = true

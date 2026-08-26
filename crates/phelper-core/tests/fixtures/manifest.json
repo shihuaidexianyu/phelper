@@ -1,0 +1,9 @@
+{
+  "bios": "F.30",
+  "board": "8BAB",
+  "files": [
+    "sdd_8bab.bin",
+    "fan_table_8bab.bin"
+  ],
+  "taken_at_epoch_ms": 1787656306155
+}

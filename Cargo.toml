@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = ["crates/phelper-domain", "crates/phelper-core", "crates/phelper-cli"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+toml = "0.9"
+tracing = "0.1"
+
+[profile.dev]
+# WMI/COM 交互在 debug 下没有性能需求，但增量编译速度优先
+debug = 1
