@@ -30,6 +30,12 @@ pub enum ReAssert {
     ThermalMode,
     FanLevels,
     MaxFan,
+    /// 0x29 power limits — not part of `tracked()` (that fn is pure over
+    /// ObservedState and the "non-default" notion needs the coordinator's
+    /// dirty flag); the coordinator appends this to its tracked set while
+    /// `power_limits_dirty` is set (AC/DC transitions can make the firmware
+    /// drop custom limits — the kernel re-actualizes on that event).
+    PowerLimits,
 }
 
 #[derive(Debug)]
@@ -83,7 +89,14 @@ impl KeepAliveService {
     /// Recompute the schedule from the current tracked set. Call after any
     /// state change (user command, safety action, shutdown restore).
     pub fn reschedule(&mut self, observed: &ObservedState, now: Instant) {
-        if Self::tracked(observed).is_empty() {
+        self.reschedule_tracked(&Self::tracked(observed), now);
+    }
+
+    /// Recompute the schedule from an explicitly computed tracked set (the
+    /// coordinator's version — it can include coordinator-state items like
+    /// PowerLimits that `tracked()` cannot see).
+    pub fn reschedule_tracked(&mut self, tracked: &[ReAssert], now: Instant) {
+        if tracked.is_empty() {
             self.next_due = None;
         } else {
             self.next_due = Some(now + self.period);

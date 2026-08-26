@@ -13,6 +13,7 @@ pub struct DesiredState {
     pub thermal_mode: Option<ThermalMode>,
     pub fan_mode: Option<FanMode>,
     pub gpu_platform_policy: Option<GpuPlatformPolicy>,
+    pub power_limits: Option<crate::policy::CpuPowerLimits>,
 }
 
 /// Observed configuration state, per-field provenance (AR-10).
@@ -23,8 +24,9 @@ pub struct DesiredState {
 /// - `TrustedWrite`: no trustworthy readback exists (thermal mode — BIOS has
 ///   no query, EC 0x59 is diagnostics-only; max fan — 0x26 is unreliable).
 ///   Maintained by the KeepAliveService re-asserting the last written value.
-/// - `Unknown`: never written/never read (0x29 power limits stay Unknown
-///   until the three-step verification passes).
+/// - `Unknown`: never written/never read. (0x29 power limits sit here until
+///   a write verifies against the MSR 0x610 telemetry readback — the §25
+///   three-step runbook's step 2.)
 #[derive(Debug, Clone, PartialEq)]
 pub enum ObservedValue<T> {
     Verified {
@@ -74,5 +76,7 @@ pub struct ObservedState {
     pub mux: ObservedValue<MuxMode>,
     pub epp_ac: ObservedValue<u8>,
     pub epp_dc: ObservedValue<u8>,
+    pub epp1_ac: ObservedValue<u8>,
+    pub epp1_dc: ObservedValue<u8>,
     pub power_limits: ObservedValue<crate::policy::CpuPowerLimits>,
 }

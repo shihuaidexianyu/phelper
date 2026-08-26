@@ -22,7 +22,9 @@ use phelper_core::domain::capability::{CapabilitySet, Support};
 use phelper_core::domain::command::{
     ControlCommand, ControlOutcome, ControlStatus, StepOutcome, Verification,
 };
-use phelper_core::domain::policy::{BoostPolicy, CpuPolicy, FanLevels, FanMode, ThermalMode};
+use phelper_core::domain::policy::{
+    BoostPolicy, CpuPolicy, FanLevels, FanMode, GpuPlatformPolicy, ThermalMode,
+};
 use phelper_core::domain::state::ObservedState;
 use phelper_core::{Engine, control::journal::ControlJournal};
 
@@ -40,6 +42,15 @@ enum ControlCmd {
     Status,
     /// Set CPU Energy Performance Preference (0-100; 0 = max performance).
     Epp {
+        /// AC value (percent).
+        #[arg(long)]
+        ac: Option<u8>,
+        /// DC (battery) value (percent).
+        #[arg(long)]
+        dc: Option<u8>,
+    },
+    /// Set class-1 (E-core) EPP via PERFEPP1 (0-100; 0 = max performance).
+    Epp1 {
         /// AC value (percent).
         #[arg(long)]
         ac: Option<u8>,
@@ -74,6 +85,40 @@ enum ControlCmd {
     Fan {
         #[command(subcommand)]
         mode: FanCmd,
+    },
+    /// Set CPU power limits PL1/PL2 (0x29, EXPERIMENTAL — only in
+    /// `--features experimental` builds; byte order S2-arbitrated on 8BAB).
+    /// pl4/concurrent are left unchanged (wire 0xFF). Hold keeps the
+    /// heartbeat alive (AC/DC transitions can drop custom limits).
+    #[cfg(feature = "experimental")]
+    PowerLimits {
+        /// PL1 (sustained) watts, 15..=130.
+        #[arg(long)]
+        pl1: u8,
+        /// PL2 (turbo) watts, 15..=157, must be >= PL1.
+        #[arg(long)]
+        pl2: u8,
+        #[arg(long, default_value_t = 120)]
+        hold: u64,
+    },
+    /// Set GPU platform policy (0x22: cTGP / PPAB / dstate / slowdown temp).
+    /// Unspecified fields keep their current 0x21-readback values
+    /// (read-modify-write; slowdown temp is preserved by default).
+    GpuPolicy {
+        /// Configurable TGP on/off.
+        #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
+        ctgp: Option<bool>,
+        /// PPAB (power budget balancing) on/off.
+        #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
+        ppab: Option<bool>,
+        /// GPU power state: 1=100%, 2=50%, 3=25%, 4=12.5%.
+        #[arg(long)]
+        dstate: Option<u8>,
+        /// GPU slowdown temperature threshold (°C).
+        #[arg(long)]
+        slowdown_temp: Option<u8>,
+        #[arg(long, default_value_t = 120)]
+        hold: u64,
     },
 }
 
@@ -157,6 +202,15 @@ enum Plan {
     Change(ControlCommand),
     /// Dispatch, hold the process for the heartbeat, then graceful restore.
     HpState(ControlCommand, u64),
+    /// 0x22 read-modify-write: partial fields, merged with the live 0x21
+    /// readback after engine start, then treated as HpState.
+    GpuPolicyMerge {
+        ctgp: Option<bool>,
+        ppab: Option<bool>,
+        dstate: Option<u8>,
+        slowdown_temp: Option<u8>,
+        hold: u64,
+    },
 }
 
 /// Pure argument → command mapping. All rejections happen HERE, before
@@ -171,6 +225,16 @@ fn plan(args: &ControlArgs) -> Result<Plan> {
             Plan::Change(ControlCommand::SetCpuPolicy(CpuPolicy {
                 epp_ac: *ac,
                 epp_dc: *dc,
+                ..CpuPolicy::default()
+            }))
+        }
+        ControlCmd::Epp1 { ac, dc } => {
+            if ac.is_none() && dc.is_none() {
+                bail!("nothing to do: pass --ac and/or --dc");
+            }
+            Plan::Change(ControlCommand::SetCpuPolicy(CpuPolicy {
+                epp1_ac: *ac,
+                epp1_dc: *dc,
                 ..CpuPolicy::default()
             }))
         }
@@ -198,6 +262,55 @@ fn plan(args: &ControlArgs) -> Result<Plan> {
         })),
         ControlCmd::Thermal { mode, hold } => {
             Plan::HpState(ControlCommand::SetThermalMode((*mode).into()), *hold)
+        }
+        #[cfg(feature = "experimental")]
+        ControlCmd::PowerLimits { pl1, pl2, hold } => {
+            if !(15..=130).contains(pl1) {
+                bail!("--pl1: {pl1}W out of 13900HX envelope 15..=130");
+            }
+            if !(15..=157).contains(pl2) {
+                bail!("--pl2: {pl2}W out of 13900HX envelope 15..=157");
+            }
+            if pl2 < pl1 {
+                bail!("--pl2 must be >= --pl1 (kernel-validated invariant)");
+            }
+            Plan::HpState(
+                ControlCommand::SetPowerLimits(phelper_core::domain::policy::CpuPowerLimits {
+                    pl1_w: *pl1,
+                    pl2_w: *pl2,
+                    pl4_w: 0,
+                    cpu_gpu_concurrent_w: 0,
+                }),
+                *hold,
+            )
+        }
+        ControlCmd::GpuPolicy {
+            ctgp,
+            ppab,
+            dstate,
+            slowdown_temp,
+            hold,
+        } => {
+            if ctgp.is_none() && ppab.is_none() && dstate.is_none() && slowdown_temp.is_none() {
+                bail!("nothing to do: pass at least one of --ctgp/--ppab/--dstate/--slowdown-temp");
+            }
+            if let Some(d) = dstate
+                && !(1..=4).contains(d)
+            {
+                bail!("--dstate: {d} out of range 1..=4 (100/50/25/12.5%)");
+            }
+            if let Some(t) = slowdown_temp
+                && !(30..=110).contains(t)
+            {
+                bail!("--slowdown-temp: {t} outside plausible band 30..=110 °C");
+            }
+            Plan::GpuPolicyMerge {
+                ctgp: *ctgp,
+                ppab: *ppab,
+                dstate: *dstate,
+                slowdown_temp: *slowdown_temp,
+                hold: *hold,
+            }
         }
         ControlCmd::Fan { mode } => match mode {
             // Restoring the default needs no heartbeat: shutdown's restore
@@ -248,6 +361,37 @@ pub fn run(args: ControlArgs) -> Result<()> {
             r
         }
         Plan::HpState(cmd, hold) => run_hp_state(engine, cmd, hold),
+        Plan::GpuPolicyMerge {
+            ctgp,
+            ppab,
+            dstate,
+            slowdown_temp,
+            hold,
+        } => {
+            // Read-modify-write merge against the live 0x21 readback (the
+            // coordinator populated observed.gpu_platform_policy at start).
+            let merged = {
+                let control = engine
+                    .control()
+                    .context("control unavailable (engine is telemetry-only — see startup warnings)")?;
+                let cur = control
+                    .observed()
+                    .gpu_platform_policy
+                    .value()
+                    .copied()
+                    .context(
+                        "0x21 readback unavailable — cannot preserve unspecified fields \
+                         (gpu_platform_policy observed is Unknown)",
+                    )?;
+                GpuPlatformPolicy {
+                    ctgp: ctgp.unwrap_or(cur.ctgp),
+                    ppab: ppab.unwrap_or(cur.ppab),
+                    dstate: dstate.unwrap_or(cur.dstate),
+                    slowdown_temp_c: slowdown_temp.unwrap_or(cur.slowdown_temp_c),
+                }
+            };
+            run_hp_state(engine, ControlCommand::SetGpuPlatformPolicy(merged), hold)
+        }
     }
 }
 
@@ -359,6 +503,7 @@ fn print_capabilities(caps: &CapabilitySet) {
     row("mux (0x52)", caps.mux);
     row("power_limits (0x29)", caps.power_limits);
     row("ppm.epp", caps.ppm.epp);
+    row("ppm.epp1", caps.ppm.epp1);
     row("ppm.max_freq", caps.ppm.max_freq);
     println!("  ppm.write_privileged   {}", caps.ppm.write_privileged);
     println!(
@@ -380,6 +525,8 @@ fn print_observed(obs: &ObservedState) {
     println!("  max_fan:      {}", fmt_obs(&obs.max_fan));
     println!("  epp_ac:       {}", fmt_obs(&obs.epp_ac));
     println!("  epp_dc:       {}", fmt_obs(&obs.epp_dc));
+    println!("  epp1_ac:      {}", fmt_obs(&obs.epp1_ac));
+    println!("  epp1_dc:      {}", fmt_obs(&obs.epp1_dc));
     println!("  gpu_policy:   {}", fmt_obs(&obs.gpu_platform_policy));
     println!("  mux:          {}", fmt_obs(&obs.mux));
     println!("  power_limits: {}", fmt_obs(&obs.power_limits));

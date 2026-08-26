@@ -38,6 +38,10 @@ pub trait ThermalFeed {
     fn pkg_temp_c(&self) -> Option<(f64, Instant)>;
     /// Latest 0x2D fan readback: (levels, when it was taken).
     fn fan_levels(&self) -> Option<(FanLevels, Instant)>;
+    /// Latest MSR 0x610 readback via the PawnIO telemetry collector:
+    /// (pl1_w, pl2_w, when it was taken). The 0x29 verification channel —
+    /// the coordinator reads the telemetry store, never the MSR itself.
+    fn power_limits_w(&self) -> Option<(f64, f64, Instant)>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,9 +96,69 @@ impl SafetySupervisor {
     ) -> Result<(), ControlError> {
         match cmd {
             ControlCommand::ApplyProfile { .. } => Err(ControlError::Unsupported),
-            ControlCommand::SetPowerLimits(_) => Err(ControlError::Unsupported),
-            ControlCommand::SetGpuPlatformPolicy(_) => Err(ControlError::Unsupported),
             ControlCommand::SetMuxMode(_) => Err(ControlError::Unsupported),
+
+            ControlCommand::SetPowerLimits(l) => {
+                // Two independent gates, both required (§25/§54/§57):
+                //   1. the experimental cargo feature must be COMPILED IN
+                //      (feature-off builds reject by construction);
+                //   2. the board capability must say Experimental (8BAB
+                //      BoardProfile does, post-S2-arbitration).
+                if !cfg!(feature = "experimental-hp-power-limits") {
+                    return Err(ControlError::Unsupported);
+                }
+                if caps.power_limits != Support::Experimental {
+                    return Err(ControlError::Unsupported);
+                }
+                if l.pl4_w != 0 || l.cpu_gpu_concurrent_w != 0 {
+                    return Err(ControlError::UnsafeRequest {
+                        reason: "pl4/cpu_gpu_concurrent writes are unverified on 8BAB; \
+                                 set 0 (= leave unchanged, wire 0xFF)"
+                            .into(),
+                    });
+                }
+                // 13900HX envelope: PL1 15..=130 (default 55), PL2 15..=157
+                // (max turbo 157); PL2 >= PL1 (the kernel's own invariant).
+                if !(15..=130).contains(&l.pl1_w) {
+                    return Err(ControlError::UnsafeRequest {
+                        reason: format!("PL1 {}W outside 13900HX envelope 15..=130", l.pl1_w),
+                    });
+                }
+                if !(15..=157).contains(&l.pl2_w) {
+                    return Err(ControlError::UnsafeRequest {
+                        reason: format!("PL2 {}W outside 13900HX envelope 15..=157", l.pl2_w),
+                    });
+                }
+                if l.pl2_w < l.pl1_w {
+                    return Err(ControlError::UnsafeRequest {
+                        reason: format!("PL2 {}W < PL1 {}W", l.pl2_w, l.pl1_w),
+                    });
+                }
+                Ok(())
+            }
+
+            ControlCommand::SetGpuPlatformPolicy(p) => {
+                require_supported(caps.gpu_platform_policy)?;
+                if !(1..=4).contains(&p.dstate) {
+                    return Err(ControlError::UnsafeRequest {
+                        reason: format!("dstate {} out of range 1..=4 (100/50/25/12.5%)", p.dstate),
+                    });
+                }
+                // 0 is special: it is what 0x21 reads on 8BAB ("board has no
+                // slowdown-temp knob"), so writing 0 back is the read-modify-
+                // write PRESERVE of the firmware's own value — by construction
+                // it cannot be unsafe here. Explicit user values are already
+                // range-checked client-side; this band is the second fence.
+                if p.slowdown_temp_c != 0 && !(30..=110).contains(&p.slowdown_temp_c) {
+                    return Err(ControlError::UnsafeRequest {
+                        reason: format!(
+                            "gpu slowdown temp {}°C outside plausible band 30..=110 (0 = preserve board-absent value)",
+                            p.slowdown_temp_c
+                        ),
+                    });
+                }
+                Ok(())
+            }
 
             ControlCommand::SetCpuPolicy(p) => self.validate_cpu_policy(p, caps),
 
@@ -148,6 +212,17 @@ impl SafetySupervisor {
                 if v > 100 {
                     return Err(ControlError::UnsafeRequest {
                         reason: format!("EPP {v} out of range 0..=100"),
+                    });
+                }
+            }
+        }
+        if p.epp1_ac.is_some() || p.epp1_dc.is_some() {
+            require_supported(caps.ppm.epp1)?;
+            require_elevated(caps)?;
+            for v in [p.epp1_ac, p.epp1_dc].into_iter().flatten() {
+                if v > 100 {
+                    return Err(ControlError::UnsafeRequest {
+                        reason: format!("EPP1 {v} out of range 0..=100"),
                     });
                 }
             }
@@ -311,6 +386,9 @@ mod tests {
         fn fan_levels(&self) -> Option<(FanLevels, Instant)> {
             self.fans
         }
+        fn power_limits_w(&self) -> Option<(f64, f64, Instant)> {
+            Some((55.0, 130.0, Instant::now()))
+        }
     }
 
     fn caps_full() -> CapabilitySet {
@@ -326,8 +404,10 @@ mod tests {
         c.fan.clamp_min = Some(5);
         c.fan.clamp_max = Some(55);
         c.ppm.epp = Support::Supported;
+        c.ppm.epp1 = Support::Supported;
         c.ppm.max_freq = Support::Supported;
         c.ppm.write_privileged = true;
+        c.gpu_platform_policy = Support::Supported;
         c
     }
 
@@ -370,6 +450,44 @@ mod tests {
     }
 
     #[test]
+    fn epp1_over_100_rejected() {
+        let s = SafetySupervisor::new();
+        let p = CpuPolicy {
+            epp1_dc: Some(101),
+            ..Default::default()
+        };
+        let e = s
+            .validate(
+                &ControlCommand::SetCpuPolicy(p),
+                &caps_full(),
+                &FakeFeed::fresh(70.0),
+                &ObservedState::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(e, ControlError::UnsafeRequest { .. }));
+    }
+
+    #[test]
+    fn epp1_requires_capability() {
+        let s = SafetySupervisor::new();
+        let mut caps = caps_full();
+        caps.ppm.epp1 = Support::Unsupported;
+        let p = CpuPolicy {
+            epp1_ac: Some(20),
+            ..Default::default()
+        };
+        let e = s
+            .validate(
+                &ControlCommand::SetCpuPolicy(p),
+                &caps,
+                &FakeFeed::fresh(70.0),
+                &ObservedState::default(),
+            )
+            .unwrap_err();
+        assert_eq!(e, ControlError::Unsupported);
+    }
+
+    #[test]
     fn power_limits_poisons_whole_command() {
         let s = SafetySupervisor::new();
         let p = CpuPolicy {
@@ -391,6 +509,171 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(e, ControlError::Unsupported);
+    }
+
+    // ---- validate: GPU platform policy (0x22) ----
+
+    fn gpu_policy() -> phelper_domain::policy::GpuPlatformPolicy {
+        phelper_domain::policy::GpuPlatformPolicy {
+            ctgp: true,
+            ppab: true,
+            dstate: 1,
+            slowdown_temp_c: 87,
+        }
+    }
+
+    #[test]
+    fn gpu_policy_allowed_with_capability() {
+        let s = SafetySupervisor::new();
+        s.validate(
+            &ControlCommand::SetGpuPlatformPolicy(gpu_policy()),
+            &caps_full(),
+            &FakeFeed::fresh(70.0),
+            &ObservedState::default(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn gpu_policy_requires_capability() {
+        let s = SafetySupervisor::new();
+        let mut caps = caps_full();
+        caps.gpu_platform_policy = Support::Unsupported;
+        let e = s
+            .validate(
+                &ControlCommand::SetGpuPlatformPolicy(gpu_policy()),
+                &caps,
+                &FakeFeed::fresh(70.0),
+                &ObservedState::default(),
+            )
+            .unwrap_err();
+        assert_eq!(e, ControlError::Unsupported);
+    }
+
+    #[test]
+    fn gpu_policy_bad_dstate_rejected() {
+        let s = SafetySupervisor::new();
+        let mut p = gpu_policy();
+        p.dstate = 5;
+        let e = s
+            .validate(
+                &ControlCommand::SetGpuPlatformPolicy(p),
+                &caps_full(),
+                &FakeFeed::fresh(70.0),
+                &ObservedState::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(e, ControlError::UnsafeRequest { .. }));
+    }
+
+    #[test]
+    fn gpu_policy_implausible_slowdown_rejected() {
+        let s = SafetySupervisor::new();
+        let mut p = gpu_policy();
+        p.slowdown_temp_c = 200;
+        let e = s
+            .validate(
+                &ControlCommand::SetGpuPlatformPolicy(p),
+                &caps_full(),
+                &FakeFeed::fresh(70.0),
+                &ObservedState::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(e, ControlError::UnsafeRequest { .. }));
+    }
+
+    #[test]
+    fn gpu_policy_slowdown_zero_is_preserve() {
+        // 8BAB's 0x21 readback reports slowdown_temp_c = 0 ("no knob").
+        // A read-modify-write that carries 0 back must pass the safety
+        // gate — it preserves the firmware's own value. (HIL-2 catch:
+        // without this, every gpu-policy write on 8BAB is rejected.)
+        let s = SafetySupervisor::new();
+        let mut p = gpu_policy();
+        p.slowdown_temp_c = 0;
+        s.validate(
+            &ControlCommand::SetGpuPlatformPolicy(p),
+            &caps_full(),
+            &FakeFeed::fresh(70.0),
+            &ObservedState::default(),
+        )
+        .unwrap();
+    }
+
+    // ---- validate: 0x29 power limits (double gate) ----
+
+    fn pl(pl1: u8, pl2: u8) -> phelper_domain::policy::CpuPowerLimits {
+        phelper_domain::policy::CpuPowerLimits {
+            pl1_w: pl1,
+            pl2_w: pl2,
+            pl4_w: 0,
+            cpu_gpu_concurrent_w: 0,
+        }
+    }
+
+    /// Feature-OFF builds reject by construction, even with Experimental
+    /// caps and a sane payload (§57: the path must not exist).
+    #[cfg(not(feature = "experimental-hp-power-limits"))]
+    #[test]
+    fn power_limits_rejected_without_feature() {
+        let s = SafetySupervisor::new();
+        let mut caps = caps_full();
+        caps.power_limits = Support::Experimental;
+        let e = s
+            .validate(
+                &ControlCommand::SetPowerLimits(pl(45, 90)),
+                &caps,
+                &FakeFeed::fresh(70.0),
+                &ObservedState::default(),
+            )
+            .unwrap_err();
+        assert_eq!(e, ControlError::Unsupported);
+    }
+
+    #[cfg(feature = "experimental-hp-power-limits")]
+    #[test]
+    fn power_limits_requires_experimental_caps() {
+        let s = SafetySupervisor::new();
+        // Supported-but-not-Experimental must NOT pass (§54 Tier C rule).
+        let mut caps = caps_full();
+        caps.power_limits = Support::Supported;
+        let e = s
+            .validate(
+                &ControlCommand::SetPowerLimits(pl(45, 90)),
+                &caps,
+                &FakeFeed::fresh(70.0),
+                &ObservedState::default(),
+            )
+            .unwrap_err();
+        assert_eq!(e, ControlError::Unsupported);
+    }
+
+    #[cfg(feature = "experimental-hp-power-limits")]
+    #[test]
+    fn power_limits_range_ladder() {
+        let s = SafetySupervisor::new();
+        let mut caps = caps_full();
+        caps.power_limits = Support::Experimental;
+        let f = FakeFeed::fresh(70.0);
+        let o = ObservedState::default();
+        let check = |l| s.validate(&ControlCommand::SetPowerLimits(l), &caps, &f, &o);
+
+        check(pl(45, 90)).unwrap(); // sane → pass
+
+        let mut bad = pl(14, 90); // PL1 below envelope
+        assert!(matches!(check(bad), Err(ControlError::UnsafeRequest { .. })));
+        bad = pl(131, 140); // PL1 above envelope
+        assert!(matches!(check(bad), Err(ControlError::UnsafeRequest { .. })));
+        bad = pl(45, 158); // PL2 above envelope
+        assert!(matches!(check(bad), Err(ControlError::UnsafeRequest { .. })));
+        bad = pl(90, 45); // PL2 < PL1 (kernel invariant)
+        assert!(matches!(check(bad), Err(ControlError::UnsafeRequest { .. })));
+        bad = pl(45, 90);
+        bad.pl4_w = 200; // pl4 unverified
+        assert!(matches!(check(bad), Err(ControlError::UnsafeRequest { .. })));
+        bad = pl(45, 90);
+        bad.cpu_gpu_concurrent_w = 65; // cc unverified
+        assert!(matches!(check(bad), Err(ControlError::UnsafeRequest { .. })));
     }
 
     #[test]
@@ -559,16 +842,20 @@ mod tests {
         let f = FakeFeed::fresh(70.0);
         let o = ObservedState::default();
         let c = caps_full();
+        // M3 note: SetGpuPlatformPolicy (0x22) moved IN scope (0x21 readback
+        // verification). SetPowerLimits is gated (Experimental caps +
+        // cargo feature) — it still rejects HERE because this caps_full()
+        // deliberately leaves power_limits at NotProbed.
         for cmd in [
             ControlCommand::ApplyProfile {
                 profile: "x".into(),
             },
             ControlCommand::SetMuxMode(phelper_domain::policy::MuxMode::Discrete),
-            ControlCommand::SetGpuPlatformPolicy(phelper_domain::policy::GpuPlatformPolicy {
-                ctgp: true,
-                ppab: true,
-                dstate: 1,
-                slowdown_temp_c: 87,
+            ControlCommand::SetPowerLimits(phelper_domain::policy::CpuPowerLimits {
+                pl1_w: 55,
+                pl2_w: 110,
+                pl4_w: 215,
+                cpu_gpu_concurrent_w: 0,
             }),
         ] {
             assert_eq!(s.validate(&cmd, &c, &f, &o).unwrap_err(), ControlError::Unsupported);

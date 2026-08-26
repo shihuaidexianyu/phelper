@@ -265,6 +265,76 @@ pub(crate) fn encode_max_fan(on: bool) -> [u8; 4] {
     (on as u32).to_le_bytes()
 }
 
+/// 0x22 GPU platform policy set: `{ctgp, ppab, dstate, gpu_slowdown_temp}`,
+/// insize=4, outsize=0 (hp-wmi.c HPWMI_SET_GPU_THERMAL_MODES_QUERY via
+/// HPWMI_GM; OSH SetGpuPowerState same layout). Full 4-byte write — callers
+/// read-modify-write via 0x21 to preserve untouched fields (the kernel
+/// preserves `gpu_slowdown_temp` this way).
+#[allow(dead_code)] // call sites live behind `control` (M3); unconditional for tests
+pub(crate) fn encode_gpu_policy(p: GpuPlatformPolicy) -> [u8; 4] {
+    [
+        u8::from(p.ctgp),
+        u8::from(p.ppab),
+        p.dstate,
+        p.slowdown_temp_c,
+    ]
+}
+
+// ---------------------------------------------------------------- 0x29 power limits
+// S1 verdict (2026-08-26, hp-wmi.c master + OSH OmenHardware.cs):
+// 4-byte payload, per-byte 0xFF = NO_CHANGE, pl1/pl2 = 0x00 restores the
+// firmware DEFAULT. byte2=pl4 and byte3=cpu_gpu_concurrent are
+// cross-confirmed (kernel struct + OSH SetCpuPowerLimit4/SetConcurrentTdp
+// both write single bytes at offsets 2/3). The byte0/byte1 pl1↔pl2 order
+// rests on the kernel struct ALONE (OSH only ever writes both to the same
+// value; the kernel only writes {0,0,FF,FF} on this board class) — that is
+// the unresolved half the on-device arbitration (S2) settles.
+
+/// 0x00 in pl1/pl2 = restore firmware default (hp-wmi.c
+/// HP_POWER_LIMIT_DEFAULT; the kernel's AC/DC re-actualization write).
+pub(crate) const POWER_LIMIT_DEFAULT: u8 = 0x00;
+/// 0xFF in any byte = leave that field unchanged (hp-wmi.c
+/// HP_POWER_LIMIT_NO_CHANGE; OSH writes rely on the same sentinel).
+pub(crate) const POWER_LIMIT_NO_CHANGE: u8 = 0xFF;
+
+/// Candidate A — kernel struct order `{pl1, pl2, 0xFF, 0xFF}`.
+/// **PROVEN WRONG on 8BAB** (M3 S2 arbitration, 2026-08-26): this encoding
+/// wrote intent PL1=45/PL2=90 and MSR 0x610 read back PL1=90/PL2=45. Kept
+/// only so `power-spike --order kernel` can re-run the experiment.
+#[allow(dead_code)] // M3 S2 arbitration
+pub(crate) fn encode_power_limits_kernel(pl1_w: u8, pl2_w: u8) -> [u8; 4] {
+    [pl1_w, pl2_w, POWER_LIMIT_NO_CHANGE, POWER_LIMIT_NO_CHANGE]
+}
+
+/// Candidate B — swapped pl1/pl2 (the documented "OSH order" reading).
+#[allow(dead_code)] // M3 S2 arbitration
+pub(crate) fn encode_power_limits_swapped(pl1_w: u8, pl2_w: u8) -> [u8; 4] {
+    [pl2_w, pl1_w, POWER_LIMIT_NO_CHANGE, POWER_LIMIT_NO_CHANGE]
+}
+
+/// THE 0x29 encoder for 8BAB — byte order settled on-device by the M3 S2
+/// arbitration (2026-08-26, double A/B): **byte0 = PL2, byte1 = PL1** on
+/// this firmware, the OPPOSITE of the kernel struct. pl4/cc always go out
+/// as 0xFF (NO_CHANGE): their explicit-write behavior was not part of the
+/// arbitration, so they stay unwritable (§57). Do not "fix" this to the
+/// kernel order — that is exactly the trap §25's mandatory three-step
+/// verification exists for.
+pub(crate) fn encode_power_limits(pl1_w: u8, pl2_w: u8) -> [u8; 4] {
+    encode_power_limits_swapped(pl1_w, pl2_w)
+}
+
+/// Restore firmware default PL1/PL2: `{0x00, 0x00, 0xFF, 0xFF}` — the exact
+/// write the kernel issues on AC/DC power-source events.
+#[allow(dead_code)] // M3
+pub(crate) fn encode_power_limits_restore_default() -> [u8; 4] {
+    [
+        POWER_LIMIT_DEFAULT,
+        POWER_LIMIT_DEFAULT,
+        POWER_LIMIT_NO_CHANGE,
+        POWER_LIMIT_NO_CHANGE,
+    ]
+}
+
 // ---------------------------------------------------------------- tests
 
 #[cfg(test)]
@@ -362,6 +432,28 @@ mod tests {
         assert!(p.ctgp && p.ppab);
         assert_eq!(p.dstate, 1);
         assert_eq!(p.slowdown_temp_c, 87);
+    }
+
+    #[test]
+    fn gpu_policy_encode_decode_roundtrip() {
+        let p = GpuPlatformPolicy {
+            ctgp: false,
+            ppab: true,
+            dstate: 2,
+            slowdown_temp_c: 87,
+        };
+        let wire = encode_gpu_policy(p);
+        assert_eq!(wire, [0, 1, 2, 87]);
+        assert_eq!(decode_gpu_policy(&wire).unwrap(), p);
+    }
+
+    #[test]
+    fn power_limits_encoders() {
+        assert_eq!(encode_power_limits_kernel(45, 90), [45, 90, 0xFF, 0xFF]);
+        assert_eq!(encode_power_limits_swapped(45, 90), [90, 45, 0xFF, 0xFF]);
+        // The canonical encoder is the S2-arbitrated one (swapped on 8BAB).
+        assert_eq!(encode_power_limits(45, 90), [90, 45, 0xFF, 0xFF]);
+        assert_eq!(encode_power_limits_restore_default(), [0, 0, 0xFF, 0xFF]);
     }
 
     #[test]

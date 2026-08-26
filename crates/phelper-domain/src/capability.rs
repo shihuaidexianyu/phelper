@@ -65,6 +65,8 @@ impl Default for FanCapabilities {
 pub struct PpmCapabilities {
     /// PERFEPP read/write via PowrProf.
     pub epp: Support,
+    /// PERFEPP1 (processor class 1 / E-core EPP) read/write via PowrProf.
+    pub epp1: Support,
     /// PROCFREQMAX read/write via PowrProf.
     pub max_freq: Support,
     /// Process token is elevated — PowrProf writes will succeed.
@@ -75,6 +77,7 @@ impl PpmCapabilities {
     pub fn not_probed() -> Self {
         Self {
             epp: Support::NotProbed,
+            epp1: Support::NotProbed,
             max_freq: Support::NotProbed,
             write_privileged: false,
         }

@@ -34,6 +34,9 @@ pub mod ids {
     // for EPP writes; reads do not require elevation)
     pub const CPU_EPP_AC: MetricId = MetricId("cpu.epp_ac");
     pub const CPU_EPP_DC: MetricId = MetricId("cpu.epp_dc");
+    /// PERFEPP1 — processor class 1 (E-core) EPP on the 13900HX.
+    pub const CPU_EPP1_AC: MetricId = MetricId("cpu.epp1_ac");
+    pub const CPU_EPP1_DC: MetricId = MetricId("cpu.epp1_dc");
 
     // CPU/system (Windows)
     pub const CPU_UTIL_PERCENT: MetricId = MetricId("cpu.util_percent");

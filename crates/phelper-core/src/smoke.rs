@@ -179,3 +179,130 @@ pub fn hp_write_spike(cpu: u16, gpu: u16) -> Result<String, phelper_domain::erro
     }
     Ok(out)
 }
+
+/// DEV-ONLY 0x29 byte-order arbitration spike (§57 Stage 2; M3 spike S2).
+///
+/// The kernel struct says `{pl1, pl2, 0xFF, 0xFF}`; the "OSH order" reading
+/// says pl1/pl2 are swapped. Neither can be proven from literature (the
+/// kernel only ever writes {0,0,FF,FF} on this board class; OSH only writes
+/// pl1==pl2). This spike writes ASYMMETRIC limits (pl1 != pl2, both far
+/// from the 55/130 baseline) under ONE candidate encoding and watches MSR
+/// 0x610 (PawnIO, read-only): whichever 0x610 field moves to which value
+/// settles the order on THIS firmware. Write → readback → restore is the
+/// whole shape; the RAPL-under-load behavior check (runbook step 3) happens
+/// separately under `control power-limits`.
+///
+/// The restore is the kernel's own AC/DC write: {0x00, 0x00, 0xFF, 0xFF} =
+/// "firmware defaults, leave pl4/cc alone" — no hardcoded 55/130 needed.
+#[cfg(all(feature = "experimental-hp-power-limits", feature = "pawnio"))]
+pub fn power_limits_spike(
+    kernel_order: bool,
+    pl1: u8,
+    pl2: u8,
+) -> Result<String, phelper_domain::error::EngineError> {
+    use phelper_domain::error::{EngineError, HpWmiError};
+
+    use crate::platform::hp_wmi::HpWmiTransport;
+    use crate::platform::hp_wmi::commands::{self, HpCommandGroup, cmd};
+
+    fn w(e: HpWmiError) -> EngineError {
+        EngineError::WmiUnavailable(e.to_string())
+    }
+    fn p(e: PlatformError) -> EngineError {
+        EngineError::Config(format!("pawnio: {e}"))
+    }
+
+    if pl1 == pl2 {
+        return Err(EngineError::Config(
+            "arbitration needs ASYMMETRIC limits (pl1 != pl2) — equal values \
+             cannot distinguish the byte order"
+                .into(),
+        ));
+    }
+
+    let t = HpWmiTransport::connect().map_err(w)?;
+    let image = pawnio::intelmsr_image().map_err(p)?;
+    let io = PawnIo::load_module(&image).map_err(p)?;
+    let unit = pawnio::power_unit_w(pawnio::read_msr(&io, pawnio::MSR_RAPL_POWER_UNIT).map_err(p)?);
+
+    let read_pl = |io: &PawnIo| -> Result<(f64, f64), PlatformError> {
+        let raw = pawnio::read_msr(io, pawnio::MSR_PKG_POWER_LIMIT)?;
+        Ok(pawnio::pkg_power_limits_w(raw, unit))
+    };
+
+    let mut out = String::new();
+    let (b1, b2) = read_pl(&io).map_err(p)?;
+    out.push_str(&format!(
+        "0x610 baseline: PL1={b1:.1}W PL2={b2:.1}W (unit 1/{}W)\n",
+        (1.0 / unit) as u32
+    ));
+
+    let payload = if kernel_order {
+        commands::encode_power_limits_kernel(pl1, pl2)
+    } else {
+        commands::encode_power_limits_swapped(pl1, pl2)
+    };
+    out.push_str(&format!(
+        "0x29 write [{} order]: {:02X?} (intent PL1={pl1}W PL2={pl2}W)\n",
+        if kernel_order { "kernel" } else { "swapped" },
+        payload
+    ));
+
+    let spike_result = (|| -> Result<String, HpWmiError> {
+        t.write_execute(HpCommandGroup::Gaming, cmd::POWER_LIMITS, &payload)?;
+        let mut s = String::from("write rc=0; 0x610 polls (250 ms):");
+        let mut last = (b1, b2);
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            match read_pl(&io) {
+                Ok((v1, v2)) => {
+                    s.push_str(&format!(" ({v1:.1},{v2:.1})"));
+                    last = (v1, v2);
+                    // Settle early once BOTH fields moved away from baseline.
+                    if (v1 - b1).abs() > 1.0 && (v2 - b2).abs() > 1.0 {
+                        break;
+                    }
+                }
+                Err(e) => s.push_str(&format!(" (read err: {e})")),
+            }
+        }
+        let (f1, f2) = last;
+        let near = |a: f64, b: f64| (a - b).abs() <= 2.0;
+        let verdict = if near(f1, f64::from(pl1)) && near(f2, f64::from(pl2)) {
+            format!(
+                "VERDICT: encoding CORRECT — {} order puts PL1={pl1}W PL2={pl2}W",
+                if kernel_order { "kernel" } else { "swapped" }
+            )
+        } else if near(f1, f64::from(pl2)) && near(f2, f64::from(pl1)) {
+            format!(
+                "VERDICT: bytes SWAPPED on this firmware — the {} order is WRONG, use the other",
+                if kernel_order { "kernel" } else { "swapped" }
+            )
+        } else if near(f1, b1) && near(f2, b2) {
+            "VERDICT: NO EFFECT — 0x29 explicit write ignored by this firmware (fail closed)".into()
+        } else {
+            format!("VERDICT: INCONCLUSIVE — final PL1={f1:.1}W PL2={f2:.1}W matches neither intent nor baseline")
+        };
+        s.push_str(&format!("\nfinal: PL1={f1:.1}W PL2={f2:.1}W\n{verdict}\n"));
+        Ok(s)
+    })();
+
+    // ALWAYS restore firmware defaults afterwards (the kernel's own write).
+    let restore_payload = commands::encode_power_limits_restore_default();
+    let restore = t.write_execute(HpCommandGroup::Gaming, cmd::POWER_LIMITS, &restore_payload);
+    out.push_str(&spike_result.unwrap_or_else(|e| format!("spike error: {e}\n")));
+    match restore {
+        Ok(()) => {
+            out.push_str("0x29 restore {0,0,FF,FF} (firmware defaults) -> rc=0\n");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            match read_pl(&io) {
+                Ok((r1, r2)) => {
+                    out.push_str(&format!("post-restore 0x610: PL1={r1:.1}W PL2={r2:.1}W\n"))
+                }
+                Err(e) => out.push_str(&format!("post-restore 0x610 read failed: {e}\n")),
+            }
+        }
+        Err(e) => out.push_str(&format!("RESTORE FAILED: {e} — power-cycle expectation: values may persist; check 0x610!\n")),
+    }
+    Ok(out)
+}

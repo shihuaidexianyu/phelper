@@ -377,6 +377,24 @@ mod imp {
             let payload = commands::encode_max_fan(on);
             self.write_execute(HpCommandGroup::Gaming, cmd::MAX_FAN_SET, &payload)
         }
+
+        fn set_gpu_platform_policy(&self, p: GpuPlatformPolicy) -> Result<(), HpWmiError> {
+            let payload = commands::encode_gpu_policy(p);
+            self.write_execute(HpCommandGroup::Gaming, cmd::GPU_POLICY_SET, &payload)
+        }
+
+        fn set_power_limits(&self, l: phelper_domain::policy::CpuPowerLimits) -> Result<(), HpWmiError> {
+            // Defense in depth after the safety layer: only the S2-verified
+            // pl1/pl2 bytes may go on the wire; pl4/cc stay NO_CHANGE (0xFF)
+            // until their explicit-write behavior is arbitrated too.
+            if l.pl4_w != 0 || l.cpu_gpu_concurrent_w != 0 {
+                return Err(HpWmiError::InvalidInput(
+                    "pl4/cpu_gpu_concurrent unverified on 8BAB — 0 (= NO_CHANGE) only",
+                ));
+            }
+            let payload = commands::encode_power_limits(l.pl1_w, l.pl2_w);
+            self.write_execute(HpCommandGroup::Gaming, cmd::POWER_LIMITS, &payload)
+        }
     }
 
     impl HpPlatform for HpWmiTransport {

@@ -183,6 +183,15 @@ impl CapabilityService {
                 notes.push(format!("EPP read failed: {e}"));
             }
         }
+        match windows_ppm::read_epp1() {
+            Ok(_) => {
+                caps.ppm.epp1 = Support::Supported;
+            }
+            Err(e) => {
+                caps.ppm.epp1 = Support::Unsupported;
+                notes.push(format!("EPP1 read failed: {e}"));
+            }
+        }
         match windows_ppm::read_max_freq_mhz() {
             Ok(mhz) => {
                 caps.ppm.max_freq = Support::Supported;

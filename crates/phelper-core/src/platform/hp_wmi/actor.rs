@@ -15,7 +15,7 @@ use std::time::Duration;
 use phelper_domain::error::HpWmiError;
 use phelper_domain::hp::{FanTable, SystemDesignData};
 #[cfg(feature = "control")]
-use phelper_domain::policy::ThermalMode;
+use phelper_domain::policy::{CpuPowerLimits, ThermalMode};
 use phelper_domain::policy::{FanLevels, GpuPlatformPolicy, MuxMode};
 use phelper_domain::ports::HpPlatform;
 use tracing::{debug, info, warn};
@@ -37,6 +37,10 @@ enum HpRequest {
     SetFanLevels(FanLevels, mpsc::Sender<Result<(), HpWmiError>>),
     #[cfg(feature = "control")]
     SetMaxFan(bool, mpsc::Sender<Result<(), HpWmiError>>),
+    #[cfg(feature = "control")]
+    SetGpuPlatformPolicy(GpuPlatformPolicy, mpsc::Sender<Result<(), HpWmiError>>),
+    #[cfg(feature = "control")]
+    SetPowerLimits(CpuPowerLimits, mpsc::Sender<Result<(), HpWmiError>>),
     Shutdown(mpsc::Sender<()>),
 }
 
@@ -108,6 +112,16 @@ impl HpActor {
                     use phelper_domain::ports::HpControl;
                     let _ = reply.send(self.transport.set_max_fan(on));
                 }
+                #[cfg(feature = "control")]
+                HpRequest::SetGpuPlatformPolicy(p, reply) => {
+                    use phelper_domain::ports::HpControl;
+                    let _ = reply.send(self.transport.set_gpu_platform_policy(p));
+                }
+                #[cfg(feature = "control")]
+                HpRequest::SetPowerLimits(l, reply) => {
+                    use phelper_domain::ports::HpControl;
+                    let _ = reply.send(self.transport.set_power_limits(l));
+                }
                 HpRequest::Shutdown(reply) => {
                     info!("hp-actor shutting down");
                     let _ = reply.send(());
@@ -178,5 +192,11 @@ impl phelper_domain::ports::HpControl for HpHandle {
     }
     fn set_max_fan(&self, on: bool) -> Result<(), HpWmiError> {
         self.call(|tx| HpRequest::SetMaxFan(on, tx))
+    }
+    fn set_gpu_platform_policy(&self, p: GpuPlatformPolicy) -> Result<(), HpWmiError> {
+        self.call(|tx| HpRequest::SetGpuPlatformPolicy(p, tx))
+    }
+    fn set_power_limits(&self, l: CpuPowerLimits) -> Result<(), HpWmiError> {
+        self.call(|tx| HpRequest::SetPowerLimits(l, tx))
     }
 }

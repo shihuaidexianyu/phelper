@@ -19,7 +19,9 @@ use phelper_domain::command::{
 };
 use phelper_domain::error::{ControlError, EngineError, HpWmiError, PlatformError};
 use phelper_domain::identity::DeviceIdentity;
-use phelper_domain::policy::{CpuPolicy, FanLevels, FanMode, ThermalMode};
+use phelper_domain::policy::{
+    CpuPolicy, CpuPowerLimits, FanLevels, FanMode, GpuPlatformPolicy, ThermalMode,
+};
 use phelper_domain::ports::{CpuPolicyBackend, HpBackend};
 use phelper_domain::state::{DesiredState, ObservedState, ObservedValue};
 use phelper_domain::telemetry::ids;
@@ -195,6 +197,16 @@ pub(crate) struct ControlCoordinator<H, P, F> {
     safety_tick: Duration,
     desired: Arc<RwLock<DesiredState>>,
     observed: Arc<RwLock<ObservedState>>,
+    /// 0x21 readback captured at engine start — the restore point for
+    /// shutdown (only written back when this session changed the policy).
+    gpu_policy_startup: Option<GpuPlatformPolicy>,
+    gpu_policy_dirty: bool,
+    /// 0x610 feed values captured right BEFORE this session's first 0x29
+    /// write — the shutdown restore point. (The {0,0,FF,FF} DEFAULT write
+    /// was observed NOT to take effect on this firmware within 500 ms in
+    /// the S2 spike, so restore = explicit write-back of captured values.)
+    power_limits_baseline: Option<(u8, u8)>,
+    power_limits_dirty: bool,
 }
 
 impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Send + 'static>
@@ -208,7 +220,16 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         )?;
         let (tx, rx) = mpsc::sync_channel(QUEUE_DEPTH);
         let desired = Arc::new(RwLock::new(DesiredState::default()));
-        let observed = Arc::new(RwLock::new(Self::initial_observed(&cfg.ppm)));
+        // 0x21 readback at start: populates ObservedState (Verified, AR-10)
+        // AND is the shutdown restore point if this session writes 0x22.
+        let gpu_policy_startup = cfg
+            .hp
+            .as_ref()
+            .and_then(|hp| hp.gpu_platform_policy().ok());
+        let observed = Arc::new(RwLock::new(Self::initial_observed(
+            &cfg.ppm,
+            gpu_policy_startup,
+        )));
         let caps = Arc::new(cfg.caps);
         let handle = ControlHandle {
             tx,
@@ -231,6 +252,10 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             safety_tick: cfg.safety_tick,
             desired,
             observed,
+            gpu_policy_startup,
+            gpu_policy_dirty: false,
+            power_limits_baseline: None,
+            power_limits_dirty: false,
         };
         std::thread::Builder::new()
             .name("control-coord".into())
@@ -239,9 +264,10 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         Ok(handle)
     }
 
-    /// EPP is read back at start (Verified); everything else is Unknown
-    /// until written or proven (AR-10: we don't claim states we never saw).
-    fn initial_observed(ppm: &P) -> ObservedState {
+    /// EPP/EPP1 (and the GPU platform policy when the HP backend is up) are
+    /// read back at start (Verified); everything else is Unknown until
+    /// written or proven (AR-10: we don't claim states we never saw).
+    fn initial_observed(ppm: &P, gpu_policy: Option<GpuPlatformPolicy>) -> ObservedState {
         let mut o = ObservedState::default();
         if let Ok((ac, dc)) = ppm.read_epp() {
             o.epp_ac = ObservedValue::Verified {
@@ -253,6 +279,25 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 value: dc,
                 at: Instant::now(),
                 source: "powrprof PERFEPP",
+            };
+        }
+        if let Ok((ac, dc)) = ppm.read_epp1() {
+            o.epp1_ac = ObservedValue::Verified {
+                value: ac,
+                at: Instant::now(),
+                source: "powrprof PERFEPP1",
+            };
+            o.epp1_dc = ObservedValue::Verified {
+                value: dc,
+                at: Instant::now(),
+                source: "powrprof PERFEPP1",
+            };
+        }
+        if let Some(p) = gpu_policy {
+            o.gpu_platform_policy = ObservedValue::Verified {
+                value: p,
+                at: Instant::now(),
+                source: "hp-wmi 0x21",
             };
         }
         o
@@ -342,6 +387,8 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             ControlCommand::SetThermalMode(mode) => self.exec_thermal(*mode, &mut steps),
             ControlCommand::SetFanMode(mode) => self.exec_fan_mode(*mode, &mut steps),
             ControlCommand::SetCpuPolicy(policy) => self.exec_cpu_policy(policy, &mut steps),
+            ControlCommand::SetGpuPlatformPolicy(p) => self.exec_gpu_policy(*p, &mut steps),
+            ControlCommand::SetPowerLimits(l) => self.exec_power_limits(*l, &mut steps),
             // validate() already rejected these; unreachable in practice.
             _ => ControlStatus::Rejected {
                 error: ControlError::Unsupported,
@@ -354,7 +401,8 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         }
 
         // 4. Reschedule keep-alive against the new observed state.
-        self.keepalive.reschedule(&self.observed(), Instant::now());
+        self.keepalive
+            .reschedule_tracked(&self.tracked_set(), Instant::now());
 
         let outcome = ControlOutcome {
             receipt,
@@ -373,6 +421,8 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             ControlCommand::SetThermalMode(m) => d.thermal_mode = Some(*m),
             ControlCommand::SetFanMode(m) => d.fan_mode = Some(*m),
             ControlCommand::SetCpuPolicy(p) => d.cpu_policy = Some(p.clone()),
+            ControlCommand::SetGpuPlatformPolicy(p) => d.gpu_platform_policy = Some(*p),
+            ControlCommand::SetPowerLimits(l) => d.power_limits = Some(*l),
             _ => {}
         }
     }
@@ -631,11 +681,213 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         }
     }
 
+    // ------------------------------------------------------------ GPU policy
+
+    /// 0x22 write with 0x21 readback verification (a real readback exists
+    /// here, unlike 0x1A/0x27 — so this path is Verified, not TrustedWrite).
+    fn exec_gpu_policy(&mut self, p: GpuPlatformPolicy, steps: &mut Vec<StepOutcome>) -> ControlStatus {
+        let Some(hp) = &self.hp else {
+            return ControlStatus::Rejected {
+                error: ControlError::BackendUnavailable {
+                    what: "HP platform".into(),
+                },
+            };
+        };
+        let before = match hp.gpu_platform_policy() {
+            Ok(cur) => format!(
+                "ctgp={} ppab={} dstate={} slowdown={}C",
+                cur.ctgp, cur.ppab, cur.dstate, cur.slowdown_temp_c
+            ),
+            Err(e) => format!("0x21 unreadable: {e}"),
+        };
+        match hp.set_gpu_platform_policy(p) {
+            Ok(()) => {
+                let verification = self.verify_gpu_policy(hp, p);
+                let ok = matches!(verification, Verification::Verified);
+                self.set_observed(|o| {
+                    o.gpu_platform_policy = if ok {
+                        ObservedValue::Verified {
+                            value: p,
+                            at: Instant::now(),
+                            source: "hp-wmi 0x21",
+                        }
+                    } else {
+                        // Honest AR-10: the write happened; the Failed
+                        // verdict in the outcome carries the truth.
+                        ObservedValue::TrustedWrite {
+                            value: p,
+                            at: Instant::now(),
+                        }
+                    };
+                });
+                if ok {
+                    // Only a proven write counts as "this session changed
+                    // the policy" for the shutdown restore.
+                    self.gpu_policy_dirty = true;
+                }
+                steps.push(StepOutcome {
+                    step: "verify gpu policy (0x21)".into(),
+                    backend: "hp-wmi 0x21".into(),
+                    firmware_return: None,
+                    before: Some(before.clone()),
+                    after: Some(format!("{verification:?}")),
+                    verification: verification.clone(),
+                });
+                ControlStatus::Applied {
+                    verification: if ok {
+                        Verification::Verified
+                    } else {
+                        verification
+                    },
+                }
+            }
+            Err(e) => {
+                steps.push(failed_step("set gpu policy", "hp-wmi 0x22", &e, before));
+                ControlStatus::Rejected {
+                    error: map_hp_error(e),
+                }
+            }
+        }
+    }
+
+    /// 0x21 readback after a 0x22 write: all four bytes must match.
+    fn verify_gpu_policy(&self, hp: &H, target: GpuPlatformPolicy) -> Verification {
+        let mut last = String::new();
+        for _ in 0..self.verify_polls {
+            std::thread::sleep(self.verify_poll_interval);
+            match hp.gpu_platform_policy() {
+                Ok(actual) => {
+                    last = format!(
+                        "ctgp={} ppab={} dstate={} slowdown={}C",
+                        actual.ctgp, actual.ppab, actual.dstate, actual.slowdown_temp_c
+                    );
+                    if actual == target {
+                        return Verification::Verified;
+                    }
+                }
+                Err(e) => last = format!("readback error: {e}"),
+            }
+        }
+        Verification::Failed {
+            expected: format!(
+                "ctgp={} ppab={} dstate={} slowdown={}C",
+                target.ctgp, target.ppab, target.dstate, target.slowdown_temp_c
+            ),
+            actual: last,
+        }
+    }
+
+    // ------------------------------------------------------------ power limits
+
+    /// 0x29 write (EXPERIMENTAL — safety already double-gated feature +
+    /// caps). Verification is runbook step 2: the MSR 0x610 telemetry
+    /// readback must converge to the written values (runbook step 3, the
+    /// RAPL-under-load behavior check, is a HIL activity, not an in-engine
+    /// one). The baseline for shutdown-restore is captured from the feed
+    /// right before our FIRST write — the firmware DEFAULT write
+    /// ({0,0,FF,FF}) was observed not to take effect promptly on 8BAB.
+    fn exec_power_limits(&mut self, l: CpuPowerLimits, steps: &mut Vec<StepOutcome>) -> ControlStatus {
+        let Some(hp) = &self.hp else {
+            return ControlStatus::Rejected {
+                error: ControlError::BackendUnavailable {
+                    what: "HP platform".into(),
+                },
+            };
+        };
+        let before = match self.feed.power_limits_w() {
+            Some((p1, p2, at)) => format!(
+                "pl1={p1:.1}W pl2={p2:.1}W (0x610, {:.1}s ago)",
+                at.elapsed().as_secs_f64()
+            ),
+            None => "0x610 readback unavailable".to_string(),
+        };
+        if self.power_limits_baseline.is_none()
+            && let Some((p1, p2, _)) = self.feed.power_limits_w()
+        {
+            self.power_limits_baseline = Some((p1.round() as u8, p2.round() as u8));
+        }
+        let written_at = Instant::now();
+        match hp.set_power_limits(l) {
+            Ok(()) => {
+                let verification = self.verify_power_limits(l, written_at);
+                let ok = matches!(verification, Verification::Verified);
+                self.set_observed(|o| {
+                    o.power_limits = if ok {
+                        ObservedValue::Verified {
+                            value: l,
+                            at: Instant::now(),
+                            source: "msr 0x610 (telemetry)",
+                        }
+                    } else {
+                        // Honest AR-10: the write happened; the Failed
+                        // verdict in the outcome carries the truth.
+                        ObservedValue::TrustedWrite {
+                            value: l,
+                            at: Instant::now(),
+                        }
+                    };
+                });
+                if ok {
+                    self.power_limits_dirty = true;
+                }
+                steps.push(StepOutcome {
+                    step: "verify power limits (MSR 0x610)".into(),
+                    backend: "pawnio telemetry feed".into(),
+                    firmware_return: None,
+                    before: Some(before.clone()),
+                    after: Some(format!("{verification:?}")),
+                    verification: verification.clone(),
+                });
+                ControlStatus::Applied {
+                    verification: if ok {
+                        Verification::Verified
+                    } else {
+                        verification
+                    },
+                }
+            }
+            Err(e) => {
+                steps.push(failed_step("set power limits", "hp-wmi 0x29", &e, before));
+                ControlStatus::Rejected {
+                    error: map_hp_error(e),
+                }
+            }
+        }
+    }
+
+    /// Runbook step 2: poll the 0x610 telemetry feed (250 ms cadence) until
+    /// a sample TAKEN AFTER the write sits within ±1 W of the targets.
+    fn verify_power_limits(&self, l: CpuPowerLimits, written_at: Instant) -> Verification {
+        let mut last = String::new();
+        for _ in 0..self.verify_polls {
+            std::thread::sleep(self.verify_poll_interval);
+            match self.feed.power_limits_w() {
+                Some((p1, p2, at)) => {
+                    last = format!("pl1={p1:.1}W pl2={p2:.1}W");
+                    if at < written_at {
+                        last.push_str(" (pre-write sample)");
+                        continue;
+                    }
+                    if (p1 - f64::from(l.pl1_w)).abs() <= 1.0
+                        && (p2 - f64::from(l.pl2_w)).abs() <= 1.0
+                    {
+                        return Verification::Verified;
+                    }
+                }
+                None => last = "0x610 feed unavailable".into(),
+            }
+        }
+        Verification::Failed {
+            expected: format!("pl1={}W pl2={}W", l.pl1_w, l.pl2_w),
+            actual: last,
+        }
+    }
+
     // ------------------------------------------------------------ CPU policy
 
-    /// §32 order: EPP → max-freq → boost. Steps are independent settings —
-    /// a later failure leaves earlier steps applied (Partial; no M2
-    /// rollback, journal carries the evidence).
+    /// §32 order: EPP → EPP1 → max-freq → boost. Steps are independent
+    /// settings — a later failure leaves earlier steps applied (Partial; no
+    /// M2 rollback, journal carries the evidence).
     fn exec_cpu_policy(&mut self, p: &CpuPolicy, steps: &mut Vec<StepOutcome>) -> ControlStatus {
         let mut applied = false;
         let mut failed = false;
@@ -697,6 +949,72 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 Err(e) => {
                     failed = true;
                     steps.push(platform_failed_step("write EPP", "powrprof PERFEPP", &e, before));
+                }
+            }
+        }
+
+        if p.epp1_ac.is_some() || p.epp1_dc.is_some() {
+            let before = self
+                .ppm
+                .read_epp1()
+                .map(|(ac, dc)| format!("epp1 ac={ac} dc={dc}"))
+                .unwrap_or_else(|e| format!("epp1 unreadable: {e}"));
+            match self.ppm.write_epp1(p.epp1_ac, p.epp1_dc) {
+                Ok(()) => {
+                    let verification = match self.ppm.read_epp1() {
+                        Ok((ac, dc)) => {
+                            let ac_ok = p.epp1_ac.is_none_or(|v| v == ac);
+                            let dc_ok = p.epp1_dc.is_none_or(|v| v == dc);
+                            if ac_ok && dc_ok {
+                                self.set_observed(|o| {
+                                    o.epp1_ac = ObservedValue::Verified {
+                                        value: ac,
+                                        at: Instant::now(),
+                                        source: "powrprof PERFEPP1",
+                                    };
+                                    o.epp1_dc = ObservedValue::Verified {
+                                        value: dc,
+                                        at: Instant::now(),
+                                        source: "powrprof PERFEPP1",
+                                    };
+                                });
+                                Verification::Verified
+                            } else {
+                                Verification::Failed {
+                                    expected: format!(
+                                        "ac={:?} dc={:?}",
+                                        p.epp1_ac, p.epp1_dc
+                                    ),
+                                    actual: format!("ac={ac} dc={dc}"),
+                                }
+                            }
+                        }
+                        Err(e) => Verification::Failed {
+                            expected: format!("ac={:?} dc={:?}", p.epp1_ac, p.epp1_dc),
+                            actual: format!("readback error: {e}"),
+                        },
+                    };
+                    if !matches!(verification, Verification::Verified) {
+                        failed = true;
+                    }
+                    steps.push(StepOutcome {
+                        step: "write EPP1 (class-1)".into(),
+                        backend: "powrprof PERFEPP1".into(),
+                        firmware_return: Some("ok".into()),
+                        before: Some(before),
+                        after: Some(format!("{verification:?}")),
+                        verification,
+                    });
+                    applied = true;
+                }
+                Err(e) => {
+                    failed = true;
+                    steps.push(platform_failed_step(
+                        "write EPP1 (class-1)",
+                        "powrprof PERFEPP1",
+                        &e,
+                        before,
+                    ));
                 }
             }
         }
@@ -903,6 +1221,16 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
 
     // ------------------------------------------------------------ keepalive
 
+    /// The full keep-alive set: observed-derived items (thermal/fan/max)
+    /// plus coordinator-state items (power limits while dirty).
+    fn tracked_set(&self) -> Vec<ReAssert> {
+        let mut t = KeepAliveService::tracked(&self.observed());
+        if self.power_limits_dirty {
+            t.push(ReAssert::PowerLimits);
+        }
+        t
+    }
+
     /// Heartbeat tick: 0x10 fan-count-get keeps the firmware's
     /// user-defined states alive; then re-assert every non-default
     /// TrustedWrite (clawback repair). Steady-state success is NOT
@@ -912,9 +1240,9 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             self.keepalive.record_success(now); // nothing to heartbeat against
             return;
         };
-        let tracked = KeepAliveService::tracked(&self.observed());
+        let tracked = self.tracked_set();
         if tracked.is_empty() {
-            self.keepalive.reschedule(&self.observed(), now);
+            self.keepalive.reschedule_tracked(&tracked, now);
             return;
         }
 
@@ -932,6 +1260,10 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                         _ => Ok(()),
                     },
                     ReAssert::MaxFan => hp.set_max_fan(true),
+                    ReAssert::PowerLimits => match observed.power_limits.value() {
+                        Some(l) => hp.set_power_limits(*l),
+                        None => Ok(()),
+                    },
                 };
                 if let Err(e) = r {
                     failed = Some(e);
@@ -970,9 +1302,10 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
 
     // ------------------------------------------------------------ restore
 
-    /// AR-12 restore: 0x2E{0,0} + 0x27 off + thermal Balanced. Best-effort —
-    /// every step is attempted even if earlier ones fail; the firmware
-    /// clawback (~120 s) is the ultimate backstop regardless.
+    /// AR-12 restore: 0x2E{0,0} + 0x27 off + thermal Balanced (+ the startup
+    /// GPU policy when this session changed it). Best-effort — every step is
+    /// attempted even if earlier ones fail; the firmware clawback (~120 s)
+    /// is the ultimate backstop regardless.
     /// EPP/max-freq/boost are deliberately NOT restored: they are
     /// Windows-native settings with no firmware-session semantics.
     fn restore_firmware_auto(&mut self, origin: JournalOrigin) {
@@ -985,6 +1318,52 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             let _ = Self::fan_write(&mut steps, "restore max-fan off", "hp-wmi 0x27", "restore", || {
                 hp.set_max_fan(false)
             });
+            if self.gpu_policy_dirty
+                && let Some(startup) = self.gpu_policy_startup
+            {
+                match hp.set_gpu_platform_policy(startup) {
+                    Ok(()) => steps.push(StepOutcome {
+                        step: "restore gpu policy (startup value)".into(),
+                        backend: "hp-wmi 0x22".into(),
+                        firmware_return: Some("rc=0".into()),
+                        before: Some("restore".into()),
+                        after: None,
+                        verification: Verification::TrustedNoReadback,
+                    }),
+                    Err(e) => steps.push(failed_step(
+                        "restore gpu policy (startup value)",
+                        "hp-wmi 0x22",
+                        &e,
+                        "restore".into(),
+                    )),
+                }
+            }
+            if self.power_limits_dirty
+                && let Some((b1, b2)) = self.power_limits_baseline
+            {
+                let baseline = CpuPowerLimits {
+                    pl1_w: b1,
+                    pl2_w: b2,
+                    pl4_w: 0,
+                    cpu_gpu_concurrent_w: 0,
+                };
+                match hp.set_power_limits(baseline) {
+                    Ok(()) => steps.push(StepOutcome {
+                        step: "restore power limits (0x610 baseline)".into(),
+                        backend: "hp-wmi 0x29".into(),
+                        firmware_return: Some("rc=0".into()),
+                        before: Some("restore".into()),
+                        after: Some(format!("pl1={b1}W pl2={b2}W")),
+                        verification: Verification::TrustedNoReadback,
+                    }),
+                    Err(e) => steps.push(failed_step(
+                        "restore power limits (0x610 baseline)",
+                        "hp-wmi 0x29",
+                        &e,
+                        "restore".into(),
+                    )),
+                }
+            }
             match hp.set_thermal_mode(ThermalMode::Balanced) {
                 Ok(()) => steps.push(StepOutcome {
                     step: "restore thermal balanced".into(),
@@ -1015,9 +1394,33 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 value: ThermalMode::Balanced,
                 at: Instant::now(),
             };
+            if self.gpu_policy_dirty
+                && let Some(startup) = self.gpu_policy_startup
+            {
+                o.gpu_platform_policy = ObservedValue::TrustedWrite {
+                    value: startup,
+                    at: Instant::now(),
+                };
+            }
+            if self.power_limits_dirty
+                && let Some((b1, b2)) = self.power_limits_baseline
+            {
+                o.power_limits = ObservedValue::TrustedWrite {
+                    value: CpuPowerLimits {
+                        pl1_w: b1,
+                        pl2_w: b2,
+                        pl4_w: 0,
+                        cpu_gpu_concurrent_w: 0,
+                    },
+                    at: Instant::now(),
+                };
+            }
         });
+        self.gpu_policy_dirty = false;
+        self.power_limits_dirty = false;
         self.safety.note_user_fan_mode(FanMode::FirmwareAuto);
-        self.keepalive.reschedule(&self.observed(), Instant::now());
+        self.keepalive
+            .reschedule_tracked(&self.tracked_set(), Instant::now());
         self.journal(
             origin,
             &ControlOutcome {
@@ -1129,6 +1532,14 @@ impl ThermalFeed for SnapshotFeed {
         let at = cpu.timestamp.min(gpu.timestamp);
         Some((FanLevels::new(cpu_level, gpu_level), at))
     }
+
+    fn power_limits_w(&self) -> Option<(f64, f64, Instant)> {
+        let snap = self.telemetry.snapshot();
+        let pl1 = snap.samples.get(&ids::CPU_PL1_W)?;
+        let pl2 = snap.samples.get(&ids::CPU_PL2_W)?;
+        let at = pl1.timestamp.min(pl2.timestamp);
+        Some((pl1.value.as_f64()?, pl2.value.as_f64()?, at))
+    }
 }
 
 #[cfg(test)]
@@ -1154,6 +1565,17 @@ mod tests {
         /// Scripted 0x2D readbacks for verification (popped front; last
         /// value repeats when exhausted).
         readback_script: Vec<FanLevels>,
+        /// Current 0x21 readback value; None = read fails (NotAvailable).
+        gpu_policy: Option<GpuPlatformPolicy>,
+        gpu_policy_writes: Vec<GpuPlatformPolicy>,
+        /// When set, 0x21 reads return THIS instead of the last write —
+        /// scripts a readback mismatch for the verification path.
+        gpu_policy_pin: Option<GpuPlatformPolicy>,
+        power_limits_writes: Vec<CpuPowerLimits>,
+        /// When set, a set_power_limits write also moves this shared
+        /// "MSR 0x610" pair — the test's ThermalFeed reads it, simulating
+        /// the firmware applying the write (the verification converges).
+        msr_link: Option<std::sync::Arc<Mutex<(f64, f64)>>>,
     }
 
     impl Default for MockHpState {
@@ -1166,6 +1588,16 @@ mod tests {
                 fan_count_calls: 0,
                 fail_next_thermal: false,
                 readback_script: Vec::new(),
+                gpu_policy: Some(GpuPlatformPolicy {
+                    ctgp: true,
+                    ppab: true,
+                    dstate: 1,
+                    slowdown_temp_c: 87,
+                }),
+                gpu_policy_writes: Vec::new(),
+                gpu_policy_pin: None,
+                power_limits_writes: Vec::new(),
+                msr_link: None,
             }
         }
     }
@@ -1204,7 +1636,12 @@ mod tests {
             Ok(s.readback_script.first().copied().unwrap_or(s.fan_levels))
         }
         fn gpu_platform_policy(&self) -> Result<GpuPlatformPolicy, HpWmiError> {
-            Err(HpWmiError::NotAvailable("mock"))
+            let s = self.state();
+            match (s.gpu_policy_pin, s.gpu_policy) {
+                (Some(pin), _) => Ok(pin),
+                (None, Some(p)) => Ok(p),
+                (None, None) => Err(HpWmiError::NotAvailable("mock")),
+            }
         }
         fn mux_mode(&self) -> Result<MuxMode, HpWmiError> {
             Err(HpWmiError::NotAvailable("mock"))
@@ -1234,14 +1671,33 @@ mod tests {
             self.state().max_fan_writes.push(on);
             Ok(())
         }
+        fn set_gpu_platform_policy(&self, p: GpuPlatformPolicy) -> Result<(), HpWmiError> {
+            let mut s = self.state();
+            s.gpu_policy_writes.push(p);
+            s.gpu_policy = Some(p);
+            Ok(())
+        }
+        fn set_power_limits(&self, l: CpuPowerLimits) -> Result<(), HpWmiError> {
+            let mut s = self.state();
+            s.power_limits_writes.push(l);
+            if let Some(link) = &s.msr_link {
+                *link.lock().unwrap() = (f64::from(l.pl1_w), f64::from(l.pl2_w));
+            }
+            Ok(())
+        }
     }
 
     #[derive(Clone, Default)]
-    struct MockPpm(std::sync::Arc<Mutex<(u8, u8)>>);
+    struct MockPpm(std::sync::Arc<Mutex<(u8, u8, u8, u8)>>);
 
     impl CpuPolicyBackend for MockPpm {
         fn read_epp(&self) -> Result<(u8, u8), PlatformError> {
-            Ok(*self.0.lock().unwrap())
+            let g = self.0.lock().unwrap();
+            Ok((g.0, g.1))
+        }
+        fn read_epp1(&self) -> Result<(u8, u8), PlatformError> {
+            let g = self.0.lock().unwrap();
+            Ok((g.2, g.3))
         }
         fn read_max_freq_mhz(&self) -> Result<(u32, u32), PlatformError> {
             Ok((0, 0))
@@ -1256,6 +1712,16 @@ mod tests {
             }
             if let Some(v) = dc {
                 g.1 = v;
+            }
+            Ok(())
+        }
+        fn write_epp1(&self, ac: Option<u8>, dc: Option<u8>) -> Result<(), PlatformError> {
+            let mut g = self.0.lock().unwrap();
+            if let Some(v) = ac {
+                g.2 = v;
+            }
+            if let Some(v) = dc {
+                g.3 = v;
             }
             Ok(())
         }
@@ -1278,6 +1744,9 @@ mod tests {
         }
         fn fan_levels(&self) -> Option<(FanLevels, Instant)> {
             Some((FanLevels::new(30, 30), Instant::now()))
+        }
+        fn power_limits_w(&self) -> Option<(f64, f64, Instant)> {
+            Some((55.0, 130.0, Instant::now()))
         }
     }
 
@@ -1307,8 +1776,11 @@ mod tests {
         c.fan.clamp_min = Some(5);
         c.fan.clamp_max = Some(55);
         c.ppm.epp = Support::Supported;
+        c.ppm.epp1 = Support::Supported;
         c.ppm.max_freq = Support::Supported;
         c.ppm.write_privileged = true;
+        c.gpu_platform_policy = Support::Supported;
+        c.power_limits = Support::Experimental;
         c
     }
 
@@ -1328,7 +1800,7 @@ mod tests {
                 .join(format!("phelper-coord-test-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             let journal_path = dir.join("journal.jsonl");
-            let ppm = MockPpm(std::sync::Arc::new(Mutex::new((50, 50))));
+            let ppm = MockPpm(std::sync::Arc::new(Mutex::new((50, 50, 50, 50))));
             let mut cfg = ControlConfig::new(
                 caps_full(),
                 test_identity(tag),
@@ -1552,6 +2024,246 @@ mod tests {
         rig.handle.shutdown();
     }
 
+    #[test]
+    fn epp1_write_readback_verified() {
+        let rig = TestRig::start("epp1");
+        let o = block(
+            &rig.handle,
+            ControlCommand::SetCpuPolicy(CpuPolicy {
+                epp1_ac: Some(30),
+                epp1_dc: Some(50),
+                ..Default::default()
+            }),
+        );
+        assert!(matches!(
+            o.status,
+            ControlStatus::Applied {
+                verification: Verification::Verified
+            }
+        ));
+        let observed = rig.handle.observed();
+        assert_eq!(observed.epp1_ac.value(), Some(&30));
+        assert_eq!(observed.epp1_dc.value(), Some(&50));
+        assert!(observed.epp1_ac.is_verified());
+        rig.handle.shutdown();
+    }
+
+    #[test]
+    fn gpu_policy_write_readback_verified() {
+        let rig = TestRig::start("gpu-policy");
+        let target = GpuPlatformPolicy {
+            ctgp: false,
+            ppab: true,
+            dstate: 2,
+            slowdown_temp_c: 87,
+        };
+        let o = block(&rig.handle, ControlCommand::SetGpuPlatformPolicy(target));
+        assert!(matches!(
+            o.status,
+            ControlStatus::Applied {
+                verification: Verification::Verified
+            }
+        ));
+        let observed = rig.handle.observed();
+        assert_eq!(observed.gpu_platform_policy.value(), Some(&target));
+        assert!(observed.gpu_platform_policy.is_verified());
+        assert_eq!(rig.hp.state().gpu_policy_writes, vec![target]);
+        rig.handle.shutdown();
+    }
+
+    #[test]
+    fn gpu_policy_readback_mismatch_is_honest_failure() {
+        let rig = TestRig::start("gpu-policy-mismatch");
+        // Firmware "ignores" the write: pin 0x21 to the startup value.
+        let startup = rig.hp.state().gpu_policy.unwrap();
+        rig.hp.state().gpu_policy_pin = Some(startup);
+        let target = GpuPlatformPolicy {
+            ctgp: false,
+            ppab: false,
+            dstate: 3,
+            slowdown_temp_c: 87,
+        };
+        let o = block(&rig.handle, ControlCommand::SetGpuPlatformPolicy(target));
+        assert!(matches!(
+            o.status,
+            ControlStatus::Applied {
+                verification: Verification::Failed { .. }
+            }
+        ));
+        // AR-10 honesty: observed records the TrustedWrite, not Verified.
+        let observed = rig.handle.observed();
+        assert_eq!(observed.gpu_platform_policy.value(), Some(&target));
+        assert!(!observed.gpu_platform_policy.is_verified());
+        rig.handle.shutdown();
+    }
+
+    #[test]
+    fn shutdown_restores_startup_gpu_policy() {
+        let rig = TestRig::start("gpu-policy-restore");
+        let startup = rig.hp.state().gpu_policy;
+        let target = GpuPlatformPolicy {
+            ctgp: false,
+            ppab: true,
+            dstate: 2,
+            slowdown_temp_c: 87,
+        };
+        let o = block(&rig.handle, ControlCommand::SetGpuPlatformPolicy(target));
+        assert!(matches!(
+            o.status,
+            ControlStatus::Applied {
+                verification: Verification::Verified
+            }
+        ));
+        rig.handle.shutdown();
+        let writes = rig.hp.state().gpu_policy_writes.clone();
+        // write #1 = the user's change, write #2 = the shutdown restore.
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[1], startup.unwrap());
+    }
+
+    // ---------------------------- 0x29 power limits (feature-gated) ----
+
+    #[cfg(feature = "experimental-hp-power-limits")]
+    struct PlFeed(std::sync::Arc<Mutex<(f64, f64)>>);
+
+    #[cfg(feature = "experimental-hp-power-limits")]
+    impl ThermalFeed for PlFeed {
+        fn pkg_temp_c(&self) -> Option<(f64, Instant)> {
+            Some((70.0, Instant::now()))
+        }
+        fn fan_levels(&self) -> Option<(FanLevels, Instant)> {
+            Some((FanLevels::new(30, 30), Instant::now()))
+        }
+        fn power_limits_w(&self) -> Option<(f64, f64, Instant)> {
+            let v = *self.0.lock().unwrap();
+            Some((v.0, v.1, Instant::now()))
+        }
+    }
+
+    /// Custom rig with a live "MSR 0x610" pair the feed reads; with_link
+    /// wires MockHp's 0x29 writes into it (simulating firmware applying the
+    /// write so verification can converge).
+    #[cfg(feature = "experimental-hp-power-limits")]
+    fn start_pl_rig(
+        tag: &str,
+        link: std::sync::Arc<Mutex<(f64, f64)>>,
+        with_link: bool,
+    ) -> (ControlHandle, MockHp) {
+        let dir = std::env::temp_dir().join(format!(
+            "phelper-coord-test-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let journal_path = dir.join("journal.jsonl");
+        let hp = MockHp::default();
+        if with_link {
+            hp.state().msr_link = Some(std::sync::Arc::clone(&link));
+        }
+        let mut cfg = ControlConfig::new(
+            caps_full(),
+            test_identity(tag),
+            Some(hp.clone()),
+            MockPpm::default(),
+            PlFeed(link),
+            journal_path,
+        );
+        cfg.verify_poll_interval = Duration::from_millis(5);
+        cfg.keepalive_period = Duration::from_millis(120);
+        cfg.safety_tick = Duration::from_millis(20);
+        let handle = ControlCoordinator::start(cfg).unwrap();
+        (handle, hp)
+    }
+
+    #[cfg(feature = "experimental-hp-power-limits")]
+    fn pl(pl1: u8, pl2: u8) -> CpuPowerLimits {
+        CpuPowerLimits {
+            pl1_w: pl1,
+            pl2_w: pl2,
+            pl4_w: 0,
+            cpu_gpu_concurrent_w: 0,
+        }
+    }
+
+    #[cfg(feature = "experimental-hp-power-limits")]
+    #[test]
+    fn power_limits_write_verified_via_0610_feed() {
+        let link = std::sync::Arc::new(Mutex::new((55.0_f64, 130.0_f64)));
+        let (handle, hp) = start_pl_rig("pl-verified", std::sync::Arc::clone(&link), true);
+        let o = block(&handle, ControlCommand::SetPowerLimits(pl(45, 90)));
+        assert!(matches!(
+            o.status,
+            ControlStatus::Applied {
+                verification: Verification::Verified
+            }
+        ));
+        let observed = handle.observed();
+        assert_eq!(observed.power_limits.value(), Some(&pl(45, 90)));
+        assert!(observed.power_limits.is_verified());
+        assert_eq!(hp.state().power_limits_writes, vec![pl(45, 90)]);
+        handle.shutdown();
+    }
+
+    #[cfg(feature = "experimental-hp-power-limits")]
+    #[test]
+    fn power_limits_no_convergence_is_honest_failure() {
+        // Firmware "ignores" the write: feed never moves off the baseline.
+        let link = std::sync::Arc::new(Mutex::new((55.0_f64, 130.0_f64)));
+        let (handle, hp) = start_pl_rig("pl-noconv", std::sync::Arc::clone(&link), false);
+        let o = block(&handle, ControlCommand::SetPowerLimits(pl(45, 90)));
+        assert!(matches!(
+            o.status,
+            ControlStatus::Applied {
+                verification: Verification::Failed { .. }
+            }
+        ));
+        let observed = handle.observed();
+        assert_eq!(observed.power_limits.value(), Some(&pl(45, 90)));
+        assert!(!observed.power_limits.is_verified());
+        handle.shutdown();
+        // Not dirty → shutdown does NOT write a power-limits restore.
+        assert_eq!(hp.state().power_limits_writes.len(), 1);
+    }
+
+    #[cfg(feature = "experimental-hp-power-limits")]
+    #[test]
+    fn shutdown_restores_power_limits_baseline() {
+        let link = std::sync::Arc::new(Mutex::new((55.0_f64, 130.0_f64)));
+        let (handle, hp) = start_pl_rig("pl-restore", std::sync::Arc::clone(&link), true);
+        let o = block(&handle, ControlCommand::SetPowerLimits(pl(45, 90)));
+        assert!(matches!(
+            o.status,
+            ControlStatus::Applied {
+                verification: Verification::Verified
+            }
+        ));
+        handle.shutdown();
+        let writes = hp.state().power_limits_writes.clone();
+        // write #1 = the user's change, write #2 = baseline restore (55/130
+        // captured from the feed BEFORE our first write).
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[1], pl(55, 130));
+        assert_eq!(*link.lock().unwrap(), (55.0, 130.0));
+    }
+
+    #[cfg(feature = "experimental-hp-power-limits")]
+    #[test]
+    fn keepalive_reasserts_power_limits() {
+        let link = std::sync::Arc::new(Mutex::new((55.0_f64, 130.0_f64)));
+        let (handle, hp) = start_pl_rig("pl-keepalive", std::sync::Arc::clone(&link), true);
+        let o = block(&handle, ControlCommand::SetPowerLimits(pl(45, 90)));
+        assert!(matches!(
+            o.status,
+            ControlStatus::Applied {
+                verification: Verification::Verified
+            }
+        ));
+        // keepalive period is 120 ms in this rig — let ~3 ticks pass.
+        std::thread::sleep(Duration::from_millis(400));
+        let n = hp.state().power_limits_writes.len();
+        handle.shutdown();
+        assert!(n >= 2, "expected keepalive re-asserts, got {n} writes");
+    }
+
     /// HIL-13 regression: after the hysteresis release, observed.max_fan
     /// must not stay TrustedWrite(true) — the keepalive would re-assert max
     /// fan at the next tick. The release sequence must write 0x27-off
@@ -1566,6 +2278,9 @@ mod tests {
             fn fan_levels(&self) -> Option<(FanLevels, Instant)> {
                 Some((FanLevels::new(20, 20), Instant::now()))
             }
+            fn power_limits_w(&self) -> Option<(f64, f64, Instant)> {
+                Some((55.0, 130.0, Instant::now()))
+            }
         }
 
         let dir = std::env::temp_dir().join(format!("phelper-coord-test-hyst-{}", std::process::id()));
@@ -1573,7 +2288,7 @@ mod tests {
         let journal_path = dir.join("journal.jsonl");
         let temp = std::sync::Arc::new(Mutex::new(70.0_f64));
         let hp = MockHp::default();
-        let ppm = MockPpm(std::sync::Arc::new(Mutex::new((50, 50))));
+        let ppm = MockPpm(std::sync::Arc::new(Mutex::new((50, 50, 50, 50))));
         let mut cfg = ControlConfig::new(
             caps_full(),
             test_identity("hyst"),

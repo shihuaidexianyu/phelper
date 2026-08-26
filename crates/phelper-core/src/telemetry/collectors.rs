@@ -425,7 +425,7 @@ impl Collector for PpmCollector {
 
     fn collect(&mut self) -> Vec<MetricSample> {
         use phelper_domain::telemetry::MetricValue as V;
-        let mut out = Vec::with_capacity(2);
+        let mut out = Vec::with_capacity(4);
         match crate::platform::windows_ppm::read_epp() {
             Ok(epp) => {
                 out.push(fresh(ids::CPU_EPP_AC, V::U64(u64::from(epp.ac)), MetricSource::WindowsPpm));
@@ -435,6 +435,17 @@ impl Collector for PpmCollector {
             Err(e) => {
                 debug!(%e, "EPP read failed");
                 self.status = ProviderStatus::Degraded(format!("EPP read: {e}"));
+            }
+        }
+        match crate::platform::windows_ppm::read_epp1() {
+            Ok(epp1) => {
+                out.push(fresh(ids::CPU_EPP1_AC, V::U64(u64::from(epp1.ac)), MetricSource::WindowsPpm));
+                out.push(fresh(ids::CPU_EPP1_DC, V::U64(u64::from(epp1.dc)), MetricSource::WindowsPpm));
+            }
+            Err(e) => {
+                // Class-1 EPP is absent on homogeneous CPUs; a failure here
+                // alone must not flap the provider status.
+                debug!(%e, "EPP1 read failed");
             }
         }
         out

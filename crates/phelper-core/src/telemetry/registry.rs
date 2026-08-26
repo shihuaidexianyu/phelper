@@ -98,6 +98,20 @@ pub(crate) const REGISTRY: &[MetricMeta] = &[
         "PERFEPP DC readback"
     ),
     m!(
+        ids::CPU_EPP1_AC,
+        "%",
+        MetricSource::WindowsPpm,
+        5000,
+        "PERFEPP1 (class-1 / E-core) AC readback"
+    ),
+    m!(
+        ids::CPU_EPP1_DC,
+        "%",
+        MetricSource::WindowsPpm,
+        5000,
+        "PERFEPP1 (class-1 / E-core) DC readback"
+    ),
+    m!(
         ids::CPU_UTIL_PERCENT,
         "%",
         MetricSource::WindowsPdh,

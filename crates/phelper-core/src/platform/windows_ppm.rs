@@ -34,6 +34,15 @@ const PERFEPP: GUID = GUID::from_values(
     0x4dbf,
     [0xb1, 0xdc, 0x15, 0xeb, 0x38, 0x1c, 0x68, 0x63],
 );
+/// GUID_PROCESSOR_PERFEPP1 36687f9e-e3a5-4dbf-b1dc-15eb381c6864 — on
+/// heterogeneous CPUs (13900HX) this is the processor-class-1 (E-core) EPP;
+/// differs from PERFEPP only in the last byte.
+const PERFEPP1: GUID = GUID::from_values(
+    0x3668_7f9e,
+    0xe3a5,
+    0x4dbf,
+    [0xb1, 0xdc, 0x15, 0xeb, 0x38, 0x1c, 0x68, 0x64],
+);
 /// GUID_PROCESSOR_PROCFREQMAX 75b0ae3f-bce0-45a7-8c89-c9611c25e100
 /// (frequency ceiling in MHz; 0 = unlimited).
 const PROCFREQMAX: GUID = GUID::from_values(
@@ -123,6 +132,20 @@ pub(crate) fn read_epp() -> Result<EppReading, PlatformError> {
     let dc = read_index(false, &scheme, &SUB_PROCESSOR, &PERFEPP)?;
     if ac > 100 || dc > 100 {
         return Err(PlatformError::Data("EPP out of 0-100 range"));
+    }
+    Ok(EppReading {
+        ac: ac as u8,
+        dc: dc as u8,
+    })
+}
+
+/// Read the class-1 (E-core) EPP (PERFEPP1) from the active power scheme.
+pub(crate) fn read_epp1() -> Result<EppReading, PlatformError> {
+    let scheme = active_scheme()?;
+    let ac = read_index(true, &scheme, &SUB_PROCESSOR, &PERFEPP1)?;
+    let dc = read_index(false, &scheme, &SUB_PROCESSOR, &PERFEPP1)?;
+    if ac > 100 || dc > 100 {
+        return Err(PlatformError::Data("EPP1 out of 0-100 range"));
     }
     Ok(EppReading {
         ac: ac as u8,
@@ -234,6 +257,11 @@ impl phelper_domain::ports::CpuPolicyBackend for PpmBackend {
         Ok((r.ac, r.dc))
     }
 
+    fn read_epp1(&self) -> Result<(u8, u8), PlatformError> {
+        let r = read_epp1()?;
+        Ok((r.ac, r.dc))
+    }
+
     fn read_max_freq_mhz(&self) -> Result<(u32, u32), PlatformError> {
         read_max_freq_mhz_acdc()
     }
@@ -249,6 +277,20 @@ impl phelper_domain::ports::CpuPolicyBackend for PpmBackend {
         }
         if let Some(v) = dc {
             write_index(false, &scheme, &SUB_PROCESSOR, &PERFEPP, v as u32)?;
+        }
+        if ac.is_some() || dc.is_some() {
+            commit_active_scheme()?;
+        }
+        Ok(())
+    }
+
+    fn write_epp1(&self, ac: Option<u8>, dc: Option<u8>) -> Result<(), PlatformError> {
+        let scheme = active_scheme()?;
+        if let Some(v) = ac {
+            write_index(true, &scheme, &SUB_PROCESSOR, &PERFEPP1, v as u32)?;
+        }
+        if let Some(v) = dc {
+            write_index(false, &scheme, &SUB_PROCESSOR, &PERFEPP1, v as u32)?;
         }
         if ac.is_some() || dc.is_some() {
             commit_active_scheme()?;
@@ -296,6 +338,10 @@ mod tests {
         assert_eq!(
             t(&PERFEPP),
             (0x36687f9e, 0xe3a5, 0x4dbf, [0xb1, 0xdc, 0x15, 0xeb, 0x38, 0x1c, 0x68, 0x63])
+        );
+        assert_eq!(
+            t(&PERFEPP1),
+            (0x36687f9e, 0xe3a5, 0x4dbf, [0xb1, 0xdc, 0x15, 0xeb, 0x38, 0x1c, 0x68, 0x64])
         );
         assert_eq!(
             t(&PROCFREQMAX),

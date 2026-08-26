@@ -78,6 +78,18 @@ pub trait HpControl: Send {
     /// 0x27 max fan on/off, payload = 4-byte LE int 1/0, outsize=0
     /// (hp-wmi.c `HPWMI_FAN_SPEED_MAX_SET_QUERY`).
     fn set_max_fan(&self, on: bool) -> Result<(), HpWmiError>;
+    /// 0x22 GPU platform policy set, payload = 4 bytes
+    /// `{ctgp, ppab, dstate, gpu_slowdown_temp}`, outsize=0 (hp-wmi.c
+    /// `HPWMI_SET_GPU_THERMAL_MODES_QUERY`). Full-structure write — callers
+    /// read-modify-write via 0x21 to preserve untouched fields.
+    fn set_gpu_platform_policy(&self, p: crate::policy::GpuPlatformPolicy) -> Result<(), HpWmiError>;
+    /// 0x29 CPU power limits (PL1/PL2). On 8BAB the wire order is
+    /// `{PL2, PL1, 0xFF, 0xFF}` (S2-arbitrated 2026-08-26 — NOT the kernel
+    /// struct order). pl4/cc are not writable yet: implementations reject
+    /// nonzero `pl4_w`/`cpu_gpu_concurrent_w` (0 = NO_CHANGE). AUTHORIZATION
+    /// (Experimental caps + cargo feature) lives in the safety layer —
+    /// domain traits carry no cargo-feature gates.
+    fn set_power_limits(&self, l: crate::policy::CpuPowerLimits) -> Result<(), HpWmiError>;
 }
 
 /// The full HP backend: read port + write port (what the coordinator holds).
@@ -91,11 +103,14 @@ impl<T: HpPlatform + HpControl> HpBackend for T {}
 pub trait CpuPolicyBackend: Send {
     /// EPP 0..=100 (0 = favor performance) as (AC, DC).
     fn read_epp(&self) -> Result<(u8, u8), PlatformError>;
+    /// PERFEPP1 (processor class 1 / E-core EPP) as (AC, DC).
+    fn read_epp1(&self) -> Result<(u8, u8), PlatformError>;
     /// Max frequency ceiling in MHz as (AC, DC); 0 = unlimited.
     fn read_max_freq_mhz(&self) -> Result<(u32, u32), PlatformError>;
     /// PERFBOOSTMODE as (AC, DC).
     fn read_boost_policy(&self) -> Result<(BoostPolicy, BoostPolicy), PlatformError>;
     fn write_epp(&self, ac: Option<u8>, dc: Option<u8>) -> Result<(), PlatformError>;
+    fn write_epp1(&self, ac: Option<u8>, dc: Option<u8>) -> Result<(), PlatformError>;
     fn write_max_freq_mhz(&self, ac: Option<u32>, dc: Option<u32>) -> Result<(), PlatformError>;
     /// The domain models ONE boost value; Windows stores it per rail, so
     /// the implementation writes the same mode to both AC and DC.

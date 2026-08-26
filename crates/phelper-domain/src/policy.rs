@@ -72,9 +72,12 @@ pub struct GpuPlatformPolicy {
     pub slowdown_temp_c: u8,
 }
 
-/// 0x29 power limits payload. EXPERIMENTAL on 8BAB: byte order is contested
-/// (kernel struct {pl1,pl2,pl4,cc} vs OmenSuperHub {PL2,PL1,..}) and the
-/// kernel never writes explicit values on this board. See feasibility §3.
+/// 0x29 power limits payload. EXPERIMENTAL on 8BAB: the pl1/pl2 byte order
+/// was settled on-device (M3 S2, 2026-08-26 — firmware wants byte0=PL2,
+/// byte1=PL1, OPPOSITE of the kernel struct). `pl4_w` and
+/// `cpu_gpu_concurrent_w` are NOT writable yet (their explicit-write
+/// behavior is unverified): 0 = leave unchanged (wire 0xFF), nonzero is
+/// rejected by safety and transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CpuPowerLimits {
     pub pl1_w: u8,
@@ -137,6 +140,9 @@ pub struct CpuPolicy {
     /// Energy Performance Preference 0..=100 (0 = favor performance).
     pub epp_ac: Option<u8>,
     pub epp_dc: Option<u8>,
+    /// PERFEPP1: processor class 1 (E-core) EPP on heterogeneous CPUs.
+    pub epp1_ac: Option<u8>,
+    pub epp1_dc: Option<u8>,
     pub max_freq_mhz_ac: Option<u32>,
     pub max_freq_mhz_dc: Option<u32>,
     pub boost_policy: Option<BoostPolicy>,
