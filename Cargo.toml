@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/phelper-domain", "crates/phelper-core", "crates/phelper-cli"]
+members = [
+    "crates/phelper-domain",
+    "crates/phelper-core",
+    "crates/phelper-cli",
+    "apps/desktop",
+]
 
 [workspace.package]
 edition = "2024"

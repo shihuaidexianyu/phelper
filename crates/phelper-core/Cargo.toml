@@ -38,6 +38,11 @@ windows = { version = "0.62", features = [
     "Win32_System_Threading",
     "Win32_System_LibraryLoader",
     "Win32_Storage_FileSystem",
+    "Win32_UI_Shell",
+    # ShellExecuteW self-elevation (elevation.rs) — must be declared here:
+    # relying on gpui's transitive copy only links in full-workspace builds
+    # (feature unification); `cargo run -p phelper-cli` alone breaks.
+    "Win32_UI_WindowsAndMessaging",
     "Win32_Security",
     "Win32_System_Wmi",
     "Win32_System_Com",

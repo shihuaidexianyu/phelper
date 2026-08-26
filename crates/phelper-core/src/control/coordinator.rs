@@ -23,6 +23,7 @@ use phelper_domain::policy::{
     CpuPolicy, CpuPowerLimits, FanLevels, FanMode, GpuPlatformPolicy, ThermalMode,
 };
 use phelper_domain::ports::{CpuPolicyBackend, HpBackend};
+use phelper_domain::profile::GpuPolicyPatch;
 use phelper_domain::state::{DesiredState, ObservedState, ObservedValue};
 use phelper_domain::telemetry::ids;
 use tracing::{debug, info, warn};
@@ -56,6 +57,11 @@ enum ControlRequest {
         cmd: ControlCommand,
         reply: mpsc::Sender<ControlOutcome>,
     },
+    /// Read-only re-probe of the read-backable observed fields. NOT a
+    /// ControlCommand: no write, no journal entry, no safety gate — the
+    /// coordinator simply re-reads and re-stamps ObservedState so a
+    /// startup stamp never poses as live truth for the whole session.
+    RefreshObserved,
     Shutdown(mpsc::Sender<()>),
 }
 
@@ -174,6 +180,17 @@ impl ControlHandle {
 
     pub fn observed(&self) -> ObservedState {
         self.observed.read().expect("observed poisoned").clone()
+    }
+
+    /// Ask the coordinator to re-probe the read-backable observed fields
+    /// (EPP/EPP1 via PPM, 0x21 gpu policy) and re-stamp ObservedState.
+    /// Read-only and fire-and-forget: a dropped refresh (full queue)
+    /// just keeps the previous stamp, whose Instant keeps the staleness
+    /// visible. (0x610 power limits are deliberately NOT re-stamped here:
+    /// their observed value drives the keepalive byte2 re-assert — M4.1 —
+    /// and their 250 ms live truth is already on the telemetry feed.)
+    pub fn refresh_observed(&self) {
+        let _ = self.tx.try_send(ControlRequest::RefreshObserved);
     }
 
     /// Stop the coordinator; it restores firmware automatic state first
@@ -312,6 +329,54 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         o
     }
 
+    /// Read-only re-probe behind `ControlRequest::RefreshObserved` (M6 —
+    /// keeps the UI's observed stamps from going minutes stale between
+    /// writes). Every source fails independently: a failed
+    /// re-read leaves the old stamp in place, its Instant keeping the
+    /// age honest — refresh never ERASES knowledge.
+    fn refresh_observed(&mut self) {
+        debug!("re-probing observed readbacks");
+        if let Ok((ac, dc)) = self.ppm.read_epp() {
+            self.set_observed(|o| {
+                o.epp_ac = ObservedValue::Verified {
+                    value: ac,
+                    at: Instant::now(),
+                    source: "powrprof PERFEPP",
+                };
+                o.epp_dc = ObservedValue::Verified {
+                    value: dc,
+                    at: Instant::now(),
+                    source: "powrprof PERFEPP",
+                };
+            });
+        }
+        if let Ok((ac, dc)) = self.ppm.read_epp1() {
+            self.set_observed(|o| {
+                o.epp1_ac = ObservedValue::Verified {
+                    value: ac,
+                    at: Instant::now(),
+                    source: "powrprof PERFEPP1",
+                };
+                o.epp1_dc = ObservedValue::Verified {
+                    value: dc,
+                    at: Instant::now(),
+                    source: "powrprof PERFEPP1",
+                };
+            });
+        }
+        if let Some(hp) = &self.hp
+            && let Ok(p) = hp.gpu_platform_policy()
+        {
+            self.set_observed(|o| {
+                o.gpu_platform_policy = ObservedValue::Verified {
+                    value: p,
+                    at: Instant::now(),
+                    source: "hp-wmi 0x21",
+                };
+            });
+        }
+    }
+
     fn run(mut self) {
         info!("control coordinator running");
         loop {
@@ -331,6 +396,7 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                     let _ = ack.send(());
                     return;
                 }
+                Ok(ControlRequest::RefreshObserved) => self.refresh_observed(),
                 Err(mpsc::RecvTimeoutError::Timeout) => self.tick(),
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     // All handles dropped without shutdown(): still restore.
@@ -480,6 +546,9 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             ControlCommand::SetFanMode(mode) => self.exec_fan_mode(*mode, steps),
             ControlCommand::SetCpuPolicy(policy) => self.exec_cpu_policy(policy, steps),
             ControlCommand::SetGpuPlatformPolicy(p) => self.exec_gpu_policy(*p, steps),
+            ControlCommand::SetGpuPlatformPolicyPatch(patch) => {
+                self.exec_gpu_policy_patch(*patch, steps)
+            }
             ControlCommand::SetPowerLimits(l) => self.exec_power_limits(*l, steps),
             // validate() rejects these; a plan never contains them.
             _ => ControlStatus::Rejected {
@@ -535,6 +604,10 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             ControlCommand::SetFanMode(m) => d.fan_mode = Some(*m),
             ControlCommand::SetCpuPolicy(p) => d.cpu_policy = Some(p.clone()),
             ControlCommand::SetGpuPlatformPolicy(p) => d.gpu_platform_policy = Some(*p),
+            // Desired is stamped inside exec_gpu_policy_patch — the
+            // merged full value only exists there. (The profile-clearing
+            // below still applies: a direct patch clears the name stamp.)
+            ControlCommand::SetGpuPlatformPolicyPatch(_) => {}
             ControlCommand::SetPowerLimits(l) => d.power_limits = Some(*l),
             _ => {}
         }
@@ -867,6 +940,54 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 }
             }
         }
+    }
+
+    /// 0x22 patch write (M6): the merge base is a FRESH 0x21 read taken
+    /// here inside the single writer — never the cached ObservedState,
+    /// which can sit minutes stale between re-probes (a UI-side merge
+    /// over it would silently clobber fields the user never touched).
+    /// Write + delayed-poll verify + observed stamping reuse
+    /// the full-struct path; the plan-level safety gate has already
+    /// range-checked every `Some` field.
+    fn exec_gpu_policy_patch(
+        &mut self,
+        patch: GpuPolicyPatch,
+        steps: &mut Vec<StepOutcome>,
+    ) -> ControlStatus {
+        let current = match &self.hp {
+            Some(hp) => match hp.gpu_platform_policy() {
+                Ok(c) => c,
+                Err(e) => {
+                    steps.push(failed_step(
+                        "read gpu policy (0x21)",
+                        "hp-wmi 0x21",
+                        &e,
+                        "—".into(),
+                    ));
+                    return ControlStatus::Rejected {
+                        error: map_hp_error_ref(&e),
+                    };
+                }
+            },
+            None => {
+                return ControlStatus::Rejected {
+                    error: ControlError::BackendUnavailable {
+                        what: "HP platform".into(),
+                    },
+                };
+            }
+        };
+        let merged = patch.apply(current);
+        let status = self.exec_gpu_policy(merged, steps);
+        if matches!(status, ControlStatus::Applied { .. }) {
+            // record_desired() can't fill this in — the merged value only
+            // exists here — so the patch arm stamps desired itself.
+            self.desired
+                .write()
+                .expect("desired poisoned")
+                .gpu_platform_policy = Some(merged);
+        }
+        status
     }
 
     /// 0x21 readback after a 0x22 write: all four bytes must match.
@@ -2294,6 +2415,85 @@ mod tests {
         let observed = rig.handle.observed();
         assert_eq!(observed.gpu_platform_policy.value(), Some(&target));
         assert!(!observed.gpu_platform_policy.is_verified());
+        rig.handle.shutdown();
+    }
+
+    #[test]
+    fn gpu_policy_patch_merges_over_fresh_read() {
+        let rig = TestRig::start("gpu-policy-patch");
+        // Simulate change SINCE engine start (what this command exists
+        // for): the startup stamp holds the default mock value, but the
+        // "firmware" now reads something else entirely.
+        rig.hp.state().gpu_policy = Some(GpuPlatformPolicy {
+            ctgp: true,
+            ppab: false,
+            dstate: 3,
+            slowdown_temp_c: 0,
+        });
+        let o = block(
+            &rig.handle,
+            ControlCommand::SetGpuPlatformPolicyPatch(GpuPolicyPatch {
+                ctgp: Some(false),
+                ..Default::default()
+            }),
+        );
+        assert!(matches!(
+            o.status,
+            ControlStatus::Applied {
+                verification: Verification::Verified
+            }
+        ));
+        // The merge base was the FRESH read: only ctgp moved; the changed
+        // ppab/dstate/slowdown were preserved — NOT the startup values.
+        let merged = GpuPlatformPolicy {
+            ctgp: false,
+            ppab: false,
+            dstate: 3,
+            slowdown_temp_c: 0,
+        };
+        assert_eq!(rig.hp.state().gpu_policy_writes, vec![merged]);
+        let observed = rig.handle.observed();
+        assert_eq!(observed.gpu_platform_policy.value(), Some(&merged));
+        assert!(observed.gpu_platform_policy.is_verified());
+        assert_eq!(rig.handle.desired().gpu_platform_policy, Some(merged));
+        rig.handle.shutdown();
+    }
+
+    #[test]
+    fn gpu_policy_patch_empty_rejected_pre_write() {
+        let rig = TestRig::start("gpu-policy-patch-empty");
+        let o = block(
+            &rig.handle,
+            ControlCommand::SetGpuPlatformPolicyPatch(GpuPolicyPatch::default()),
+        );
+        assert!(matches!(o.status, ControlStatus::Rejected { .. }));
+        assert!(rig.hp.state().gpu_policy_writes.is_empty());
+        rig.handle.shutdown();
+    }
+
+    #[test]
+    fn refresh_observed_restamps_drifted_readbacks() {
+        let rig = TestRig::start("refresh-observed");
+        // Startup stamp holds the default mock value; now the "firmware"
+        // reads something else with zero writes (a stale cache).
+        let drifted = GpuPlatformPolicy {
+            ctgp: false,
+            ppab: false,
+            dstate: 3,
+            slowdown_temp_c: 0,
+        };
+        rig.hp.state().gpu_policy_pin = Some(drifted);
+        rig.handle.refresh_observed();
+        // Fire-and-forget: poll the cache until the re-probe lands.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rig.handle.observed().gpu_platform_policy.value() != Some(&drifted) {
+            assert!(Instant::now() < deadline, "refresh never landed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(rig.handle.observed().gpu_platform_policy.is_verified());
+        // Read-only: no writes, and nothing journaled (pre-shutdown).
+        assert!(rig.hp.state().gpu_policy_writes.is_empty());
+        assert!(rig.journal_text().is_empty());
         rig.handle.shutdown();
     }
 

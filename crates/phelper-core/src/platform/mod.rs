@@ -1,7 +1,10 @@
 //! Platform adapters (Windows-only). Each module implements domain ports;
 //! nothing here is visible to the outside except through those ports.
 
-pub(crate) mod elevation;
+// pub like ogh_watch: the desktop shell needs the elevation gate + runas
+// relaunch for its self-elevation startup (M6; gpui.lib owns RT_MANIFEST,
+// so a static requireAdministrator manifest is impossible with gpui).
+pub mod elevation;
 pub(crate) mod hp_wmi;
 pub(crate) mod identity;
 #[cfg(feature = "nvidia")]

@@ -187,6 +187,40 @@ impl SafetySupervisor {
                 Ok(())
             }
 
+            ControlCommand::SetGpuPlatformPolicyPatch(p) => {
+                require_supported(caps.gpu_platform_policy)?;
+                if p.ctgp.is_none()
+                    && p.ppab.is_none()
+                    && p.dstate.is_none()
+                    && p.slowdown_temp_c.is_none()
+                {
+                    return Err(ControlError::UnsafeRequest {
+                        reason: "empty 0x22 patch — no field selected to change".into(),
+                    });
+                }
+                // Per-field bands mirror the full-struct arm; the merged
+                // result's remaining fields come from the live 0x21 read at
+                // write time (hardware-sourced, hence already plausible).
+                if let Some(d) = p.dstate
+                    && !(1..=4).contains(&d)
+                {
+                    return Err(ControlError::UnsafeRequest {
+                        reason: format!("dstate {d} out of range 1..=4 (100/50/25/12.5%)"),
+                    });
+                }
+                if let Some(s) = p.slowdown_temp_c
+                    && s != 0
+                    && !(30..=110).contains(&s)
+                {
+                    return Err(ControlError::UnsafeRequest {
+                        reason: format!(
+                            "gpu slowdown temp {s}°C outside plausible band 30..=110 (0 = preserve board-absent value)"
+                        ),
+                    });
+                }
+                Ok(())
+            }
+
             ControlCommand::SetCpuPolicy(p) => self.validate_cpu_policy(p, caps),
 
             ControlCommand::SetThermalMode(_) => require_supported(caps.thermal_mode),
@@ -625,6 +659,78 @@ mod tests {
             &ObservedState::default(),
         )
         .unwrap();
+    }
+
+    // ---- validate: GPU platform policy PATCH (0x22, M6 UI path) ----
+
+    #[test]
+    fn gpu_policy_patch_ctgp_only_allowed() {
+        let s = SafetySupervisor::new();
+        s.validate(
+            &ControlCommand::SetGpuPlatformPolicyPatch(phelper_domain::profile::GpuPolicyPatch {
+                ctgp: Some(false),
+                ..Default::default()
+            }),
+            &caps_full(),
+            &FakeFeed::fresh(70.0),
+            &ObservedState::default(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn gpu_policy_patch_empty_rejected() {
+        let s = SafetySupervisor::new();
+        let e = s
+            .validate(
+                &ControlCommand::SetGpuPlatformPolicyPatch(Default::default()),
+                &caps_full(),
+                &FakeFeed::fresh(70.0),
+                &ObservedState::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(e, ControlError::UnsafeRequest { .. }));
+    }
+
+    #[test]
+    fn gpu_policy_patch_field_bands_mirrored() {
+        let s = SafetySupervisor::new();
+        for bad in [
+            phelper_domain::profile::GpuPolicyPatch {
+                dstate: Some(5),
+                ..Default::default()
+            },
+            phelper_domain::profile::GpuPolicyPatch {
+                slowdown_temp_c: Some(200),
+                ..Default::default()
+            },
+        ] {
+            let e = s
+                .validate(
+                    &ControlCommand::SetGpuPlatformPolicyPatch(bad),
+                    &caps_full(),
+                    &FakeFeed::fresh(70.0),
+                    &ObservedState::default(),
+                )
+                .unwrap_err();
+            assert!(matches!(e, ControlError::UnsafeRequest { .. }));
+        }
+        let mut caps = caps_full();
+        caps.gpu_platform_policy = Support::Unsupported;
+        let e = s
+            .validate(
+                &ControlCommand::SetGpuPlatformPolicyPatch(
+                    phelper_domain::profile::GpuPolicyPatch {
+                        ppab: Some(true),
+                        ..Default::default()
+                    },
+                ),
+                &caps,
+                &FakeFeed::fresh(70.0),
+                &ObservedState::default(),
+            )
+            .unwrap_err();
+        assert_eq!(e, ControlError::Unsupported);
     }
 
     // ---- validate: 0x29 power limits (double gate) ----

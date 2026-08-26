@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ControlError;
 use crate::policy::{CpuPolicy, CpuPowerLimits, FanMode, GpuPlatformPolicy, MuxMode, ThermalMode};
+use crate::profile::GpuPolicyPatch;
 
 /// The only way anything ever asks for a hardware mutation (AR-03).
 /// UI/CLI/future API dispatch these; nobody calls `set_pl1()` directly.
@@ -17,6 +18,13 @@ pub enum ControlCommand {
     SetThermalMode(ThermalMode),
     SetFanMode(FanMode),
     SetGpuPlatformPolicy(GpuPlatformPolicy),
+    /// 0x22 partial write: only `Some` fields move; the rest merge from a
+    /// FRESH 0x21 read taken inside the coordinator at write time — never
+    /// from a cached ObservedState (a stale-cache merge would silently
+    /// clobber fields the user never touched). This is the UI toggle path;
+    /// the full-struct variant stays for CLI/profiles whose merge base is
+    /// fresh.
+    SetGpuPlatformPolicyPatch(GpuPolicyPatch),
     /// EXPERIMENTAL (0x29). Requires the `experimental-hp-power-limits`
     /// feature AND passes the staged verification runbook.
     SetPowerLimits(CpuPowerLimits),
