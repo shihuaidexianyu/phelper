@@ -1,7 +1,8 @@
 //! TrendChart — 5-minute dual-series area chart (temp + power) fed by the
 //! telemetry ring store via `AppHandle::history` (§39 passthrough; the
-//! chart never touches collectors). Series are index-aligned after
-//! bucket-downsampling to ≤120 points (fmt::downsample).
+//! chart never touches collectors). Both series average onto ONE fixed
+//! 120-bucket time grid (fmt::time_grid) — unique x labels, time-aligned
+//! mixed cadences, sub-second jitter smoothed.
 
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
@@ -45,9 +46,14 @@ pub struct TrendPoint {
     pub b: f64,
 }
 
-/// Pull both histories, downsample each, align by index (the two series
-/// come from the same collector tick, so counts match; truncation to the
-/// shorter guards the rest). x labels are age-from-now of the A sample.
+/// Pull both histories onto ONE fixed 120-bucket time grid (2.5 s each)
+/// and emit the intersection. The grid is the fix for the M6 "loopy
+/// chart": gpui-component's `ScalePoint` resolves an x value by FIRST
+/// match, so duplicate "M:SS" labels collapsed several points onto one x
+/// and the polyline drew vertical zigzags — worst right after startup
+/// (250 ms samples → ~4 points per 1 s label). Bucket ages are always
+/// unique, mixed cadences (250 ms CPU vs 500 ms GPU) align by TIME
+/// instead of index, and per-bucket averaging smooths sub-second jitter.
 pub fn trend_points(app: &AppHandle, id_a: MetricId, id_b: MetricId) -> Vec<TrendPoint> {
     let now = Instant::now();
     let pairs = |id: MetricId| -> Vec<(f64, f64)> {
@@ -61,21 +67,26 @@ pub fn trend_points(app: &AppHandle, id_a: MetricId, id_b: MetricId) -> Vec<Tren
             })
             .collect()
     };
-    let da = fmt::downsample(&pairs(id_a), MAX_POINTS);
-    let db = fmt::downsample(&pairs(id_b), MAX_POINTS);
-    let n = da.len().min(db.len());
-    // Histories arrive oldest→newest; trim to the NEWEST n on both sides.
-    let da = &da[da.len() - n..];
-    let db = &db[db.len() - n..];
-    da.iter()
-        .zip(db)
-        .map(|((age, a), (_, b))| {
-            let age = *age as u64;
-            TrendPoint {
-                time: format!("{}:{:02}", age / 60, age % 60),
-                a: *a,
-                b: *b,
-            }
+    let ga = fmt::time_grid(&pairs(id_a), WINDOW.as_secs_f64(), MAX_POINTS);
+    let gb: std::collections::BTreeMap<usize, f64> =
+        fmt::time_grid(&pairs(id_b), WINDOW.as_secs_f64(), MAX_POINTS)
+            .into_iter()
+            .collect();
+    let width = WINDOW.as_secs_f64() / MAX_POINTS as f64;
+    // Intersection only — never paint a series value the store didn't
+    // produce. Buckets are indexed 0 = newest; the chart wants oldest first.
+    ga.iter()
+        .rev()
+        .filter_map(|(bucket, av)| {
+            gb.get(bucket).map(|bv| {
+                let age = ((*bucket as f64) + 0.5) * width;
+                let age = age as u64;
+                TrendPoint {
+                    time: format!("{}:{:02}", age / 60, age % 60),
+                    a: *av,
+                    b: *bv,
+                }
+            })
         })
         .collect()
 }

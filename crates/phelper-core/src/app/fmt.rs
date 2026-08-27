@@ -257,27 +257,75 @@ pub fn age_zh(now_ms: u64, at_ms: u64) -> String {
     }
 }
 
-/// Bucket-average downsample for trend charts: at most `max` points.
-/// Input is (x, y) pairs in any unit; len ≤ max returns a clone.
-pub fn downsample(points: &[(f64, f64)], max: usize) -> Vec<(f64, f64)> {
-    if points.len() <= max || max == 0 {
-        return points.to_vec();
+/// Fixed time-grid bucketing for trend charts: average (age_secs, value)
+/// pairs into `buckets` equal buckets spanning [0, window_secs]. Returns
+/// (bucket_index, average) with bucket 0 = NEWEST; empty buckets absent.
+///
+/// One entry per 2.5 s bucket (300 s / 120) means x labels derived from
+/// bucket ages are ALWAYS unique — this matters because gpui-component's
+/// `ScalePoint` looks a domain value up by FIRST match: duplicate x
+/// labels collapse several points onto one x position and the polyline
+/// draws vertical zigzags (the M6 "loopy chart" seen on the Thermals
+/// page, worst right after startup when points/second > 1). Bucket
+/// averaging also aligns mixed collector cadences (250 ms CPU vs 500 ms
+/// GPU) by TIME and smooths sub-second jitter for free.
+pub fn time_grid(points: &[(f64, f64)], window_secs: f64, buckets: usize) -> Vec<(usize, f64)> {
+    if buckets == 0 || window_secs <= 0.0 {
+        return Vec::new();
     }
-    let buckets = max;
-    let chunk = points.len().div_ceil(buckets);
-    points
-        .chunks(chunk)
-        .map(|c| {
-            let n = c.len() as f64;
-            let (sx, sy) = c.iter().fold((0.0, 0.0), |(ax, ay), (x, y)| (ax + x, ay + y));
-            (sx / n, sy / n)
-        })
-        .collect()
+    let width = window_secs / buckets as f64;
+    let mut sums: std::collections::BTreeMap<usize, (f64, usize)> = Default::default();
+    for (age, v) in points {
+        if *age < 0.0 || *age >= window_secs {
+            continue;
+        }
+        let e = sums.entry((*age / width) as usize).or_default();
+        e.0 += v;
+        e.1 += 1;
+    }
+    sums.into_iter().map(|(b, (s, n))| (b, s / n as f64)).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn time_grid_buckets_average_and_orient_newest_first() {
+        // 10 s window, 5 buckets → 2 s each. Bucket 0 = newest [0,2).
+        let pts = vec![
+            (0.5, 10.0),
+            (1.5, 20.0), // bucket 0 → avg 15
+            (2.5, 30.0), // bucket 1
+            (8.5, 40.0), // bucket 4
+            (10.5, 99.0), // out of window → dropped
+        ];
+        let g = time_grid(&pts, 10.0, 5);
+        assert_eq!(g, vec![(0, 15.0), (1, 30.0), (4, 40.0)]);
+        // Empty input / degenerate args.
+        assert!(time_grid(&[], 10.0, 5).is_empty());
+        assert!(time_grid(&pts, 10.0, 0).is_empty());
+        assert!(time_grid(&pts, 0.0, 5).is_empty());
+    }
+
+    #[test]
+    fn time_grid_label_ages_are_unique_at_second_precision() {
+        // The whole point of the grid: one entry per 2.5 s bucket ⇒ the
+        // "M:SS" labels derived from bucket-center ages never repeat (the
+        // gpui-component ScalePoint collapses duplicate x values onto the
+        // first match — the M6 loopy-chart bug). 300 s window, 120 buckets,
+        // dense 250 ms input.
+        let pts: Vec<(f64, f64)> = (0..1200).map(|i| (i as f64 * 0.25, 50.0)).collect();
+        let g = time_grid(&pts, 300.0, 120);
+        assert_eq!(g.len(), 120, "every bucket has data");
+        let ages: Vec<u64> = g
+            .iter()
+            .map(|(b, _)| ((*b as f64 + 0.5) * (300.0 / 120.0)) as u64)
+            .collect();
+        let mut dedup = ages.clone();
+        dedup.dedup();
+        assert_eq!(ages, dedup, "bucket-center ages must be unique at 1 s precision");
+    }
 
     #[test]
     fn every_error_variant_has_human_text() {
@@ -367,20 +415,5 @@ mod tests {
         assert_eq!(age_zh(t, t - 2 * 3600_000), "2 小时前");
         // Future timestamp: saturating, never underflows.
         assert_eq!(age_zh(t, t + 60_000), "刚刚");
-    }
-
-    #[test]
-    fn downsample_caps_and_preserves_shape() {
-        let pts: Vec<(f64, f64)> = (0..1000).map(|i| (i as f64, (i % 10) as f64)).collect();
-        let out = downsample(&pts, 120);
-        assert!(out.len() <= 120, "never exceeds max: {}", out.len());
-        assert!(out.len() >= 100, "stays close to max: {}", out.len());
-        let small = vec![(1.0, 2.0); 10];
-        assert_eq!(downsample(&small, 120).len(), 10, "short input passes through");
-        // Averages are within the data range.
-        for (_, y) in downsample(&pts, 50) {
-            assert!((0.0..=9.0).contains(&y));
-        }
-        assert!(downsample(&pts, 0).len() == 1000, "max=0 degenerates to clone");
     }
 }
