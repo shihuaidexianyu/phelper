@@ -16,7 +16,7 @@
 它不是对现有 Omen Gaming Hub（OGH）的简单重制，也不是对 OmenSuperHub 的 UI 换皮。项目的目标是建立一个长期可维护、可验证、低开销、控制行为透明的性能控制平台：
 
 - 统一观察 CPU、GPU、散热、系统负载和游戏帧性能；
-- 统一管理 CPU power policy、HP 平台性能模式、GPU power policy、风扇和 MUX；
+- 统一管理 CPU power policy、HP 平台性能模式、GPU power policy 和风扇；MUX 只保留必要的只读状态/能力记录；
 - 明确区分“软件希望硬件处于什么状态”与“硬件实际上处于什么状态”；
 - 优先使用 Windows、HP Firmware、NVIDIA 等正式接口；
 - 尽可能避免直接操作 Embedded Controller（EC）；
@@ -108,6 +108,12 @@ Windows 11
 - 云服务、账号体系、内容推荐；
 - 游戏商城、壁纸、资讯等非性能功能；
 - 多进程/微服务式过度拆分。
+
+## 3.3 当前产品决议：不做 MUX 显卡模式切换
+
+reference platform 支持读取 MUX 能力和当前模式，但 Hybrid/Discrete/Optimus 切换需要重启。由于系统本身支持热重载，MUX 切换对当前性能控制闭环没有足够收益，暂不提供写入接口、UI 控件或配置档自动应用。
+
+只读 MUX 状态可以继续用于能力报告和问题定位；任何后续重新实现切换的计划，都必须单独完成重启语义、失败恢复和真机验证。
 
 ---
 

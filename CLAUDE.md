@@ -24,6 +24,8 @@ Phase 5 foundation is now wired: the read-only PresentMon provider dynamically l
 
 2026-08-27 UI consolidation: the desktop user surface now has Dashboard, a combined Performance page (CPU + fan), Profiles, Monitor, and Settings. The Diagnostics page and journal viewer were removed from the GUI; core/CLI audit logs and diagnostic report code remain available for engineering support.
 
+Current scope decision: MUX graphics-mode switching is explicitly deferred/out of scope. The reference machine can report MUX capability/current mode, but switching requires a reboot and does not improve the current hot-reload performance-control loop. Keep the read-only probe/state model for support diagnostics; do not add a MUX write control, UI control, or profile field without a separate reboot/rollback/HIL plan.
+
 **`architecture.md` is the source of truth** (post-M0 corrections applied; where it conflicts with older external docs, `docs/feasibility-16-wf0032TX.md` wins). Before writing code, read it — especially §4 (AR-01–AR-12), §21 (MOF facts), §33.1 (KeepAliveService), and §60 (review checklist). New features must be checked against the §60 checklist; if its 15 questions can't be answered, the feature does not go in.
 
 ## What this project is

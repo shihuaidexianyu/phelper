@@ -163,6 +163,5 @@ cargo build -p phelper-desktop --release --features experimental
 - 目前不是通用 OMEN/Victus 控制器，只服务于 8BAB reference platform
 - 风扇当前读回的是实时 RPM/level，不是硬件内部的温度到转速曲线
 - PresentMon 仍需要用户提供 PID；自动进程选择、游戏生命周期跟踪和 benchmark 导出尚未完成
-- MUX 切换需要重启，因此不放进配置档自动应用
+- MUX 显卡模式切换暂不提供：它需要重启，且不影响当前性能控制闭环；只保留必要的只读状态/能力记录
 - `0x29` CPU 功耗限制仍属于实验性能力，不包含在内置配置档中
-
