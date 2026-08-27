@@ -10,6 +10,7 @@ use phelper_domain::capability::{CapabilitySet, Support};
 use phelper_domain::command::{ControlOutcome, ControlReceipt, ControlStatus, Verification};
 use phelper_domain::error::ControlError;
 use phelper_domain::identity::DeviceIdentity;
+use phelper_domain::policy::{FanCurve, FanMode};
 use phelper_domain::profile::PerformanceProfile;
 use phelper_domain::state::{DesiredState, ObservedState};
 use phelper_domain::telemetry::TelemetrySnapshot;
@@ -87,9 +88,7 @@ pub enum KnobStatus {
         at_epoch_ms: u64,
     },
     /// Multi-step plan stopped partway (profile apply); steps carry detail.
-    Partial {
-        at_epoch_ms: u64,
-    },
+    Partial { at_epoch_ms: u64 },
     Failed {
         error: ControlError,
         at_epoch_ms: u64,
@@ -117,6 +116,10 @@ pub struct ProfileSummary {
     /// Carries `power_limits` (top-level or the R8-poisoned cpu field) —
     /// rendered with the experimental badge; apply-time gates decide.
     pub has_experimental_fields: bool,
+    /// The app-side fan intent carried by this profile. Hardware does not
+    /// expose a readable temperature curve, so the UI uses this persisted
+    /// profile data as the curve source instead of inventing a live value.
+    pub fan_mode: Option<FanMode>,
 }
 
 /// §57 stage-4 drawer visibility. `compiled` is the cargo-feature half of
@@ -148,11 +151,14 @@ pub struct AppState {
     pub caps: Option<CapabilitySet>,
     pub desired: DesiredState,
     pub observed: ObservedState,
+    /// Last software curve successfully applied by phelper. This is a
+    /// recoverable editing source, not an active-control assertion.
+    pub last_saved_fan_curve: Option<FanCurve>,
     pub profiles: Vec<ProfileSummary>,
     pub profile_warnings: Vec<String>,
     pub ogh_findings: Vec<OghFinding>,
     pub knobs: BTreeMap<KnobId, KnobStatus>,
-    /// Arc-wrapped (v0.2): the UI receives one AppState clone per 250 ms
+    /// Arc-wrapped (v0.2): the UI receives one AppState clone per 50 ms
     /// tick — with a plain VecDeque that clone deep-copies up to
     /// EVIDENCE_CAP records 4×/s even though the strip changes only when a
     /// command finishes. Steady ticks are now pointer bumps; the reducers
@@ -215,7 +221,10 @@ impl AppState {
     }
 
     #[cfg(feature = "control")]
-    pub fn apply_journal(&mut self, entries: impl IntoIterator<Item = crate::control::journal::JournalEntry>) {
+    pub fn apply_journal(
+        &mut self,
+        entries: impl IntoIterator<Item = crate::control::journal::JournalEntry>,
+    ) {
         let tail = Arc::make_mut(&mut self.journal_tail);
         for e in entries {
             if tail.len() >= JOURNAL_CAP {
@@ -235,6 +244,7 @@ impl AppState {
                 is_builtin,
                 touches: touches_of(p),
                 has_experimental_fields: p.power_limits.is_some() || p.cpu.power_limits.is_some(),
+                fan_mode: p.fan,
             })
             .collect();
         self.profile_warnings = registry.warnings.clone();
@@ -275,24 +285,24 @@ fn touches_of(p: &PerformanceProfile) -> Vec<&'static str> {
 }
 
 /// Per-knob enable check for the UI: `Ok(())` = interactive, `Err(reason)`
-/// = disabled with this zh-CN tooltip. The UI additionally hides ALL write
-/// controls when `!state.writes_available()`.
+/// = disabled with a short user-facing explanation. The UI additionally
+/// hides ALL write controls when `!state.writes_available()`.
 pub fn knob_enabled(
     caps: Option<&CapabilitySet>,
     knob: KnobId,
     experimental: &ExperimentalUi,
 ) -> Result<(), &'static str> {
     let Some(c) = caps else {
-        return Err("引擎尚未就绪");
+        return Err("正在准备控制");
     };
     let ppm_priv = |what: &'static str| -> Result<(), &'static str> {
         if !c.ppm.write_privileged {
-            return Err("进程未提权——PowrProf 写入不可用");
+            return Err("需要管理员权限");
         }
         match what {
-            "epp" if c.ppm.epp != Support::Supported => Err("本平台不支持 EPP 写入"),
-            "epp1" if c.ppm.epp1 != Support::Supported => Err("本平台不支持 E 核 EPP（PERFEPP1）写入"),
-            "max_freq" if c.ppm.max_freq != Support::Supported => Err("本平台不支持频率上限写入"),
+            "epp" if c.ppm.epp != Support::Supported => Err("当前设备不支持此控制"),
+            "epp1" if c.ppm.epp1 != Support::Supported => Err("当前设备不支持此控制"),
+            "max_freq" if c.ppm.max_freq != Support::Supported => Err("当前设备不支持此控制"),
             _ => Ok(()),
         }
     };
@@ -304,35 +314,35 @@ pub fn knob_enabled(
             if c.ppm.write_privileged {
                 Ok(())
             } else {
-                Err("进程未提权——PowrProf 写入不可用")
+                Err("需要管理员权限")
             }
         }
         KnobId::ThermalMode => {
             if c.thermal_mode.is_usable() {
                 Ok(())
             } else {
-                Err("本平台不支持散热模式写入（0x1A）")
+                Err("当前设备不支持散热控制")
             }
         }
         KnobId::FanMode => {
             if c.fan_manual_level.is_usable() || c.max_fan.is_usable() {
                 Ok(())
             } else {
-                Err("本平台不支持软件风扇控制")
+                Err("当前设备不支持风扇控制")
             }
         }
         KnobId::GpuPolicy => {
             if experimental.gpu_policy_drawer {
                 Ok(())
             } else {
-                Err("GPU 平台策略（0x22）在本平台不可用")
+                Err("当前设备不支持此 GPU 控制")
             }
         }
         KnobId::PowerLimits => {
             if !experimental.compiled {
-                Err("本构建未启用实验性功耗墙（experimental-hp-power-limits）")
+                Err("实验功能未启用")
             } else if !experimental.power_limits_drawer {
-                Err("本平台未将 0x29 功耗墙标记为 Experimental")
+                Err("当前设备不支持此实验功能")
             } else {
                 Ok(())
             }
@@ -341,7 +351,7 @@ pub fn knob_enabled(
             if c.known_board {
                 Ok(())
             } else {
-                Err("未知机型——配置档不可用")
+                Err("当前设备不支持配置档")
             }
         }
     }
@@ -483,10 +493,9 @@ mod tests {
     #[test]
     fn profile_summaries_tag_touches() {
         let mut reg = crate::profiles::ProfileRegistry::empty();
-        let p: PerformanceProfile = toml::from_str(
-            "description = \"d\"\n[cpu]\nepp_ac = 80\n[gpu_policy]\nctgp = true\n",
-        )
-        .unwrap();
+        let p: PerformanceProfile =
+            toml::from_str("description = \"d\"\n[cpu]\nepp_ac = 80\n[gpu_policy]\nctgp = true\n")
+                .unwrap();
         reg.insert("x", p);
         let mut s = AppState::default();
         s.set_profiles(&reg);

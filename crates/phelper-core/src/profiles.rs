@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use phelper_domain::policy::{BoostPolicy, FanMode, ThermalMode};
+use phelper_domain::policy::{BoostPolicy, FanCurve, FanMode, ThermalMode};
 use phelper_domain::profile::{GpuPolicyPatch, PerformanceProfile};
 
 /// User profile directory: %LOCALAPPDATA%\phelper\profiles.
@@ -69,7 +69,8 @@ impl ProfileRegistry {
                 continue;
             }
             let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
-                r.warnings.push(format!("{}: unreadable file name", path.display()));
+                r.warnings
+                    .push(format!("{}: unreadable file name", path.display()));
                 continue;
             };
             if r.entries.contains_key(name) {
@@ -81,8 +82,9 @@ impl ProfileRegistry {
             }
             match std::fs::read_to_string(&path)
                 .map_err(|e| e.to_string())
-                .and_then(|text| toml::from_str::<PerformanceProfile>(&text).map_err(|e| e.to_string()))
-            {
+                .and_then(|text| {
+                    toml::from_str::<PerformanceProfile>(&text).map_err(|e| e.to_string())
+                }) {
                 Ok(profile) => {
                     r.entries.insert(
                         name.to_string(),
@@ -148,11 +150,11 @@ fn builtins() -> Vec<(&'static str, PerformanceProfile)> {
         (
             "silent",
             PerformanceProfile {
-                description: "效率优先：EPP 偏向能效 + 升压受限 + 固件风扇曲线（8BAB 冷机自动=停转）".into(),
+                description: "安静省电，低负载低速运行".into(),
                 thermal_mode: Some(ThermalMode::Balanced),
-                // FirmwareAuto is the quietest fan mode on this board: cold
-                // idle = 0 RPM (M2 HIL-8 verified idle fan-stop).
-                fan: Some(FanMode::FirmwareAuto),
+                // Keep fan ownership in the application. FirmwareAuto is a
+                // release/fail-safe state, not a profile mode.
+                fan: Some(FanMode::Curve(FanCurve::quiet())),
                 cpu: CpuPolicy {
                     epp_ac: Some(80),
                     epp_dc: Some(95),
@@ -168,9 +170,9 @@ fn builtins() -> Vec<(&'static str, PerformanceProfile)> {
         (
             "balanced",
             PerformanceProfile {
-                description: "出厂参考值（本机发货配置）：epp 0/0 + boost aggressive + balanced + 自动风扇 — 一键回原厂".into(),
+                description: "均衡性能与散热".into(),
                 thermal_mode: Some(ThermalMode::Balanced),
-                fan: Some(FanMode::FirmwareAuto),
+                fan: Some(FanMode::Curve(FanCurve::balanced())),
                 cpu: CpuPolicy {
                     epp_ac: Some(0),
                     epp_dc: Some(0),
@@ -199,12 +201,9 @@ fn builtins() -> Vec<(&'static str, PerformanceProfile)> {
         (
             "gaming",
             PerformanceProfile {
-                description: "游戏：thermal performance + EPP 0 全速响应 + 固件性能风扇曲线".into(),
+                description: "游戏优先，响应更快，风扇按性能曲线运行".into(),
                 thermal_mode: Some(ThermalMode::Performance),
-                // The firmware curve in Performance mode is already
-                // aggressive; manual/max fan is a deliberate noise trade
-                // left to cpu-max and manual commands.
-                fan: Some(FanMode::FirmwareAuto),
+                fan: Some(FanMode::Curve(FanCurve::performance())),
                 cpu: CpuPolicy {
                     epp_ac: Some(0),
                     epp_dc: Some(0),
@@ -225,7 +224,7 @@ fn builtins() -> Vec<(&'static str, PerformanceProfile)> {
         (
             "cpu-max",
             PerformanceProfile {
-                description: "持续全核：thermal performance + max fan + EPP 0（用风扇噪音换持续性能）".into(),
+                description: "持续性能优先，风扇全速运行".into(),
                 thermal_mode: Some(ThermalMode::Performance),
                 fan: Some(FanMode::Max),
                 cpu: CpuPolicy {
@@ -252,12 +251,29 @@ mod tests {
     fn builtins_are_present_and_stable_clean() {
         let r = ProfileRegistry::with_builtins();
         for name in ["silent", "balanced", "gaming", "cpu-max"] {
-            let p = r.get(name).unwrap_or_else(|| panic!("missing built-in {name}"));
+            let p = r
+                .get(name)
+                .unwrap_or_else(|| panic!("missing built-in {name}"));
             // No built-in may smuggle experimental fields into stable builds.
             assert!(p.power_limits.is_none(), "{name} must be stable-clean");
-            assert!(p.cpu.power_limits.is_none(), "{name} cpu R8 field must stay empty");
+            assert!(
+                p.cpu.power_limits.is_none(),
+                "{name} cpu R8 field must stay empty"
+            );
             assert!(r.is_builtin(name));
         }
+    }
+
+    #[test]
+    fn builtins_keep_fan_control_in_the_application() {
+        let r = ProfileRegistry::with_builtins();
+        for name in ["silent", "balanced", "gaming"] {
+            assert!(matches!(
+                r.get(name).and_then(|p| p.fan),
+                Some(FanMode::Curve(_))
+            ));
+        }
+        assert_eq!(r.get("cpu-max").and_then(|p| p.fan), Some(FanMode::Max));
     }
 
     #[test]
@@ -305,9 +321,19 @@ cpu_gpu_concurrent_w = 0
     }
 
     #[test]
+    fn toml_round_trip_curve_profile() {
+        let mut profile = PerformanceProfile::default();
+        profile.description = "曲线档".into();
+        profile.fan = Some(FanMode::Curve(phelper_domain::policy::FanCurve::balanced()));
+        let out = to_toml(&profile).expect("serialize");
+        let parsed: PerformanceProfile = toml::from_str(&out).expect("re-parse");
+        assert_eq!(parsed, profile);
+    }
+
+    #[test]
     fn toml_sparse_profile_defaults_fill() {
-        let p: PerformanceProfile = toml::from_str("description = \"只动 EPP\"\n[cpu]\nepp_dc = 95\n")
-            .expect("parse");
+        let p: PerformanceProfile =
+            toml::from_str("description = \"只动 EPP\"\n[cpu]\nepp_dc = 95\n").expect("parse");
         assert_eq!(p.cpu.epp_dc, Some(95));
         assert!(p.cpu.epp_ac.is_none());
         assert!(p.fan.is_none());
@@ -324,10 +350,15 @@ cpu_gpu_concurrent_w = 0
 
     #[test]
     fn load_dir_user_file_and_shadow_and_broken() {
-        let dir = std::env::temp_dir().join(format!("phelper-profiles-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("phelper-profiles-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("mine.toml"), "description = \"我的\"\n[cpu]\nepp_ac = 50\n").unwrap();
+        std::fs::write(
+            dir.join("mine.toml"),
+            "description = \"我的\"\n[cpu]\nepp_ac = 50\n",
+        )
+        .unwrap();
         std::fs::write(dir.join("silent.toml"), "description = \"shadow\"\n").unwrap();
         std::fs::write(dir.join("broken.toml"), "not [valid toml\n").unwrap();
         let r = ProfileRegistry::load(&dir);
@@ -337,7 +368,12 @@ cpu_gpu_concurrent_w = 0
         assert!(r.is_builtin("silent"));
         assert_ne!(r.get("silent").unwrap().description, "shadow");
         assert!(r.get("broken").is_none());
-        assert_eq!(r.warnings.len(), 2, "shadow + broken warnings: {:?}", r.warnings);
+        assert_eq!(
+            r.warnings.len(),
+            2,
+            "shadow + broken warnings: {:?}",
+            r.warnings
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

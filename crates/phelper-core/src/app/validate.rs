@@ -22,7 +22,9 @@ pub fn max_freq(mhz: i64) -> Result<u32, String> {
     if mhz == 0 || (400..=6000).contains(&mhz) {
         Ok(mhz as u32)
     } else {
-        Err(format!("频率上限 {mhz} MHz 超出合理范围（0 = 不限制，否则 400..=6000）"))
+        Err(format!(
+            "频率上限 {mhz} MHz 超出合理范围（0 = 不限制，否则 400..=6000）"
+        ))
     }
 }
 
@@ -30,7 +32,9 @@ pub fn max_freq(mhz: i64) -> Result<u32, String> {
 /// clamp (×100 RPM units) when the probe reported one.
 pub fn fan_rpm(rpm: i64, caps: Option<&CapabilitySet>) -> Result<u16, String> {
     if rpm % 100 != 0 || rpm < 0 {
-        return Err(format!("风扇目标必须是 100 的倍数（0x2E 线协议单位）：{rpm}"));
+        return Err(format!(
+            "风扇目标必须是 100 的倍数（0x2E 线协议单位）：{rpm}"
+        ));
     }
     let level = rpm / 100;
     if let Some(c) = caps
@@ -60,7 +64,9 @@ pub fn power_limits(pl1: i64, pl2: i64, pl4: i64) -> Result<CpuPowerLimits, Stri
         return Err(format!("PL2（{pl2}W）不得小于 PL1（{pl1}W）"));
     }
     if pl4 != 0 && !(30..=200).contains(&pl4) {
-        return Err(format!("PL4 {pl4}W 超出包络 30..=200（出厂上限，SDD byte5；0 = 不修改）"));
+        return Err(format!(
+            "PL4 {pl4}W 超出包络 30..=200（出厂上限，SDD byte5；0 = 不修改）"
+        ));
     }
     Ok(CpuPowerLimits {
         pl1_w: pl1 as u8,
@@ -105,7 +111,9 @@ pub fn profile_apply_gate(
         return Ok(());
     }
     if !compiled {
-        return Err("该配置档包含实验性功耗墙（0x29），本构建未启用 experimental-hp-power-limits".into());
+        return Err(
+            "该配置档包含实验性功耗墙（0x29），本构建未启用 experimental-hp-power-limits".into(),
+        );
     }
     match caps {
         Some(c) if c.power_limits == phelper_domain::capability::Support::Experimental => Ok(()),
@@ -164,7 +172,11 @@ mod tests {
         let ok = power_limits(45, 90, 150).unwrap();
         assert_eq!((ok.pl1_w, ok.pl2_w, ok.pl4_w), (45, 90, 150));
         assert_eq!(ok.cpu_gpu_concurrent_w, 0, "cc permanently 0/rejected");
-        assert_eq!(power_limits(55, 130, 0).unwrap().pl4_w, 0, "pl4 0 = NO_CHANGE");
+        assert_eq!(
+            power_limits(55, 130, 0).unwrap().pl4_w,
+            0,
+            "pl4 0 = NO_CHANGE"
+        );
         assert!(power_limits(14, 90, 0).is_err());
         assert!(power_limits(45, 158, 0).is_err());
         assert!(power_limits(90, 45, 0).is_err(), "pl2 < pl1");

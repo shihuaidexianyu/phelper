@@ -205,7 +205,17 @@ impl TelemetryCoordinator {
                     self.collect_where(&mut next_due, |_| true);
                     Self::publish(&self.store, &mut subscribers);
                 }
-                Ok(Command::Subscribe(tx)) => subscribers.push(tx),
+                Ok(Command::Subscribe(tx)) => {
+                    // The first collection round can finish before the app
+                    // pump registers its subscriber. Deliver the current
+                    // store immediately so it does not wait for the next
+                    // cadence just to receive data that already exists.
+                    let snap = Arc::new(self.store.read().expect("store poisoned").snapshot());
+                    if !snap.samples.is_empty() {
+                        let _ = tx.send(snap);
+                    }
+                    subscribers.push(tx);
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     let now = Instant::now();
                     self.collect_where(&mut next_due, |due| now >= *due);

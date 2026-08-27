@@ -96,12 +96,15 @@ pub fn build_report(state: &AppState, jitter: &BTreeMap<&'static str, Duration>)
         "metrics": metrics,
         "providers": providers,
         "desired": serde_json::to_value(&state.desired).unwrap_or(Value::Null),
-        "journal_tail": serde_json::to_value(&state.journal_tail).unwrap_or(Value::Null),
+        "journal_tail": serde_json::to_value(&*state.journal_tail).unwrap_or(Value::Null),
     })
 }
 
 /// Build + write; returns the written path.
-pub fn write_report(state: &AppState, jitter: &BTreeMap<&'static str, Duration>) -> Result<PathBuf, String> {
+pub fn write_report(
+    state: &AppState,
+    jitter: &BTreeMap<&'static str, Duration>,
+) -> Result<PathBuf, String> {
     let report = build_report(state, jitter);
     let path = crate::persistence::data_dir()
         .join("reports")
@@ -115,7 +118,9 @@ pub fn write_report(state: &AppState, jitter: &BTreeMap<&'static str, Duration>)
 mod tests {
     use super::*;
     use crate::control::journal::{ControlJournal, JournalOrigin};
-    use phelper_domain::command::{ControlCommand, ControlOutcome, ControlReceipt, ControlStatus, Verification};
+    use phelper_domain::command::{
+        ControlCommand, ControlOutcome, ControlReceipt, ControlStatus, Verification,
+    };
     use phelper_domain::policy::ThermalMode;
 
     #[test]

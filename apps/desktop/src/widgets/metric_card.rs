@@ -1,10 +1,10 @@
 //! MetricCard — one telemetry metric on the Dashboard: title, big value,
-//! unit, quality badge, provenance subtitle. Staleness rule (plan D-G):
+//! unit, and quality badge. Staleness rule (plan D-G):
 //! gray out when the sample age exceeds 3× its registry cadence.
 
 use std::time::Duration;
 
-use gpui::{App, IntoElement, ParentElement, SharedString, Styled, div};
+use gpui::{App, IntoElement, ParentElement, SharedString, Styled, div, prelude::FluentBuilder};
 use gpui_component::{ActiveTheme, StyledExt};
 use phelper_core::app::fmt;
 use phelper_domain::telemetry::{MetricQuality, MetricSample};
@@ -13,7 +13,7 @@ pub struct MetricCard {
     title: SharedString,
     value: SharedString,
     unit: SharedString,
-    subtitle: SharedString,
+    subtitle: Option<SharedString>,
     quality: Option<MetricQuality>,
     stale: bool,
 }
@@ -33,14 +33,19 @@ impl MetricCard {
                 title: title.into(),
                 value: "—".into(),
                 unit: unit.into(),
-                subtitle: "等待数据…".into(),
-                quality: None,
+                subtitle: None,
+                quality: Some(MetricQuality::Unavailable),
                 stale: true,
             };
         };
+        let quality = if s.value.as_f64().is_some() {
+            s.quality
+        } else {
+            MetricQuality::Unavailable
+        };
         let stale = s.timestamp.elapsed() > cadence * 3
             || matches!(
-                s.quality,
+                quality,
                 MetricQuality::Stale | MetricQuality::Unavailable | MetricQuality::Unsupported
             );
         let value = s
@@ -52,8 +57,8 @@ impl MetricCard {
             title: title.into(),
             value: value.into(),
             unit: unit.into(),
-            subtitle: fmt::source_zh(s.source).into(),
-            quality: Some(s.quality),
+            subtitle: None,
+            quality: Some(quality),
             stale,
         }
     }
@@ -64,7 +69,7 @@ impl MetricCard {
             title: title.into(),
             value: value.into(),
             unit: unit.into(),
-            subtitle: subtitle.into(),
+            subtitle: Some(subtitle.into()),
             quality: None,
             stale: false,
         }
@@ -77,25 +82,33 @@ impl MetricCard {
         } else {
             (theme.foreground, theme.muted_foreground)
         };
-        let quality_badge = self.quality.map(|q| {
-            let color = match q {
-                MetricQuality::Fresh => theme.success,
-                MetricQuality::Estimated => theme.warning,
-                _ => theme.muted_foreground,
-            };
-            div()
-                .text_xs()
-                .text_color(color)
-                .child(fmt::quality_zh(q))
-        });
+        // Healthy values speak for themselves. Keep a badge only for a
+        // degraded value so the overview is quiet until it needs attention.
+        let quality_badge = self
+            .quality
+            .and_then(|q| match (q, self.stale) {
+                (MetricQuality::Fresh | MetricQuality::Estimated, true) => {
+                    Some(MetricQuality::Stale)
+                }
+                (MetricQuality::Fresh, false) => None,
+                (q, _) => Some(q),
+            })
+            .map(|q| {
+                let color = match q {
+                    MetricQuality::Fresh => theme.success,
+                    MetricQuality::Estimated => theme.warning,
+                    _ => theme.muted_foreground,
+                };
+                div().text_xs().text_color(color).child(fmt::quality_zh(q))
+            });
 
         div()
             .v_flex()
             .gap_1()
-            .p_3()
+            .p_2()
             .min_w_0()
             .flex_1()
-            .rounded_lg()
+            .rounded_md()
             .border_1()
             .border_color(theme.border)
             .bg(theme.group_box)
@@ -114,6 +127,8 @@ impl MetricCard {
                     .child(div().text_2xl().text_color(fg).child(self.value))
                     .child(div().text_sm().text_color(sub_fg).child(self.unit)),
             )
-            .child(div().text_xs().text_color(sub_fg).child(self.subtitle))
+            .when_some(self.subtitle, |d, subtitle| {
+                d.child(div().text_xs().text_color(sub_fg).child(subtitle))
+            })
     }
 }

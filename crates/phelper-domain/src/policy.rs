@@ -32,7 +32,7 @@ pub struct FanLevels {
 impl FanLevels {
     pub const AUTO: Self = Self { cpu: 0, gpu: 0 };
 
-    pub fn new(cpu: u16, gpu: u16) -> Self {
+    pub const fn new(cpu: u16, gpu: u16) -> Self {
         Self { cpu, gpu }
     }
 
@@ -49,14 +49,155 @@ impl FanLevels {
     }
 }
 
+/// Number of control points in the user-facing software fan curve.
+///
+/// A fixed-size curve keeps the persisted profile format simple and avoids
+/// making the UI a small spreadsheet. Four points are enough to describe the
+/// useful part of a laptop fan response while still being easy to review.
+pub const FAN_CURVE_POINT_COUNT: usize = 4;
+pub const FAN_CURVE_MIN_TEMP_C: u8 = 30;
+pub const FAN_CURVE_MAX_TEMP_C: u8 = 100;
+
+/// One point in a software fan curve. Fan values use the board's native
+/// scale (100-RPM levels on the V1 8BAB board), just like [`FanLevels`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FanCurvePoint {
+    pub temp_c: u8,
+    pub cpu: u16,
+    pub gpu: u16,
+}
+
+impl FanCurvePoint {
+    pub const fn new(temp_c: u8, cpu: u16, gpu: u16) -> Self {
+        Self { temp_c, cpu, gpu }
+    }
+
+    pub const fn levels(self) -> FanLevels {
+        FanLevels::new(self.cpu, self.gpu)
+    }
+
+    pub const fn cpu_rpm(self) -> u32 {
+        self.cpu as u32 * 100
+    }
+
+    pub const fn gpu_rpm(self) -> u32 {
+        self.gpu as u32 * 100
+    }
+}
+
+/// A small, linearly interpolated software fan curve.
+///
+/// The curve is a policy, not a hardware command. The control coordinator
+/// evaluates it against fresh telemetry and emits rate-limited `FanLevels`
+/// writes through the existing single writer. A curve point never uses zero:
+/// zero means firmware-auto on this board and is deliberately reserved for
+/// the explicit auto escape hatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FanCurve {
+    pub points: [FanCurvePoint; FAN_CURVE_POINT_COUNT],
+}
+
+impl FanCurve {
+    pub const fn new(points: [FanCurvePoint; FAN_CURVE_POINT_COUNT]) -> Self {
+        Self { points }
+    }
+
+    /// Quiet preset. It still has a positive floor; the firmware-auto mode is
+    /// the only mode allowed to stop the fans at idle.
+    pub const fn quiet() -> Self {
+        Self::new([
+            FanCurvePoint::new(35, 20, 20),
+            FanCurvePoint::new(55, 20, 20),
+            FanCurvePoint::new(72, 30, 30),
+            FanCurvePoint::new(88, 50, 50),
+        ])
+    }
+
+    /// General-purpose preset for sustained mixed CPU/GPU work.
+    pub const fn balanced() -> Self {
+        Self::new([
+            FanCurvePoint::new(35, 20, 20),
+            FanCurvePoint::new(55, 26, 26),
+            FanCurvePoint::new(72, 40, 42),
+            FanCurvePoint::new(85, 55, 55),
+        ])
+    }
+
+    /// Aggressive preset. It reaches the board's conservative fallback cap
+    /// before the independent 90°C safety override is allowed to engage.
+    pub const fn performance() -> Self {
+        Self::new([
+            FanCurvePoint::new(35, 25, 25),
+            FanCurvePoint::new(50, 35, 35),
+            FanCurvePoint::new(65, 48, 50),
+            FanCurvePoint::new(80, 55, 55),
+        ])
+    }
+
+    /// Validate shape and policy-level invariants. Hardware-specific clamp
+    /// validation belongs to the capability-aware safety layer.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let mut previous_temp = None;
+        for point in self.points {
+            if !(FAN_CURVE_MIN_TEMP_C..=FAN_CURVE_MAX_TEMP_C).contains(&point.temp_c) {
+                return Err("curve temperatures must be within 30..=100°C");
+            }
+            if previous_temp.is_some_and(|temp| point.temp_c <= temp) {
+                return Err("curve temperatures must be strictly increasing");
+            }
+            if point.cpu == 0 || point.gpu == 0 {
+                return Err(
+                    "curve fan levels must be positive; use automatic mode to allow fan-stop",
+                );
+            }
+            previous_temp = Some(point.temp_c);
+        }
+        Ok(())
+    }
+
+    /// Evaluate the curve at a temperature in °C. Values outside the defined
+    /// range hold the nearest endpoint. The result remains in the board's
+    /// native integer level scale.
+    pub fn target_at(&self, temp_c: f64) -> FanLevels {
+        let temp_c = if temp_c.is_finite() {
+            temp_c
+        } else {
+            self.points[0].temp_c as f64
+        };
+        if temp_c <= self.points[0].temp_c as f64 {
+            return self.points[0].levels();
+        }
+        for pair in self.points.windows(2) {
+            let left = pair[0];
+            let right = pair[1];
+            if temp_c <= right.temp_c as f64 {
+                let span = (right.temp_c - left.temp_c) as f64;
+                let ratio = (temp_c - left.temp_c as f64) / span;
+                return FanLevels::new(
+                    interpolate_level(left.cpu, right.cpu, ratio),
+                    interpolate_level(left.gpu, right.gpu, ratio),
+                );
+            }
+        }
+        self.points[FAN_CURVE_POINT_COUNT - 1].levels()
+    }
+}
+
+fn interpolate_level(left: u16, right: u16, ratio: f64) -> u16 {
+    (left as f64 + (right as f64 - left as f64) * ratio).round() as u16
+}
+
 /// Fan control priority list (architecture.md section 27):
-/// FirmwareAuto > Thermal Profile > Max Fan > Manual (capability-confirmed).
+/// FirmwareAuto > Thermal Profile > Max Fan > Curve/Manual
+/// (capability-confirmed). A curve is evaluated by the coordinator and is
+/// never sent to firmware as a new wire format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FanMode {
     FirmwareAuto,
     Max,
     Manual(FanLevels),
+    Curve(FanCurve),
 }
 
 /// HP platform GPU power policy (0x21/0x22 payload). Distinct from NVIDIA
@@ -151,4 +292,58 @@ pub struct CpuPolicy {
     pub max_freq_mhz_dc: Option<u32>,
     pub boost_policy: Option<BoostPolicy>,
     pub power_limits: Option<CpuPowerLimits>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn curve_interpolates_each_fan_channel() {
+        let curve = FanCurve::new([
+            FanCurvePoint::new(40, 20, 30),
+            FanCurvePoint::new(60, 40, 50),
+            FanCurvePoint::new(80, 50, 60),
+            FanCurvePoint::new(90, 55, 63),
+        ]);
+        assert_eq!(curve.target_at(35.0), FanLevels::new(20, 30));
+        assert_eq!(curve.target_at(50.0), FanLevels::new(30, 40));
+        assert_eq!(curve.target_at(95.0), FanLevels::new(55, 63));
+    }
+
+    #[test]
+    fn curve_rejects_zero_levels_and_unsorted_temperatures() {
+        let zero = FanCurve::new([
+            FanCurvePoint::new(35, 0, 20),
+            FanCurvePoint::new(55, 26, 26),
+            FanCurvePoint::new(72, 40, 42),
+            FanCurvePoint::new(85, 55, 55),
+        ]);
+        assert!(zero.validate().is_err());
+
+        let unsorted = FanCurve::new([
+            FanCurvePoint::new(55, 20, 20),
+            FanCurvePoint::new(35, 26, 26),
+            FanCurvePoint::new(72, 40, 42),
+            FanCurvePoint::new(85, 55, 55),
+        ]);
+        assert!(unsorted.validate().is_err());
+    }
+
+    #[test]
+    fn presets_are_valid_and_positive() {
+        for curve in [
+            FanCurve::quiet(),
+            FanCurve::balanced(),
+            FanCurve::performance(),
+        ] {
+            assert!(curve.validate().is_ok());
+            assert!(
+                curve
+                    .points
+                    .iter()
+                    .all(|point| point.cpu > 0 && point.gpu > 0)
+            );
+        }
+    }
 }

@@ -222,15 +222,16 @@ pub fn fan_mode_zh(m: &FanMode) -> String {
         FanMode::FirmwareAuto => "固件自动".into(),
         FanMode::Max => "最大转速".into(),
         FanMode::Manual(l) => format!("手动 {} / {} RPM", l.cpu * 100, l.gpu * 100),
+        FanMode::Curve(_) => "温度曲线".into(),
     }
 }
 
 pub fn knob_zh(k: KnobId) -> &'static str {
     match k {
-        KnobId::EppAc => "EPP（交流）",
-        KnobId::EppDc => "EPP（电池）",
-        KnobId::Epp1Ac => "E 核 EPP（交流）",
-        KnobId::Epp1Dc => "E 核 EPP（电池）",
+        KnobId::EppAc => "P 核能效偏好（交流）",
+        KnobId::EppDc => "P 核能效偏好（电池）",
+        KnobId::Epp1Ac => "E 核能效偏好（交流）",
+        KnobId::Epp1Dc => "E 核能效偏好（电池）",
         KnobId::MaxFreqAc => "频率上限（交流）",
         KnobId::MaxFreqDc => "频率上限（电池）",
         KnobId::Boost => "睿频策略",
@@ -283,7 +284,9 @@ pub fn time_grid(points: &[(f64, f64)], window_secs: f64, buckets: usize) -> Vec
         e.0 += v;
         e.1 += 1;
     }
-    sums.into_iter().map(|(b, (s, n))| (b, s / n as f64)).collect()
+    sums.into_iter()
+        .map(|(b, (s, n))| (b, s / n as f64))
+        .collect()
 }
 
 #[cfg(test)]
@@ -295,9 +298,9 @@ mod tests {
         // 10 s window, 5 buckets → 2 s each. Bucket 0 = newest [0,2).
         let pts = vec![
             (0.5, 10.0),
-            (1.5, 20.0), // bucket 0 → avg 15
-            (2.5, 30.0), // bucket 1
-            (8.5, 40.0), // bucket 4
+            (1.5, 20.0),  // bucket 0 → avg 15
+            (2.5, 30.0),  // bucket 1
+            (8.5, 40.0),  // bucket 4
             (10.5, 99.0), // out of window → dropped
         ];
         let g = time_grid(&pts, 10.0, 5);
@@ -324,7 +327,10 @@ mod tests {
             .collect();
         let mut dedup = ages.clone();
         dedup.dedup();
-        assert_eq!(ages, dedup, "bucket-center ages must be unique at 1 s precision");
+        assert_eq!(
+            ages, dedup,
+            "bucket-center ages must be unique at 1 s precision"
+        );
     }
 
     #[test]
@@ -356,11 +362,13 @@ mod tests {
     fn verification_and_support_text() {
         assert_eq!(verification_zh(&Verification::Verified), "已回读验证");
         assert!(verification_zh(&Verification::TrustedNoReadback).contains("无回读"));
-        assert!(verification_zh(&Verification::Failed {
-            expected: "1".into(),
-            actual: "2".into()
-        })
-        .contains("验证失败"));
+        assert!(
+            verification_zh(&Verification::Failed {
+                expected: "1".into(),
+                actual: "2".into()
+            })
+            .contains("验证失败")
+        );
         assert_eq!(support_zh(Support::Experimental), "实验性");
         assert_eq!(support_zh(Support::NotProbed), "未探测");
     }

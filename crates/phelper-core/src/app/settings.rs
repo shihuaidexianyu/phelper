@@ -53,7 +53,10 @@ impl UiSettings {
             Ok(s) => (s, None),
             Err(e) => (
                 Self::default(),
-                Some(format!("设置文件损坏，已回退默认（{}）：{e}", path.display())),
+                Some(format!(
+                    "设置文件损坏，已回退默认（{}）：{e}",
+                    path.display()
+                )),
             ),
         }
     }
@@ -73,7 +76,10 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("phelper-uisettings-{name}-{}.toml", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "phelper-uisettings-{name}-{}.toml",
+            std::process::id()
+        ))
     }
 
     #[test]

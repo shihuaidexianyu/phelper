@@ -70,7 +70,7 @@ Linux 内核、OmenMon、OmenHwCtl、OmenSuperHub 完全一致：
 | Thermal mode（Balanced 0x30 / Performance 0x31） | WMI 0x1A，payload `{0xFF, mode}` | ✅ **内核在 8BAB 实测** | commit 13fa3aaf02；8BAB 静态使用 V1 值，无需运行时版本探测 |
 | Thermal mode **回读** | EC 偏移 0x59（本板布局） | ⚠️ 决策点 | BIOS 无查询接口（OmenMon 文档明示）；与"不碰 EC"原则冲突——见 §5-4 的处置建议 |
 | Max Fan | WMI 0x27 | ✅ 可行 | 内核使用中；0x26 回读**不可靠**（内核已弃用，改为自追踪状态） |
-| 手动风扇转速 | WMI 0x2E `{cpu_rpm, gpu_rpm}`，**单位 100 RPM，0=自动**；范围用 0x2F 风扇表 clamp | ✅ **内核在 8BAB 实测可控** | 同 commit；社区在 16-wf0xxx 独立逆出同一协议（CachyOS 帖子：type 46 = 0x2E 手动，type 26 = 0x1A 恢复自动） |
+| 手动风扇转速 | WMI 0x2E `{cpu_rpm, gpu_rpm}`，**单位 100 RPM，0=释放给固件**；范围用 0x2F 风扇表 clamp | ✅ **内核在 8BAB 实测可控** | 同 commit；社区在 16-wf0xxx 独立逆出同一协议（CachyOS 帖子：type 46 = 0x2E 手动，0 值是固件接管，不是软件温控） |
 | GPU 平台功耗策略（cTGP/PPAB/dstate） | WMI 0x21/0x22 | ✅ 可行 | 内核 victus_s 路径（8BAB 归属此路径）在 profile 切换时写入；payload 四字节结构确认 |
 | MUX（Hybrid/Discrete/Optimus） | WMI 0x52（读 cmd 0x01 / 写 cmd 0x02），SDD byte7 bit3 能力门控 | ✅ 可行 | 内核 2026-07 加入 + OmenMon/OmenHwCtl 均实现；**需重启，非热切换** |
 | **CPU 功率限制（PL1/PL2/PL4/并发）** | WMI 0x29 | ❓ **最大未验证点** | 内核**从不在此板写显式值**（只在 AC/DC 事件恢复 DEFAULT）；OmenSuperHub/OmenHwCtl 有实现但**字节序互相矛盾**（内核结构 `{pl1,pl2,pl4,cc}` vs OSH 发 `{PL2,PL1,…}`）；OmenMon #37 记录固件在 OGH 退出后把 CPU 锁回 55W。必须按文档 §25 的三步验证法实机实测 |
@@ -123,7 +123,7 @@ Linux 内核、OmenMon、OmenHwCtl、OmenSuperHub 完全一致：
 | 5 | §24 SDD | 只有 byte 3 | 补充社区已交叉使用的字节：byte 4 bit0 = 软件风扇控制支持（OSH）；byte 5 = 默认 PL4（OmenMon）；byte 7 = MUX 能力位（内核）。其余字节维持"未验证不升级"原则 |
 | 6 | §25 0x29 | "最重要协议参考之一" | 补充：内核从不对 8BAB 写显式值；**OSH 与内核结构字节序冲突**（PL1/PL2 顺序相反）；固件 clawback 风险（55W 锁）；验证计划（写入→MSR 回读→RAPL 负载）保留并提升为 Phase 2 的强制门槛 |
 | 7 | §27 fan | 未区分转速尺度 | 增加 `FanScale` capability：本机 V1 = krpm（0.1k RPM 单位）；V2 = 百分比（本机不用，但模型要防错发） |
-| 8 | §27.1 custom fan curve | "待 WMI manual fan 验证" | **前提已满足**：内核在本板实测 0x2E 可控。保留的条件改为：keep-alive 可靠性 + 温度应急交回固件 |
+| 8 | §27.1 custom fan curve | "待 WMI manual fan 验证" | **安全 MVP 已实现**：四点曲线、1 Hz 限速、keep-alive、传感器冻结恢复和温度应急交回已接入；默认 Profile 前仍需实机 soak |
 | 9 | §38 采样表 | 无 keep-alive 概念 | 增加：**0x10 心跳（≤90s 周期）**作为控制会话生命周期的一部分 |
 | 10 | §53 参考项目 | OmenSuperHub "HP DLL 调用结果" | 修正：它的控制实际走自己的 `SendOmenBiosWmi`（WMI 为主），OGH DLL 主要用于检测/枚举/灯光；另有 nvpcf（DB unlock）打包行为我们不采用。**许可证补充：OmenCore = MIT（可自由参考）；OmenHwCtl = 无 LICENSE（只参考协议行为）；OmenSuperHub/OmenMon = GPLv3** |
 | 11 | §56/§58 Phase 0 | 通用探测清单 | 换成本机定制清单（见 §6） |

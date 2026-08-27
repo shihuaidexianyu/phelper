@@ -228,9 +228,7 @@ impl From<BoostArg> for BoostPolicy {
             BoostArg::EfficientEnabled => BoostPolicy::EfficientEnabled,
             BoostArg::EfficientAggressive => BoostPolicy::EfficientAggressive,
             BoostArg::AggressiveGuaranteed => BoostPolicy::AggressiveGuaranteed,
-            BoostArg::EfficientAggressiveGuaranteed => {
-                BoostPolicy::EfficientAggressiveGuaranteed
-            }
+            BoostArg::EfficientAggressiveGuaranteed => BoostPolicy::EfficientAggressiveGuaranteed,
         }
     }
 }
@@ -259,7 +257,10 @@ enum Plan {
     ProfileShow(String),
     ProfileExport(String),
     /// Dispatch ApplyProfile, hold for the heartbeat, graceful restore.
-    ProfileApply { name: String, hold: u64 },
+    ProfileApply {
+        name: String,
+        hold: u64,
+    },
 }
 
 /// Pure argument → command mapping. All rejections happen HERE, before
@@ -313,7 +314,12 @@ fn plan(args: &ControlArgs) -> Result<Plan> {
             Plan::HpState(ControlCommand::SetThermalMode((*mode).into()), *hold)
         }
         #[cfg(feature = "experimental")]
-        ControlCmd::PowerLimits { pl1, pl2, pl4, hold } => {
+        ControlCmd::PowerLimits {
+            pl1,
+            pl2,
+            pl4,
+            hold,
+        } => {
             if !(15..=130).contains(pl1) {
                 bail!("--pl1: {pl1}W out of 13900HX envelope 15..=130");
             }
@@ -469,9 +475,9 @@ pub fn run(args: ControlArgs) -> Result<()> {
             // Read-modify-write merge against the live 0x21 readback (the
             // coordinator populated observed.gpu_platform_policy at start).
             let merged = {
-                let control = engine
-                    .control()
-                    .context("control unavailable (engine is telemetry-only — see startup warnings)")?;
+                let control = engine.control().context(
+                    "control unavailable (engine is telemetry-only — see startup warnings)",
+                )?;
                 let cur = control
                     .observed()
                     .gpu_platform_policy
@@ -517,7 +523,11 @@ fn profile_list() -> Result<()> {
         if p.fan.is_some() {
             touches.push("fan");
         }
-        println!("  {name:<12} [{tag}] {:<24} {}", touches.join("+"), p.description);
+        println!(
+            "  {name:<12} [{tag}] {:<24} {}",
+            touches.join("+"),
+            p.description
+        );
     }
     for w in &registry.warnings {
         eprintln!("  warning: {w}");
@@ -580,9 +590,7 @@ fn run_hp_state(engine: Engine, cmd: ControlCommand, hold: u64) -> Result<()> {
 fn hold_loop(hold_secs: u64) -> Result<()> {
     let stop = ctrlc_flag()?;
     let deadline = Instant::now() + Duration::from_secs(hold_secs);
-    eprintln!(
-        "\nholding {hold_secs} s (KeepAlive heartbeat active; Ctrl+C = graceful restore)…"
-    );
+    eprintln!("\nholding {hold_secs} s (KeepAlive heartbeat active; Ctrl+C = graceful restore)…");
     while !stop.load(Ordering::Relaxed) {
         let now = Instant::now();
         if now >= deadline {
@@ -619,7 +627,10 @@ fn change(engine: &Engine, cmd: ControlCommand) -> Result<()> {
 
 fn status(engine: &Engine) -> Result<()> {
     let id = engine.identity();
-    println!("board {} | BIOS {} | {}", id.board_id, id.bios_version, id.product_name);
+    println!(
+        "board {} | BIOS {} | {}",
+        id.board_id, id.bios_version, id.product_name
+    );
 
     match engine.control() {
         Some(control) => {
@@ -704,7 +715,11 @@ fn fmt_obs<T: std::fmt::Debug>(v: &phelper_core::domain::state::ObservedValue<T>
 }
 
 fn print_outcome(o: &ControlOutcome) {
-    println!("\n--- OUTCOME (receipt {}, {} ms) ---", o.receipt.0, o.duration.as_millis());
+    println!(
+        "\n--- OUTCOME (receipt {}, {} ms) ---",
+        o.receipt.0,
+        o.duration.as_millis()
+    );
     match &o.status {
         ControlStatus::Applied { verification } => {
             println!("status: APPLIED ({})", fmt_verification(verification));

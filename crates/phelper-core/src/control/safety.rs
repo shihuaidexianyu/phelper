@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use phelper_domain::capability::{CapabilitySet, Support};
 use phelper_domain::command::ControlCommand;
 use phelper_domain::error::ControlError;
-use phelper_domain::policy::{CpuPolicy, FanLevels, FanMode};
+use phelper_domain::policy::{CpuPolicy, FanCurve, FanLevels, FanMode};
 use phelper_domain::state::ObservedState;
 
 /// CPU package temperature at which user fan control is suspended.
@@ -36,6 +36,11 @@ pub const PREWRITE_TEMP_FRESH: Duration = Duration::from_secs(5);
 pub trait ThermalFeed {
     /// Latest cpu.pkg_temp_c sample: (°C, when it was taken).
     fn pkg_temp_c(&self) -> Option<(f64, Instant)>;
+    /// Latest GPU temperature sample. Optional because a machine without a
+    /// usable GPU provider can still run a CPU-driven curve.
+    fn gpu_temp_c(&self) -> Option<(f64, Instant)> {
+        None
+    }
     /// Latest 0x2D fan readback: (levels, when it was taken).
     fn fan_levels(&self) -> Option<(FanLevels, Instant)>;
     /// Latest MSR 0x610 readback via the PawnIO telemetry collector:
@@ -100,7 +105,7 @@ impl SafetySupervisor {
         cmd: &ControlCommand,
         caps: &CapabilitySet,
         feed: &dyn ThermalFeed,
-        observed: &ObservedState,
+        _observed: &ObservedState,
     ) -> Result<(), ControlError> {
         match cmd {
             // Unreachable by construction: the coordinator EXPANDS a profile
@@ -237,13 +242,10 @@ impl SafetySupervisor {
                         reason: "thermal override active (max fan forced); cool down first".into(),
                     });
                 }
-                // §27 priority: Max > Manual. Max→Manual directly is
-                // rejected — go through FirmwareAuto first.
-                if matches!(observed.max_fan.value(), Some(true)) {
-                    return Err(ControlError::UnsafeRequest {
-                        reason: "max fan is on; return to automatic before manual levels".into(),
-                    });
-                }
+                // A user Max state is released by the coordinator immediately
+                // before the manual write. The thermal override is checked
+                // above, so this direct transition cannot bypass the safety
+                // layer's forced-max state.
                 self.validate_fan_levels(*levels, caps)?;
                 // R4: never fly blind. The hysteresis net depends on fresh
                 // temperature; without it manual fan is unsafe by definition.
@@ -254,14 +256,25 @@ impl SafetySupervisor {
                     }),
                 }
             }
+            ControlCommand::SetFanMode(FanMode::Curve(curve)) => {
+                require_supported(caps.fan_manual_level)?;
+                if self.override_active() {
+                    return Err(ControlError::UnsafeRequest {
+                        reason: "thermal override active (max fan forced); cool down first".into(),
+                    });
+                }
+                self.validate_fan_curve(curve, caps)?;
+                match feed.pkg_temp_c() {
+                    Some((_, at)) if at.elapsed() <= PREWRITE_TEMP_FRESH => Ok(()),
+                    _ => Err(ControlError::UnsafeRequest {
+                        reason: "no fresh CPU temperature sample (≤5s); refusing blind fan curve control".into(),
+                    }),
+                }
+            }
         }
     }
 
-    fn validate_cpu_policy(
-        &self,
-        p: &CpuPolicy,
-        caps: &CapabilitySet,
-    ) -> Result<(), ControlError> {
+    fn validate_cpu_policy(&self, p: &CpuPolicy, caps: &CapabilitySet) -> Result<(), ControlError> {
         // R8: power limits in M2 poison the WHOLE command.
         if p.power_limits.is_some() {
             return Err(ControlError::Unsupported);
@@ -329,11 +342,25 @@ impl SafetySupervisor {
             }
             if v < lo || v > hi {
                 return Err(ControlError::UnsafeRequest {
-                    reason: format!(
-                        "{channel} fan level {v} outside clamp {lo}..={hi} (x100 RPM)"
-                    ),
+                    reason: format!("{channel} fan level {v} outside clamp {lo}..={hi} (x100 RPM)"),
                 });
             }
+        }
+        Ok(())
+    }
+
+    fn validate_fan_curve(
+        &self,
+        curve: &FanCurve,
+        caps: &CapabilitySet,
+    ) -> Result<(), ControlError> {
+        curve
+            .validate()
+            .map_err(|reason| ControlError::UnsafeRequest {
+                reason: reason.into(),
+            })?;
+        for point in curve.points {
+            self.validate_fan_levels(FanLevels::new(point.cpu, point.gpu), caps)?;
         }
         Ok(())
     }
@@ -347,8 +374,10 @@ impl SafetySupervisor {
         observed: &ObservedState,
         now: Instant,
     ) -> Option<SafetyAction> {
-        let user_fan_active = matches!(observed.fan_mode.value(), Some(FanMode::Manual(_)))
-            || matches!(observed.max_fan.value(), Some(true))
+        let user_fan_active = matches!(
+            observed.fan_mode.value(),
+            Some(FanMode::Manual(_) | FanMode::Curve(_))
+        ) || matches!(observed.max_fan.value(), Some(true))
             || self.override_active();
 
         // Watchdog first: blind controller hands back to firmware.
@@ -378,8 +407,10 @@ impl SafetySupervisor {
         }
 
         // Hysteresis engage (only while the user holds the fans).
-        if (matches!(observed.fan_mode.value(), Some(FanMode::Manual(_)))
-            || matches!(observed.max_fan.value(), Some(true)))
+        if (matches!(
+            observed.fan_mode.value(),
+            Some(FanMode::Manual(_) | FanMode::Curve(_))
+        ) || matches!(observed.max_fan.value(), Some(true)))
             && let Some((t, at)) = feed.pkg_temp_c()
             && now.duration_since(at) <= SENSOR_STALE_AFTER
             && t >= FORCE_MAX_FAN_AT_C
@@ -417,7 +448,7 @@ fn require_elevated(caps: &CapabilitySet) -> Result<(), ControlError> {
 mod tests {
     use super::*;
     use phelper_domain::capability::FanScale;
-    use phelper_domain::policy::{BoostPolicy, ThermalMode};
+    use phelper_domain::policy::{BoostPolicy, FanCurve, FanCurvePoint, ThermalMode};
 
     struct FakeFeed {
         temp: Option<(f64, Instant)>,
@@ -485,6 +516,15 @@ mod tests {
         let mut o = ObservedState::default();
         o.max_fan = phelper_domain::state::ObservedValue::TrustedWrite {
             value: true,
+            at: Instant::now(),
+        };
+        o
+    }
+
+    fn observed_max_mode() -> ObservedState {
+        let mut o = observed_max_fan();
+        o.fan_mode = phelper_domain::state::ObservedValue::TrustedWrite {
+            value: FanMode::Max,
             at: Instant::now(),
         };
         o
@@ -794,16 +834,31 @@ mod tests {
         check(pl(45, 90)).unwrap(); // sane → pass
 
         let mut bad = pl(14, 90); // PL1 below envelope
-        assert!(matches!(check(bad), Err(ControlError::UnsafeRequest { .. })));
+        assert!(matches!(
+            check(bad),
+            Err(ControlError::UnsafeRequest { .. })
+        ));
         bad = pl(131, 140); // PL1 above envelope
-        assert!(matches!(check(bad), Err(ControlError::UnsafeRequest { .. })));
+        assert!(matches!(
+            check(bad),
+            Err(ControlError::UnsafeRequest { .. })
+        ));
         bad = pl(45, 158); // PL2 above envelope
-        assert!(matches!(check(bad), Err(ControlError::UnsafeRequest { .. })));
+        assert!(matches!(
+            check(bad),
+            Err(ControlError::UnsafeRequest { .. })
+        ));
         bad = pl(90, 45); // PL2 < PL1 (kernel invariant)
-        assert!(matches!(check(bad), Err(ControlError::UnsafeRequest { .. })));
+        assert!(matches!(
+            check(bad),
+            Err(ControlError::UnsafeRequest { .. })
+        ));
         bad = pl(45, 90);
         bad.cpu_gpu_concurrent_w = 65; // cc: no readback, no restore — rejected forever
-        assert!(matches!(check(bad), Err(ControlError::UnsafeRequest { .. })));
+        assert!(matches!(
+            check(bad),
+            Err(ControlError::UnsafeRequest { .. })
+        ));
 
         // PL4 ladder (M4.1): 0 = NO_CHANGE pass; 30..=200 (factory ceiling)
         // pass; outside → UnsafeRequest.
@@ -814,10 +869,16 @@ mod tests {
         check(ok).unwrap();
         bad = pl(45, 90);
         bad.pl4_w = 29; // below plausible floor
-        assert!(matches!(check(bad), Err(ControlError::UnsafeRequest { .. })));
+        assert!(matches!(
+            check(bad),
+            Err(ControlError::UnsafeRequest { .. })
+        ));
         bad = pl(45, 90);
         bad.pl4_w = 201; // ABOVE factory — never raise a protection limit
-        assert!(matches!(check(bad), Err(ControlError::UnsafeRequest { .. })));
+        assert!(matches!(
+            check(bad),
+            Err(ControlError::UnsafeRequest { .. })
+        ));
     }
 
     #[test]
@@ -848,28 +909,30 @@ mod tests {
                 max_freq_mhz_dc: Some(bad),
                 ..Default::default()
             };
-            assert!(s
-                .validate(
+            assert!(
+                s.validate(
                     &ControlCommand::SetCpuPolicy(p),
                     &caps_full(),
                     &FakeFeed::fresh(70.0),
                     &ObservedState::default(),
                 )
-                .is_err());
+                .is_err()
+            );
         }
         for good in [0u32, 400, 2000, 6000] {
             let p = CpuPolicy {
                 max_freq_mhz_dc: Some(good),
                 ..Default::default()
             };
-            assert!(s
-                .validate(
+            assert!(
+                s.validate(
                     &ControlCommand::SetCpuPolicy(p),
                     &caps_full(),
                     &FakeFeed::fresh(70.0),
                     &ObservedState::default(),
                 )
-                .is_ok());
+                .is_ok()
+            );
         }
     }
 
@@ -880,14 +943,15 @@ mod tests {
             boost_policy: Some(BoostPolicy::EfficientAggressiveGuaranteed),
             ..Default::default()
         };
-        assert!(s
-            .validate(
+        assert!(
+            s.validate(
                 &ControlCommand::SetCpuPolicy(p),
                 &caps_full(),
                 &FakeFeed::fresh(70.0),
                 &ObservedState::default(),
             )
-            .is_ok());
+            .is_ok()
+        );
     }
 
     // ---- validate: fan ----
@@ -909,6 +973,37 @@ mod tests {
     }
 
     #[test]
+    fn fan_curve_requires_valid_points_inside_clamp() {
+        let s = SafetySupervisor::new();
+        let good = FanCurve::balanced();
+        assert!(
+            s.validate(
+                &ControlCommand::SetFanMode(FanMode::Curve(good)),
+                &caps_full(),
+                &FakeFeed::fresh(70.0),
+                &ObservedState::default(),
+            )
+            .is_ok()
+        );
+
+        let bad = FanCurve::new([
+            FanCurvePoint::new(35, 0, 20),
+            FanCurvePoint::new(55, 26, 26),
+            FanCurvePoint::new(72, 40, 42),
+            FanCurvePoint::new(85, 55, 55),
+        ]);
+        assert!(matches!(
+            s.validate(
+                &ControlCommand::SetFanMode(FanMode::Curve(bad)),
+                &caps_full(),
+                &FakeFeed::fresh(70.0),
+                &ObservedState::default(),
+            ),
+            Err(ControlError::UnsafeRequest { .. })
+        ));
+    }
+
+    #[test]
     fn manual_fan_needs_fresh_temperature() {
         let s = SafetySupervisor::new();
         let feed = FakeFeed {
@@ -927,25 +1022,35 @@ mod tests {
     }
 
     #[test]
-    fn max_to_manual_rejected_manual_to_max_allowed() {
+    fn max_to_manual_is_allowed_and_manual_to_max_is_allowed() {
         let s = SafetySupervisor::new();
-        let e = s
-            .validate(
+        assert!(
+            s.validate(
                 &ControlCommand::SetFanMode(FanMode::Manual(FanLevels::new(30, 30))),
                 &caps_full(),
                 &FakeFeed::fresh(70.0),
                 &observed_max_fan(),
             )
-            .unwrap_err();
-        assert!(matches!(e, ControlError::UnsafeRequest { .. }));
-        assert!(s
-            .validate(
+            .is_ok()
+        );
+        assert!(
+            s.validate(
+                &ControlCommand::SetFanMode(FanMode::Curve(FanCurve::balanced())),
+                &caps_full(),
+                &FakeFeed::fresh(70.0),
+                &observed_max_fan(),
+            )
+            .is_ok()
+        );
+        assert!(
+            s.validate(
                 &ControlCommand::SetFanMode(FanMode::Max),
                 &caps_full(),
                 &FakeFeed::fresh(70.0),
                 &observed_manual(FanLevels::new(30, 30)),
             )
-            .is_ok());
+            .is_ok()
+        );
     }
 
     #[test]
@@ -954,14 +1059,15 @@ mod tests {
         let mut caps = caps_full();
         caps.fan_manual_level = Support::Unsupported;
         caps.max_fan = Support::Unsupported;
-        assert!(s
-            .validate(
+        assert!(
+            s.validate(
                 &ControlCommand::SetFanMode(FanMode::FirmwareAuto),
                 &caps,
                 &FakeFeed::fresh(70.0),
                 &ObservedState::default(),
             )
-            .is_ok());
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1002,7 +1108,10 @@ mod tests {
                 cpu_gpu_concurrent_w: 0,
             }),
         ] {
-            assert_eq!(s.validate(&cmd, &c, &f, &o).unwrap_err(), ControlError::Unsupported);
+            assert_eq!(
+                s.validate(&cmd, &c, &f, &o).unwrap_err(),
+                ControlError::Unsupported
+            );
         }
     }
 
@@ -1013,10 +1122,7 @@ mod tests {
         let mut s = SafetySupervisor::new();
         let o = observed_manual(FanLevels::new(20, 20));
         // 89°C: nothing.
-        assert_eq!(
-            s.evaluate(&FakeFeed::fresh(89.0), &o, Instant::now()),
-            None
-        );
+        assert_eq!(s.evaluate(&FakeFeed::fresh(89.0), &o, Instant::now()), None);
         assert!(!s.override_active());
         // 90°C: force max fan, manual(20,20) saved.
         assert_eq!(
@@ -1025,16 +1131,30 @@ mod tests {
         );
         assert!(s.override_active());
         // 86°C: still latched.
-        assert_eq!(
-            s.evaluate(&FakeFeed::fresh(86.0), &o, Instant::now()),
-            None
-        );
+        assert_eq!(s.evaluate(&FakeFeed::fresh(86.0), &o, Instant::now()), None);
         // 85°C: release back to the saved manual mode.
         assert_eq!(
             s.evaluate(&FakeFeed::fresh(85.0), &o, Instant::now()),
-            Some(SafetyAction::ReleaseTo(FanMode::Manual(FanLevels::new(20, 20))))
+            Some(SafetyAction::ReleaseTo(FanMode::Manual(FanLevels::new(
+                20, 20
+            ))))
         );
         assert!(!s.override_active());
+    }
+
+    #[test]
+    fn max_fan_hysteresis_releases_to_max_mode() {
+        let mut s = SafetySupervisor::new();
+        let o = observed_max_mode();
+
+        assert_eq!(
+            s.evaluate(&FakeFeed::fresh(90.0), &o, Instant::now()),
+            Some(SafetyAction::ForceMaxFan)
+        );
+        assert_eq!(
+            s.evaluate(&FakeFeed::fresh(85.0), &o, Instant::now()),
+            Some(SafetyAction::ReleaseTo(FanMode::Max))
+        );
     }
 
     #[test]
@@ -1067,7 +1187,11 @@ mod tests {
     fn watchdog_ignores_freeze_when_firmware_auto() {
         let mut s = SafetySupervisor::new();
         assert_eq!(
-            s.evaluate(&FakeFeed::stale(), &ObservedState::default(), Instant::now()),
+            s.evaluate(
+                &FakeFeed::stale(),
+                &ObservedState::default(),
+                Instant::now()
+            ),
             None
         );
     }

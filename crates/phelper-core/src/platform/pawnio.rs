@@ -217,40 +217,31 @@ pub(crate) fn effective_clock_mhz(tsc_mhz: u32, prev: (u64, u64), now: (u64, u64
     ((0.05..=3.0).contains(&ratio)).then_some(tsc_mhz as f64 * ratio)
 }
 
-/// Locate the signed IntelMSR module image (runtime data file, LGPL —
-/// shipped alongside its COPYING text, never embedded in the binary).
-pub(crate) fn intelmsr_image() -> Result<Vec<u8>, PlatformError> {
-    module_image("PHELPER_INTELMSR", "IntelMSR.bin")
-}
+// The signed PawnIO modules are build-time resources, not user configuration.
+// Embed them in the core library so the released desktop executable remains
+// self-contained: launching it from Explorer, a shortcut, or another working
+// directory must not make CPU telemetry disappear.
+const EMBEDDED_INTEL_MSR: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/pawnio/IntelMSR.bin"
+));
+const EMBEDDED_INTEL_MCHBAR: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/pawnio/IntelMCHBAR.bin"
+));
 
-fn module_image(env_var: &str, file: &str) -> Result<Vec<u8>, PlatformError> {
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(p) = std::env::var(env_var) {
-        candidates.push(p.into());
-    }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        candidates.push(dir.join("assets").join("pawnio").join(file));
-        candidates.push(
-            dir.join("..")
-                .join("..")
-                .join("assets")
-                .join("pawnio")
-                .join(file),
-        );
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("assets").join("pawnio").join(file));
-    }
-    for path in &candidates {
-        if let Ok(bytes) = std::fs::read(path) {
-            return Ok(bytes);
-        }
-    }
-    Err(PlatformError::Driver(format!(
-        "{file} not found (set {env_var} or run from repo root)"
-    )))
+// Keep the module's LGPL notice in the same distributable artifact. `used`
+// prevents linker dead-stripping when the desktop shell has no license page;
+// the source asset remains here for attribution and source distributions.
+#[used]
+static EMBEDDED_PAWNIO_COPYING: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/pawnio/COPYING"
+));
+
+/// Return the embedded signed IntelMSR module image.
+pub(crate) fn intelmsr_image() -> Result<Vec<u8>, PlatformError> {
+    Ok(EMBEDDED_INTEL_MSR.to_vec())
 }
 
 // ---------------------------------------------------------------------------
@@ -288,10 +279,27 @@ pub(crate) fn mchbar_base_addr(io: &PawnIo) -> Result<u64, PlatformError> {
     Ok(out[0] as u64)
 }
 
-/// Locate the signed IntelMCHBAR module image (same LGPL runtime-data rules
-/// as IntelMSR.bin; override path via PHELPER_INTELMCHBAR).
+/// Return the embedded signed IntelMCHBAR module image.
 pub(crate) fn mchbar_image() -> Result<Vec<u8>, PlatformError> {
-    module_image("PHELPER_INTELMCHBAR", "IntelMCHBAR.bin")
+    Ok(EMBEDDED_INTEL_MCHBAR.to_vec())
+}
+
+#[cfg(test)]
+mod bundled_resource_tests {
+    use super::*;
+
+    #[test]
+    fn pawnio_runtime_resources_are_embedded() {
+        assert!(!EMBEDDED_INTEL_MSR.is_empty());
+        assert!(!EMBEDDED_INTEL_MCHBAR.is_empty());
+        assert!(
+            EMBEDDED_PAWNIO_COPYING
+                .windows(b"GNU LESSER GENERAL PUBLIC LICENSE".len())
+                .any(|window| window == b"GNU LESSER GENERAL PUBLIC LICENSE")
+        );
+        assert_eq!(intelmsr_image().unwrap(), EMBEDDED_INTEL_MSR);
+        assert_eq!(mchbar_image().unwrap(), EMBEDDED_INTEL_MCHBAR);
+    }
 }
 
 /// PL4 power-limit register, offset into the MCHBAR window. Settled

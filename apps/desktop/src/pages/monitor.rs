@@ -1,37 +1,115 @@
-//! Monitor (plan D-G): the full registry::all() metric table — id / live
-//! value / owner / live source / quality / age / cadence / note — with a
-//! substring filter on the metric id. owner ≠ live source rows highlight
-//! the source (a fallback is in use); samples older than 3× cadence gray
-//! out (stale ≠ live). Pure read — writes_available is irrelevant here.
+//! Monitor: a compact live-value table. It answers only "what is the machine
+//! doing right now?"; raw register and provider details stay out of the main
+//! control surface.
 
-use std::time::Instant;
-
-use gpui::{Context, Hsla, IntoElement, ParentElement, Styled, div, prelude::FluentBuilder, px};
+use gpui::{Context, IntoElement, ParentElement, Styled, div, px};
 use gpui_component::{ActiveTheme, StyledExt, input::Input};
-use phelper_core::app::fmt;
 use phelper_core::app::AppState;
+use phelper_core::app::fmt;
 use phelper_core::telemetry::registry;
-use phelper_domain::telemetry::MetricQuality;
+use phelper_domain::telemetry::{MetricId, MetricQuality, ids};
 
 use crate::shell::{MonitorState, ShellView};
 
 use super::dashboard::page_root;
 
-fn value_zh(v: f64) -> String {
-    if v.abs() >= 100. { format!("{v:.0}") } else { format!("{v:.1}") }
-}
-
-fn quality_zh(q: MetricQuality) -> &'static str {
-    match q {
-        MetricQuality::Fresh => "新鲜",
-        MetricQuality::Estimated => "估计",
-        MetricQuality::Stale => "陈旧",
-        _ => "不可用",
+fn metric_label(id: MetricId) -> &'static str {
+    match id {
+        ids::CPU_PKG_TEMP_C => "CPU 温度",
+        ids::CPU_TJ_MAX_C => "CPU 温度上限",
+        ids::CPU_PKG_POWER_W => "CPU 功率",
+        ids::CPU_EFFECTIVE_CLOCK_MHZ => "CPU 有效频率",
+        ids::CPU_PL1_W => "CPU 功耗上限 PL1",
+        ids::CPU_PL2_W => "CPU 功耗上限 PL2",
+        ids::CPU_PL4_W => "CPU 功耗上限 PL4",
+        ids::CPU_EPP_AC => "CPU EPP · 交流",
+        ids::CPU_EPP_DC => "CPU EPP · 电池",
+        ids::CPU_EPP1_AC => "E 核 EPP · 交流",
+        ids::CPU_EPP1_DC => "E 核 EPP · 电池",
+        ids::CPU_UTIL_PERCENT => "CPU 利用率",
+        ids::MEM_USED_BYTES => "内存已用",
+        ids::MEM_TOTAL_BYTES => "内存总量",
+        ids::DISK_READ_BPS => "磁盘读取",
+        ids::DISK_WRITE_BPS => "磁盘写入",
+        ids::NET_RX_BPS => "网络接收",
+        ids::NET_TX_BPS => "网络发送",
+        ids::GPU_TEMP_C => "GPU 温度",
+        ids::GPU_POWER_W => "GPU 功率",
+        ids::GPU_UTIL_PERCENT => "GPU 利用率",
+        ids::GPU_CORE_CLOCK_MHZ => "GPU 核心频率",
+        ids::GPU_MEM_CLOCK_MHZ => "GPU 显存频率",
+        ids::GPU_PSTATE => "GPU 状态",
+        ids::GPU_VRAM_USED_BYTES => "GPU 显存已用",
+        ids::GPU_POWER_LIMIT_W => "GPU 功耗上限",
+        ids::FRAME_DISPLAYED_FPS => "游戏帧率",
+        ids::FRAME_ONE_PERCENT_LOW_FPS => "1% Low",
+        ids::FRAME_TIME_MS => "帧时间",
+        ids::FRAME_CPU_BUSY_MS => "帧 CPU 时间",
+        ids::FRAME_GPU_TIME_MS => "帧 GPU 时间",
+        ids::FRAME_DISPLAY_LATENCY_MS => "显示延迟",
+        ids::FAN_CPU_RPM => "CPU 风扇",
+        ids::FAN_GPU_RPM => "GPU 风扇",
+        ids::POWER_AC_ONLINE => "电源",
+        ids::POWER_BATTERY_PERCENT => "电池电量",
+        // Raw register/bitmask metrics stay out of the user-facing table.
+        _ => id.0,
     }
 }
 
-fn cadence_zh(d: std::time::Duration) -> String {
-    if d.as_millis() < 1000 { format!("{} ms", d.as_millis()) } else { format!("{} s", d.as_secs()) }
+pub(crate) fn is_monitor_metric(id: MetricId) -> bool {
+    !matches!(
+        id,
+        ids::CPU_TJ_MAX_C
+            | ids::CPU_PL1_W
+            | ids::CPU_PL2_W
+            | ids::CPU_PL4_W
+            | ids::CPU_EPP_AC
+            | ids::CPU_EPP_DC
+            | ids::CPU_EPP1_AC
+            | ids::CPU_EPP1_DC
+            | ids::GPU_POWER_LIMIT_W
+            | ids::CPU_THERMAL_STATUS_RAW
+            | ids::CPU_POWER_LIMIT_RAW
+            | ids::GPU_THROTTLE_REASONS_RAW
+    )
+}
+
+fn bytes_zh(v: f64) -> String {
+    if v >= 1024. * 1024. * 1024. {
+        format!("{:.1} GB", v / (1024. * 1024. * 1024.))
+    } else if v >= 1024. * 1024. {
+        format!("{:.1} MB", v / (1024. * 1024.))
+    } else if v >= 1024. {
+        format!("{:.1} KB", v / 1024.)
+    } else {
+        format!("{v:.0} B")
+    }
+}
+
+fn rate_zh(v: f64) -> String {
+    if v >= 1024. * 1024. {
+        format!("{:.1} MB/s", v / (1024. * 1024.))
+    } else if v >= 1024. {
+        format!("{:.1} KB/s", v / 1024.)
+    } else {
+        format!("{v:.0} B/s")
+    }
+}
+
+fn value_zh(id: MetricId, v: f64, unit: &str) -> String {
+    match id {
+        ids::MEM_USED_BYTES | ids::MEM_TOTAL_BYTES | ids::GPU_VRAM_USED_BYTES => bytes_zh(v),
+        ids::DISK_READ_BPS | ids::DISK_WRITE_BPS | ids::NET_RX_BPS | ids::NET_TX_BPS => rate_zh(v),
+        ids::POWER_AC_ONLINE => {
+            if v > 0.5 {
+                "交流".into()
+            } else {
+                "电池".into()
+            }
+        }
+        _ if v.abs() >= 100. => format!("{v:.0} {unit}"),
+        _ => format!("{v:.1} {unit}"),
+    }
 }
 
 pub fn render(
@@ -40,18 +118,18 @@ pub fn render(
     cx: &mut Context<ShellView>,
 ) -> impl IntoElement {
     let theme = cx.theme();
-    let q = mon.filter.read(cx).text().to_string().to_lowercase();
+    let query = mon.filter.read(cx).text().to_string().to_lowercase();
     let snap = state.telemetry.as_deref();
-    let now = Instant::now();
-
-    // Column layout shared by header and rows.
-    let w_id = px(190.);
-    let w_val = px(110.);
-    let w_src = px(105.);
-    let w_q = px(60.);
-    let w_age = px(70.);
-    let w_cad = px(60.);
-
+    let w_id = px(210.);
+    let w_val = px(140.);
+    let w_quality = px(64.);
+    let page_header = div()
+        .h_flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .child(div().text_xl().font_semibold().child("监视器"))
+        .child(div().w(px(240.)).child(Input::new(&mon.filter)));
     let header = div()
         .h_flex()
         .gap_2()
@@ -61,95 +139,96 @@ pub fn render(
         .text_xs()
         .text_color(theme.muted_foreground)
         .child(div().w(w_id).child("指标"))
-        .child(div().w(w_val).child("值"))
-        .child(div().w(w_src).child("归属"))
-        .child(div().w(w_src).child("实际来源"))
-        .child(div().w(w_q).child("质量"))
-        .child(div().w(w_age).child("数据年龄"))
-        .child(div().w(w_cad).child("周期"))
-        .child(div().flex_1().child("备注"));
+        .child(div().w(w_val).child("当前值"))
+        .child(div().w(w_quality).child("状态"));
 
     let mut shown = 0usize;
     let mut rows = div().v_flex().w_full();
     for meta in registry::all() {
-        if !q.is_empty() && !meta.id.0.contains(q.as_str()) {
+        if !is_monitor_metric(meta.id) {
+            continue;
+        }
+        let label = metric_label(meta.id);
+        if !query.is_empty()
+            && !label.to_lowercase().contains(query.as_str())
+            && !meta.id.0.contains(query.as_str())
+        {
             continue;
         }
         shown += 1;
         let sample = snap.and_then(|s| s.samples.get(&meta.id));
-        let (value_s, live_source, quality, age_s, stale) = match sample {
+        let (value_s, quality, stale) = match sample {
             Some(s) => {
-                let age = now.saturating_duration_since(s.timestamp);
+                let age = s.timestamp.elapsed();
+                let stale = age > meta.cadence * 3
+                    || matches!(
+                        s.quality,
+                        MetricQuality::Stale
+                            | MetricQuality::Unavailable
+                            | MetricQuality::Unsupported
+                    )
+                    || s.value.as_f64().is_none();
                 (
-                    s.value.as_f64().map(value_zh).unwrap_or_else(|| "—".into()),
-                    Some(s.source),
-                    s.quality,
-                    if age.as_secs() >= 60 {
-                        format!("{} 分", age.as_secs() / 60)
+                    s.value
+                        .as_f64()
+                        .map(|v| value_zh(meta.id, v, meta.unit))
+                        .unwrap_or_else(|| "—".into()),
+                    if stale {
+                        "陈旧"
                     } else {
-                        format!("{} 秒", age.as_secs())
+                        fmt::quality_zh(s.quality)
                     },
-                    age > meta.cadence * 3,
+                    stale,
                 )
             }
-            None => ("—".into(), None, MetricQuality::Unavailable, "—".into(), true),
+            None => ("—".into(), "不可用", true),
         };
-        let fallback = live_source.is_some_and(|src| src != meta.owner);
-        let q_color: Hsla = match quality {
-            MetricQuality::Fresh => theme.success,
-            MetricQuality::Estimated | MetricQuality::Stale => theme.warning,
-            _ => theme.muted_foreground,
+        let value_color = if stale {
+            theme.muted_foreground
+        } else {
+            theme.foreground
         };
-        let val_color = if stale { theme.muted_foreground } else { theme.foreground };
+        let quality_color = if stale {
+            theme.warning
+        } else {
+            theme.muted_foreground
+        };
+        // Healthy samples need no badge. Reserve the column only for a
+        // stale/degraded value so the table stays quiet during normal use.
+        let quality_s = if stale || quality != "实时" {
+            quality
+        } else {
+            ""
+        };
         rows = rows.child(
             div()
                 .h_flex()
                 .gap_2()
                 .py_px()
-                .child(div().w(w_id).text_sm().child(meta.id.0.to_string()))
-                .child(
-                    div().w(w_val).text_sm().text_color(val_color).child(format!(
-                        "{} {}",
-                        value_s, meta.unit
-                    )),
-                )
+                .child(div().w(w_id).text_sm().child(label))
                 .child(
                     div()
-                        .w(w_src)
+                        .w(w_val)
                         .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child(fmt::source_zh(meta.owner)),
+                        .text_color(value_color)
+                        .child(value_s),
                 )
                 .child(
                     div()
-                        .w(w_src)
+                        .w(w_quality)
                         .text_sm()
-                        .when(fallback, |d| d.text_color(theme.warning).font_semibold())
-                        .child(live_source.map(fmt::source_zh).unwrap_or("—").to_string()),
-                )
-                .child(div().w(w_q).text_sm().text_color(q_color).child(quality_zh(quality)))
-                .child(
-                    div()
-                        .w(w_age)
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child(age_s),
-                )
-                .child(
-                    div()
-                        .w(w_cad)
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child(cadence_zh(meta.cadence)),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(meta.note),
+                        .text_color(quality_color)
+                        .child(quality_s),
                 ),
+        );
+    }
+    if shown == 0 {
+        rows = rows.child(
+            div()
+                .py_2()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child("没有匹配的指标"),
         );
     }
 
@@ -159,22 +238,7 @@ pub fn render(
             .gap_2()
             .p_4()
             .w_full()
-            .child(
-                div()
-                    .h_flex()
-                    .gap_3()
-                    .items_center()
-                    .child(div().w(px(280.)).child(Input::new(&mon.filter)))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(format!(
-                                "显示 {shown} / {} 项指标 · 高亮 = 回退源使用中 · 灰 = 超过 3× 周期未更新",
-                                registry::all().len()
-                            )),
-                    ),
-            )
+            .child(page_header)
             .child(header)
             .child(rows),
     )

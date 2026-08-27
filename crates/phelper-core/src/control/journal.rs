@@ -56,8 +56,9 @@ impl ControlJournal {
 
     pub fn open(path: &Path, board_id: &str, bios_version: &str) -> Result<Self, EngineError> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| EngineError::Persistence(format!("create {}: {e}", parent.display())))?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                EngineError::Persistence(format!("create {}: {e}", parent.display()))
+            })?;
         }
         let file = OpenOptions::new()
             .create(true)
@@ -97,18 +98,16 @@ impl ControlJournal {
             .and_then(|()| self.file.write_all(b"\n"))
             .and_then(|()| self.file.flush())
             .and_then(|()| self.file.sync_data())
-            .map_err(|e| {
-                EngineError::Persistence(format!("append {}: {e}", self.path.display()))
-            })
+            .map_err(|e| EngineError::Persistence(format!("append {}: {e}", self.path.display())))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use phelper_domain::command::ControlCommand;
     use phelper_domain::command::{ControlReceipt, ControlStatus, StepOutcome, Verification};
     use phelper_domain::policy::ThermalMode;
-    use phelper_domain::command::ControlCommand;
     use std::time::Duration;
 
     fn sample_outcome() -> ControlOutcome {

@@ -1,32 +1,27 @@
-//! Shell — sidebar + page switching + the 250 ms state ticker (plan D-E).
+//! Shell — sidebar + page switching + the 50 ms responsive state ticker.
 //! The ticker is the ONLY AppState pull; pages render from the snapshot.
 
-use std::collections::BTreeSet;
 use std::time::Duration;
 
-use gpui::{AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Task, Window, div, px};
-use gpui_component::{ActiveTheme, h_flex, v_flex, input::{InputEvent, InputState}, sidebar::{Sidebar, SidebarCollapsible, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem}, slider::{SliderEvent, SliderState, SliderValue}};
+use gpui::{
+    AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Task, Window, div, px,
+};
+use gpui_component::{
+    ActiveTheme, h_flex,
+    input::{InputEvent, InputState},
+    sidebar::{Sidebar, SidebarCollapsible, SidebarHeader, SidebarMenu, SidebarMenuItem},
+    slider::{SliderEvent, SliderState, SliderValue},
+    v_flex,
+};
+use phelper_core::app::AppState;
 use phelper_core::app::runtime::AppHandle;
 use phelper_core::app::state::KnobId;
-use phelper_core::app::{AppState, EngineStatus};
 use phelper_domain::command::ControlCommand;
-use phelper_domain::policy::{FanLevels, FanMode};
+use phelper_domain::policy::{FAN_CURVE_POINT_COUNT, FanCurve, FanLevels, FanMode};
 use phelper_domain::state::ObservedValue;
 use phelper_domain::telemetry::ids;
 
-use crate::pages::{PageId, dashboard, diagnostics, monitor, performance, profiles, settings, thermals};
-
-/// Diagnostics page view-state (§42: page-local interactive state lives
-/// in the shell, never in the pure page render).
-pub struct DiagState {
-    /// Expanded journal rows (journal_view::key_of keys).
-    pub expanded: BTreeSet<String>,
-    /// (message, ok) after an export attempt; None until first click.
-    pub export_note: Option<(String, bool)>,
-    /// Journal rows rendered before the 显示更多 expander (v0.2: the page
-    /// re-renders at the 250 ms tick; 200 full rows was its heaviest cost).
-    pub journal_limit: usize,
-}
+use crate::pages::{PageId, dashboard, monitor, performance, profiles, settings};
 
 /// Performance page view-state: the six slider entities (local intent —
 /// seeded once from observed values; never stomped mid-drag), plus the
@@ -40,9 +35,10 @@ pub struct PerfState {
     pub freq_dc: Entity<SliderState>,
     pub seeded: bool,
     pub banner_expanded: bool,
+    pub advanced_expanded: bool,
 }
 
-/// Thermals page view-state. Fan sliders are created LAZILY once the fan
+/// Fan view-state. Fan sliders are created LAZILY once the fan
 /// clamp is probed (SliderState has no runtime min/max setters); the ×100
 /// RPM fields mirror the slider values so one slider's Change can dispatch
 /// a complete Manual(cpu, gpu) command without cross-entity reads.
@@ -50,10 +46,29 @@ pub struct ThermalState {
     pub fan_sliders: Option<(Entity<SliderState>, Entity<SliderState>)>,
     pub cpu_rpm: u16,
     pub gpu_rpm: u16,
-    pub banner_expanded: bool,
-    /// 1 Hz chart pull caches (v0.2; see trend_chart::ChartCache).
-    pub temp_chart: crate::widgets::trend_chart::ChartCache,
-    pub fan_chart: crate::widgets::trend_chart::ChartCache,
+    /// Four curve rows × (temperature, CPU level, GPU level). Inputs are
+    /// local editing state; nothing is written until the user applies the
+    /// complete curve.
+    pub curve_inputs: [Entity<InputState>; FAN_CURVE_POINT_COUNT * 3],
+    pub curve: FanCurve,
+    pub curve_seeded: bool,
+    pub curve_origin: Option<CurveOrigin>,
+    pub curve_expanded: bool,
+    pub curve_note: Option<(String, bool)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CurveOrigin {
+    /// The coordinator has acknowledged this curve as the current app-side
+    /// fan policy.
+    Active,
+    /// Loaded from core persistence for editing; it is not active until the
+    /// user applies it again.
+    Saved,
+    /// Loaded from a named profile for editing.
+    Profile,
+    /// Chosen or edited locally and waiting for an explicit apply.
+    Draft,
 }
 
 /// Profiles page view-state: selected card + outcome banner + transient
@@ -61,6 +76,7 @@ pub struct ThermalState {
 pub struct ProfileState {
     pub selected: Option<String>,
     pub banner_expanded: bool,
+    pub management_expanded: bool,
     pub note: Option<(String, bool)>,
 }
 
@@ -97,13 +113,12 @@ pub struct ShellView {
     pub(crate) last_fp: Option<u64>,
     pub(crate) last_paint: std::time::Instant,
     pub dash: dashboard::DashState,
-    pub diag: DiagState,
-    pub perf: PerfState,
-    pub thermal: ThermalState,
+    pub perf: Option<PerfState>,
+    pub thermal: Option<ThermalState>,
     pub prof: ProfileState,
-    pub mon: MonitorState,
+    pub mon: Option<MonitorState>,
     pub settings: SettingsState,
-    pub exp: ExpState,
+    pub exp: Option<ExpState>,
     _appearance_sub: gpui::Subscription,
     _tick: Task<()>,
 }
@@ -118,7 +133,13 @@ fn knob_slider(
     knob: KnobId,
     map: fn(f32) -> ControlCommand,
 ) -> Entity<SliderState> {
-    let e = cx.new(|_| SliderState::new().min(min).max(max).step(step).default_value(0.));
+    let e = cx.new(|_| {
+        SliderState::new()
+            .min(min)
+            .max(max)
+            .step(step)
+            .default_value(0.)
+    });
     cx.subscribe(&e, move |this: &mut ShellView, _, ev: &SliderEvent, cx| {
         if let SliderEvent::Change(SliderValue::Single(v)) = ev {
             this.app.dispatch(knob, map(*v));
@@ -143,24 +164,42 @@ fn fan_sliders(
     // builder call runs update_thumb_pos (value.clamp(min, max) — panics
     // when min > max). `.min(2000)` before `.max(6300)` panics on the
     // intermediate (2000, 100) state (on-device crash D7). max FIRST.
-    let cpu = cx.new(|_| SliderState::new().max(max_rpm).min(min_rpm).step(100.).default_value(min_rpm));
-    let gpu = cx.new(|_| SliderState::new().max(max_rpm).min(min_rpm).step(100.).default_value(min_rpm));
+    let cpu = cx.new(|_| {
+        SliderState::new()
+            .max(max_rpm)
+            .min(min_rpm)
+            .step(100.)
+            .default_value(min_rpm)
+    });
+    let gpu = cx.new(|_| {
+        SliderState::new()
+            .max(max_rpm)
+            .min(min_rpm)
+            .step(100.)
+            .default_value(min_rpm)
+    });
     cx.subscribe(&cpu, |this: &mut ShellView, _, ev: &SliderEvent, cx| {
         if let SliderEvent::Change(SliderValue::Single(v)) = ev {
-            this.thermal.cpu_rpm = (*v / 100.).round() as u16;
-            let levels = FanLevels::new(this.thermal.cpu_rpm, this.thermal.gpu_rpm);
-            this.app
-                .dispatch(KnobId::FanMode, ControlCommand::SetFanMode(FanMode::Manual(levels)));
+            let thermal = this.thermal.as_mut().expect("thermal controls initialized");
+            thermal.cpu_rpm = (*v / 100.).round() as u16;
+            let levels = FanLevels::new(thermal.cpu_rpm, thermal.gpu_rpm);
+            this.app.dispatch(
+                KnobId::FanMode,
+                ControlCommand::SetFanMode(FanMode::Manual(levels)),
+            );
             cx.notify();
         }
     })
     .detach();
     cx.subscribe(&gpu, |this: &mut ShellView, _, ev: &SliderEvent, cx| {
         if let SliderEvent::Change(SliderValue::Single(v)) = ev {
-            this.thermal.gpu_rpm = (*v / 100.).round() as u16;
-            let levels = FanLevels::new(this.thermal.cpu_rpm, this.thermal.gpu_rpm);
-            this.app
-                .dispatch(KnobId::FanMode, ControlCommand::SetFanMode(FanMode::Manual(levels)));
+            let thermal = this.thermal.as_mut().expect("thermal controls initialized");
+            thermal.gpu_rpm = (*v / 100.).round() as u16;
+            let levels = FanLevels::new(thermal.cpu_rpm, thermal.gpu_rpm);
+            this.app.dispatch(
+                KnobId::FanMode,
+                ControlCommand::SetFanMode(FanMode::Manual(levels)),
+            );
             cx.notify();
         }
     })
@@ -168,12 +207,276 @@ fn fan_sliders(
     (cpu, gpu)
 }
 
+fn curve_inputs(
+    cx: &mut Context<ShellView>,
+    window: &mut Window,
+) -> [Entity<InputState>; FAN_CURVE_POINT_COUNT * 3] {
+    std::array::from_fn(|index| {
+        let placeholder = match index % 3 {
+            0 => "°C",
+            1 | 2 => "RPM",
+            _ => unreachable!(),
+        };
+        cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
+    })
+}
+
 impl ShellView {
-    pub fn new(app: AppHandle, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn set_curve_form(
+        &mut self,
+        curve: FanCurve,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let values = curve
+            .points
+            .iter()
+            .flat_map(|point| {
+                [
+                    point.temp_c.to_string(),
+                    point.cpu_rpm().to_string(),
+                    point.gpu_rpm().to_string(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let inputs = {
+            let thermal = self.thermal.as_mut().expect("thermal controls initialized");
+            thermal.curve = curve;
+            thermal.curve_inputs.clone()
+        };
+        for (input, value) in inputs.iter().zip(values) {
+            input.update(cx, |s, cx| s.set_value(value, window, cx));
+        }
+    }
+
+    fn ensure_performance_controls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.perf.is_none() {
+            self.perf = Some(PerfState {
+                epp_ac: knob_slider(cx, 0., 100., 5., KnobId::EppAc, performance::epp_ac_cmd),
+                epp_dc: knob_slider(cx, 0., 100., 5., KnobId::EppDc, performance::epp_dc_cmd),
+                epp1_ac: knob_slider(cx, 0., 100., 5., KnobId::Epp1Ac, performance::epp1_ac_cmd),
+                epp1_dc: knob_slider(cx, 0., 100., 5., KnobId::Epp1Dc, performance::epp1_dc_cmd),
+                freq_ac: knob_slider(
+                    cx,
+                    0.,
+                    6000.,
+                    100.,
+                    KnobId::MaxFreqAc,
+                    performance::freq_ac_cmd,
+                ),
+                freq_dc: knob_slider(
+                    cx,
+                    0.,
+                    6000.,
+                    100.,
+                    KnobId::MaxFreqDc,
+                    performance::freq_dc_cmd,
+                ),
+                seeded: false,
+                banner_expanded: false,
+                advanced_expanded: false,
+            });
+        }
+
+        if self.thermal.is_none() {
+            let curve_inputs = curve_inputs(cx, window);
+            for input in &curve_inputs {
+                cx.subscribe(input, |_this: &mut ShellView, _, ev: &InputEvent, cx| {
+                    if matches!(ev, InputEvent::Change) {
+                        cx.notify();
+                    }
+                })
+                .detach();
+            }
+            self.thermal = Some(ThermalState {
+                fan_sliders: None,
+                cpu_rpm: 0,
+                gpu_rpm: 0,
+                curve_inputs,
+                curve: FanCurve::balanced(),
+                curve_seeded: false,
+                curve_origin: None,
+                curve_expanded: false,
+                curve_note: None,
+            });
+        }
+
+        if self.exp.is_none() {
+            self.exp = Some(ExpState {
+                pl1: cx.new(|cx| InputState::new(window, cx).placeholder("PL1 W")),
+                pl2: cx.new(|cx| InputState::new(window, cx).placeholder("PL2 W")),
+                pl4: cx.new(|cx| InputState::new(window, cx).placeholder("PL4 W · 空=不改")),
+                seeded: false,
+                note: None,
+            });
+        }
+    }
+
+    fn ensure_monitor_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mon.is_none() {
+            let filter = cx.new(|cx| InputState::new(window, cx).placeholder("搜索指标…"));
+            cx.subscribe(&filter, |_this: &mut ShellView, _, ev: &InputEvent, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    cx.notify();
+                }
+            })
+            .detach();
+            self.mon = Some(MonitorState { filter });
+        }
+    }
+
+    fn prepare_performance_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_performance_controls(window, cx);
+
+        // Seed the EPP sliders once from the first observed readback —
+        // sliders are local intent afterwards, never stomped mid-drag.
+        if let Some(perf) = self.perf.as_mut()
+            && !perf.seeded
+        {
+            let obs = &self.state.observed;
+            let get = |v: &ObservedValue<u8>| v.value().copied();
+            if let (Some(ac), Some(dc), Some(a1), Some(d1)) = (
+                get(&obs.epp_ac),
+                get(&obs.epp_dc),
+                get(&obs.epp1_ac),
+                get(&obs.epp1_dc),
+            ) {
+                for (entity, v) in [
+                    (&perf.epp_ac, ac),
+                    (&perf.epp_dc, dc),
+                    (&perf.epp1_ac, a1),
+                    (&perf.epp1_dc, d1),
+                ] {
+                    let entity = entity.clone();
+                    entity.update(cx, |s, cx| s.set_value(v as f32, window, cx));
+                }
+                perf.seeded = true;
+            }
+        }
+
+        if self
+            .thermal
+            .as_ref()
+            .is_some_and(|thermal| !thermal.curve_seeded)
+            && self.state.caps.is_some()
+        {
+            let curve_source = match self.state.observed.fan_mode.value() {
+                Some(FanMode::Curve(curve)) => Some((*curve, CurveOrigin::Active)),
+                _ => self
+                    .state
+                    .last_saved_fan_curve
+                    .map(|curve| (curve, CurveOrigin::Saved))
+                    .or_else(|| {
+                        self.state.desired.profile.as_deref().and_then(|name| {
+                            self.state
+                                .profiles
+                                .iter()
+                                .find(|profile| profile.name == name)
+                                .and_then(|profile| match profile.fan_mode {
+                                    Some(FanMode::Curve(curve)) => {
+                                        Some((curve, CurveOrigin::Profile))
+                                    }
+                                    _ => None,
+                                })
+                        })
+                    }),
+            };
+            if let Some((curve, origin)) = curve_source {
+                self.set_curve_form(curve, window, cx);
+                let thermal = self.thermal.as_mut().expect("thermal controls initialized");
+                thermal.curve_seeded = true;
+                thermal.curve_origin = Some(origin);
+            }
+        }
+
+        // Create the manual-fan sliders once the clamp is probed, seeded
+        // from the observed manual levels (if already in Manual) else from
+        // live RPM (clamped; fans may read 0 at idle fan-stop). Programmatic
+        // set_value does NOT fire SliderEvent::Change — no dispatch (D6:
+        // journal stayed clean through EPP seeding).
+        if self
+            .thermal
+            .as_ref()
+            .is_some_and(|thermal| thermal.fan_sliders.is_none())
+        {
+            let clamp =
+                self.state
+                    .caps
+                    .as_ref()
+                    .and_then(|c| match (c.fan.clamp_min, c.fan.clamp_max) {
+                        (Some(lo), Some(hi)) => Some((lo, hi)),
+                        _ => None,
+                    });
+            if let Some((lo, hi)) = clamp {
+                let snap = self.state.telemetry.as_deref();
+                let live = |id| {
+                    snap.and_then(|s| s.samples.get(&id))
+                        .and_then(|s| s.value.as_f64())
+                };
+                let from_live = |v: Option<f64>| match v {
+                    Some(rpm) => ((rpm / 100.).round() as u16).clamp(lo, hi),
+                    None => lo,
+                };
+                let (c0, g0) = match self.state.observed.fan_mode.value() {
+                    Some(FanMode::Manual(l)) => (l.cpu.clamp(lo, hi), l.gpu.clamp(lo, hi)),
+                    _ => (
+                        from_live(live(ids::FAN_CPU_RPM)),
+                        from_live(live(ids::FAN_GPU_RPM)),
+                    ),
+                };
+                let (cpu_e, gpu_e) = fan_sliders(cx, (lo * 100) as f32, (hi * 100) as f32);
+                cpu_e.update(cx, |s, cx| s.set_value((c0 * 100) as f32, window, cx));
+                gpu_e.update(cx, |s, cx| s.set_value((g0 * 100) as f32, window, cx));
+                let thermal = self.thermal.as_mut().expect("thermal controls initialized");
+                thermal.cpu_rpm = c0;
+                thermal.gpu_rpm = g0;
+                thermal.fan_sliders = Some((cpu_e, gpu_e));
+            }
+        }
+
+        // Seed the 0x29 inputs once from the live 0x610 TELEMETRY
+        // readback (250 ms). observed.power_limits stays Unknown until a
+        // write verifies this session, so it can't seed a fresh session — the
+        // telemetry metrics are the same hardware readback the CLI shows.
+        // PL4 stays empty = NO_CHANGE (mirrors the CLI's --pl4).
+        if self.exp.as_ref().is_some_and(|exp| !exp.seeded) {
+            let snap = self.state.telemetry.as_deref();
+            let val = |id| {
+                snap.and_then(|s| s.samples.get(&id))
+                    .and_then(|s| s.value.as_f64())
+            };
+            if let (Some(pl1), Some(pl2)) = (val(ids::CPU_PL1_W), val(ids::CPU_PL2_W)) {
+                let (pl1_input, pl2_input) = {
+                    let exp = self
+                        .exp
+                        .as_ref()
+                        .expect("experimental controls initialized");
+                    (exp.pl1.clone(), exp.pl2.clone())
+                };
+                pl1_input.update(cx, |s, cx| {
+                    s.set_value(format!("{}", pl1.round() as i64), window, cx)
+                });
+                pl2_input.update(cx, |s, cx| {
+                    s.set_value(format!("{}", pl2.round() as i64), window, cx)
+                });
+                self.exp
+                    .as_mut()
+                    .expect("experimental controls initialized")
+                    .seeded = true;
+            }
+        }
+    }
+
+    pub fn new(
+        app: AppHandle,
+        theme: phelper_core::app::settings::ThemePref,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let _tick = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
-                    .timer(Duration::from_millis(250))
+                    .timer(Duration::from_millis(50))
                     .await;
                 let r = this.update(cx, |this, cx| {
                     this.state = this.app.state();
@@ -194,13 +497,6 @@ impl ShellView {
                 }
             }
         });
-        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("筛选指标 ID（子串）…"));
-        cx.subscribe(&filter, |_this: &mut ShellView, _, ev: &InputEvent, cx| {
-            if matches!(ev, InputEvent::Change) {
-                cx.notify();
-            }
-        })
-        .detach();
         // OS theme flipped while we run: re-resolve "跟随系统" live. The
         // notify matters now: the v0.2-d tick skips unchanged frames, and
         // a theme flip is not part of any page fingerprint.
@@ -217,46 +513,17 @@ impl ShellView {
             last_fp: None,
             last_paint: std::time::Instant::now(),
             dash: Default::default(),
-            diag: DiagState {
-                expanded: BTreeSet::new(),
-                export_note: None,
-                journal_limit: 50,
-            },
-            perf: PerfState {
-                epp_ac: knob_slider(cx, 0., 100., 5., KnobId::EppAc, performance::epp_ac_cmd),
-                epp_dc: knob_slider(cx, 0., 100., 5., KnobId::EppDc, performance::epp_dc_cmd),
-                epp1_ac: knob_slider(cx, 0., 100., 5., KnobId::Epp1Ac, performance::epp1_ac_cmd),
-                epp1_dc: knob_slider(cx, 0., 100., 5., KnobId::Epp1Dc, performance::epp1_dc_cmd),
-                freq_ac: knob_slider(cx, 0., 6000., 100., KnobId::MaxFreqAc, performance::freq_ac_cmd),
-                freq_dc: knob_slider(cx, 0., 6000., 100., KnobId::MaxFreqDc, performance::freq_dc_cmd),
-                seeded: false,
-                banner_expanded: false,
-            },
-            thermal: ThermalState {
-                fan_sliders: None,
-                cpu_rpm: 0,
-                gpu_rpm: 0,
-                banner_expanded: false,
-                temp_chart: Default::default(),
-                fan_chart: Default::default(),
-            },
+            perf: None,
+            thermal: None,
             prof: ProfileState {
                 selected: None,
                 banner_expanded: false,
+                management_expanded: false,
                 note: None,
             },
-            mon: MonitorState { filter },
-            settings: SettingsState {
-                theme: phelper_core::app::settings::UiSettings::load().0.theme,
-                note: None,
-            },
-            exp: ExpState {
-                pl1: cx.new(|cx| InputState::new(window, cx).placeholder("PL1 W")),
-                pl2: cx.new(|cx| InputState::new(window, cx).placeholder("PL2 W")),
-                pl4: cx.new(|cx| InputState::new(window, cx).placeholder("PL4 W · 空=不改")),
-                seeded: false,
-                note: None,
-            },
+            mon: None,
+            settings: SettingsState { theme, note: None },
+            exp: None,
             _appearance_sub: appearance_sub,
             _tick,
         }
@@ -265,86 +532,10 @@ impl ShellView {
 
 impl Render for ShellView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Seed the EPP sliders once from the first observed readback —
-        // sliders are local intent afterwards, never stomped mid-drag.
-        if !self.perf.seeded {
-            let obs = &self.state.observed;
-            let get = |v: &ObservedValue<u8>| v.value().copied();
-            if let (Some(ac), Some(dc), Some(a1), Some(d1)) = (
-                get(&obs.epp_ac),
-                get(&obs.epp_dc),
-                get(&obs.epp1_ac),
-                get(&obs.epp1_dc),
-            ) {
-                for (entity, v) in [
-                    (&self.perf.epp_ac, ac),
-                    (&self.perf.epp_dc, dc),
-                    (&self.perf.epp1_ac, a1),
-                    (&self.perf.epp1_dc, d1),
-                ] {
-                    let entity = entity.clone();
-                    entity.update(cx, |s, cx| s.set_value(v as f32, window, cx));
-                }
-                self.perf.seeded = true;
-            }
-        }
-
-        // Create the manual-fan sliders once the clamp is probed, seeded
-        // from the observed manual levels (if already in Manual) else from
-        // live RPM (clamped; fans may read 0 at idle fan-stop). Programmatic
-        // set_value does NOT fire SliderEvent::Change — no dispatch (D6:
-        // journal stayed clean through EPP seeding).
-        if self.thermal.fan_sliders.is_none() {
-            let clamp = self.state.caps.as_ref().and_then(|c| {
-                match (c.fan.clamp_min, c.fan.clamp_max) {
-                    (Some(lo), Some(hi)) => Some((lo, hi)),
-                    _ => None,
-                }
-            });
-            if let Some((lo, hi)) = clamp {
-                let (cpu_e, gpu_e) = fan_sliders(cx, (lo * 100) as f32, (hi * 100) as f32);
-                let snap = self.state.telemetry.as_deref();
-                let live = |id| {
-                    snap.and_then(|s| s.samples.get(&id)).and_then(|s| s.value.as_f64())
-                };
-                let from_live = |v: Option<f64>| match v {
-                    Some(rpm) => ((rpm / 100.).round() as u16).clamp(lo, hi),
-                    None => lo,
-                };
-                let (c0, g0) = match self.state.observed.fan_mode.value() {
-                    Some(FanMode::Manual(l)) => (l.cpu.clamp(lo, hi), l.gpu.clamp(lo, hi)),
-                    _ => (
-                        from_live(live(ids::FAN_CPU_RPM)),
-                        from_live(live(ids::FAN_GPU_RPM)),
-                    ),
-                };
-                self.thermal.cpu_rpm = c0;
-                self.thermal.gpu_rpm = g0;
-                cpu_e.update(cx, |s, cx| s.set_value((c0 * 100) as f32, window, cx));
-                gpu_e.update(cx, |s, cx| s.set_value((g0 * 100) as f32, window, cx));
-                self.thermal.fan_sliders = Some((cpu_e, gpu_e));
-            }
-        }
-
-        // Seed the 0x29 inputs once from the live 0x610 TELEMETRY
-        // readback (250 ms). observed.power_limits stays Unknown until a
-        // write verifies this session, so it can't seed a fresh session —
-        // the telemetry metrics are the same hardware readback the CLI
-        // shows. PL4 stays empty = NO_CHANGE (mirrors the CLI's --pl4).
-        if !self.exp.seeded {
-            let snap = self.state.telemetry.as_deref();
-            let val = |id| {
-                snap.and_then(|s| s.samples.get(&id)).and_then(|s| s.value.as_f64())
-            };
-            if let (Some(pl1), Some(pl2)) = (val(ids::CPU_PL1_W), val(ids::CPU_PL2_W)) {
-                self.exp
-                    .pl1
-                    .update(cx, |s, cx| s.set_value(format!("{}", pl1.round() as i64), window, cx));
-                self.exp
-                    .pl2
-                    .update(cx, |s, cx| s.set_value(format!("{}", pl2.round() as i64), window, cx));
-                self.exp.seeded = true;
-            }
+        if self.page == PageId::Performance {
+            self.prepare_performance_page(window, cx);
+        } else if self.page == PageId::Monitor {
+            self.ensure_monitor_filter(window, cx);
         }
 
         // NOTE: build everything that needs `&mut cx` (listeners, page
@@ -362,25 +553,30 @@ impl Render for ShellView {
         }));
 
         let content: gpui::AnyElement = match self.page {
-            PageId::Dashboard => dashboard::render(&self.state, &self.app, &self.dash, cx).into_any_element(),
-            PageId::Performance => {
-                performance::render(&self.state, &self.app, &self.perf, &self.exp, cx).into_any_element()
+            PageId::Dashboard => {
+                dashboard::render(&self.state, &self.app, &self.dash, cx).into_any_element()
             }
-            PageId::Thermals => {
-                thermals::render(&self.state, &self.app, &self.thermal, cx).into_any_element()
+            PageId::Performance => {
+                let perf = self
+                    .perf
+                    .as_ref()
+                    .expect("performance controls initialized");
+                let thermal = self.thermal.as_ref().expect("thermal controls initialized");
+                let exp = self
+                    .exp
+                    .as_ref()
+                    .expect("experimental controls initialized");
+                performance::render(&self.state, &self.app, perf, thermal, exp, cx)
+                    .into_any_element()
             }
             PageId::Profiles => {
                 profiles::render(&self.state, &self.app, &self.prof, cx).into_any_element()
             }
             PageId::Monitor => {
-                monitor::render(&self.state, &self.mon, cx).into_any_element()
+                let mon = self.mon.as_ref().expect("monitor filter initialized");
+                monitor::render(&self.state, mon, cx).into_any_element()
             }
-            PageId::Settings => {
-                settings::render(&self.settings, cx).into_any_element()
-            }
-            PageId::Diagnostics => {
-                diagnostics::render(&self.state, &self.app, &self.diag, cx).into_any_element()
-            }
+            PageId::Settings => settings::render(&self.settings, cx).into_any_element(),
         };
 
         let theme = cx.theme();
@@ -391,37 +587,19 @@ impl Render for ShellView {
             .child(
                 Sidebar::new("phelper-nav")
                     .collapsible(SidebarCollapsible::None)
-                    .w(px(200.))
-                    .header(SidebarHeader::new().child(
-                        v_flex()
-                            .child(div().text_lg().child("phelper"))
-                            .child(
+                    .w(px(132.))
+                    .header(
+                        SidebarHeader::new().child(
+                            v_flex().child(div().text_lg().child("phelper")).child(
                                 div()
                                     .text_xs()
                                     .text_color(theme.muted_foreground)
-                                    .child("OMEN 16-wf0032TX"),
+                                    .child("OMEN 16"),
                             ),
-                    ))
-                    .child(SidebarGroup::new("页面").child(menu))
-                    .footer(
-                        div()
-                            .p_2()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(match &self.state.engine {
-                                EngineStatus::Starting => "引擎启动中…",
-                                EngineStatus::Running => "引擎运行中",
-                                EngineStatus::TelemetryOnly => "遥测模式",
-                                EngineStatus::Failed(_) => "引擎故障",
-                            }),
-                    ),
+                        ),
+                    )
+                    .child(menu),
             )
-            .child(
-                v_flex()
-                    .h_full()
-                    .flex_1()
-                    .min_w_0()
-                    .child(content),
-            )
+            .child(v_flex().h_full().flex_1().min_w_0().child(content))
     }
 }

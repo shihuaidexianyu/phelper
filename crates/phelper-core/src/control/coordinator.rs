@@ -20,7 +20,7 @@ use phelper_domain::command::{
 use phelper_domain::error::{ControlError, EngineError, HpWmiError, PlatformError};
 use phelper_domain::identity::DeviceIdentity;
 use phelper_domain::policy::{
-    CpuPolicy, CpuPowerLimits, FanLevels, FanMode, GpuPlatformPolicy, ThermalMode,
+    CpuPolicy, CpuPowerLimits, FanCurve, FanLevels, FanMode, GpuPlatformPolicy, ThermalMode,
 };
 use phelper_domain::ports::{CpuPolicyBackend, HpBackend};
 use phelper_domain::profile::GpuPolicyPatch;
@@ -30,6 +30,7 @@ use tracing::{debug, info, warn};
 
 use crate::telemetry::TelemetryHandle;
 
+use super::fan_curve::{FanCurveController, effective_temperature};
 use super::journal::{ControlJournal, JournalOrigin};
 use super::keepalive::{KeepAliveService, ReAssert};
 use super::safety::{SafetyAction, SafetySupervisor, ThermalFeed};
@@ -74,6 +75,9 @@ pub(crate) struct ControlConfig<H, P, F> {
     pub ppm: P,
     pub feed: F,
     pub journal_path: std::path::PathBuf,
+    /// Optional path for the last explicitly applied software fan curve.
+    /// Tests leave this unset so they never touch the user's state directory.
+    pub fan_curve_path: Option<std::path::PathBuf>,
     /// Profile registry for ApplyProfile expansion (built-ins + user TOML;
     /// empty = profiles unresolvable, ApplyProfile rejects UnknownProfile).
     pub profiles: crate::profiles::ProfileRegistry,
@@ -100,6 +104,7 @@ impl<H, P, F> ControlConfig<H, P, F> {
             ppm,
             feed,
             journal_path,
+            fan_curve_path: None,
             profiles: crate::profiles::ProfileRegistry::empty(),
             verify_polls: FAN_VERIFY_POLLS,
             verify_poll_interval: Duration::from_secs(1),
@@ -117,6 +122,7 @@ pub struct ControlHandle {
     caps: Arc<CapabilitySet>,
     desired: Arc<RwLock<DesiredState>>,
     observed: Arc<RwLock<ObservedState>>,
+    last_saved_fan_curve: Arc<RwLock<Option<FanCurve>>>,
 }
 
 impl Clone for ControlHandle {
@@ -127,6 +133,7 @@ impl Clone for ControlHandle {
             caps: Arc::clone(&self.caps),
             desired: Arc::clone(&self.desired),
             observed: Arc::clone(&self.observed),
+            last_saved_fan_curve: Arc::clone(&self.last_saved_fan_curve),
         }
     }
 }
@@ -182,6 +189,16 @@ impl ControlHandle {
         self.observed.read().expect("observed poisoned").clone()
     }
 
+    /// The last curve successfully applied by phelper, if one was saved.
+    /// This is an editing source only; it does not claim that the firmware
+    /// is still running the curve after the process has exited.
+    pub fn last_saved_fan_curve(&self) -> Option<FanCurve> {
+        *self
+            .last_saved_fan_curve
+            .read()
+            .expect("saved fan curve poisoned")
+    }
+
     /// Ask the coordinator to re-probe the read-backable observed fields
     /// (EPP/EPP1 via PPM, 0x21 gpu policy) and re-stamp ObservedState.
     /// Read-only and fire-and-forget: a dropped refresh (full queue)
@@ -212,6 +229,7 @@ pub(crate) struct ControlCoordinator<H, P, F> {
     feed: F,
     journal: ControlJournal,
     safety: SafetySupervisor,
+    fan_curve: FanCurveController,
     keepalive: KeepAliveService,
     profiles: crate::profiles::ProfileRegistry,
     verify_polls: u32,
@@ -232,6 +250,14 @@ pub(crate) struct ControlCoordinator<H, P, F> {
     /// touch a field we never measured.)
     power_limits_baseline: Option<(u8, u8, u8)>,
     power_limits_dirty: bool,
+    /// True only after this coordinator has successfully changed fan
+    /// control. A read-only session must never write `{0,0}` on shutdown.
+    fan_control_dirty: bool,
+    /// Thermal mode has no reliable readback, so restore it only when this
+    /// session actually wrote it.
+    thermal_mode_dirty: bool,
+    fan_curve_path: Option<std::path::PathBuf>,
+    last_saved_fan_curve: Arc<RwLock<Option<FanCurve>>>,
 }
 
 impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Send + 'static>
@@ -247,14 +273,21 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         let desired = Arc::new(RwLock::new(DesiredState::default()));
         // 0x21 readback at start: populates ObservedState (Verified, AR-10)
         // AND is the shutdown restore point if this session writes 0x22.
-        let gpu_policy_startup = cfg
-            .hp
-            .as_ref()
-            .and_then(|hp| hp.gpu_platform_policy().ok());
+        let gpu_policy_startup = cfg.hp.as_ref().and_then(|hp| hp.gpu_platform_policy().ok());
         let observed = Arc::new(RwLock::new(Self::initial_observed(
             &cfg.ppm,
             gpu_policy_startup,
         )));
+        let last_saved_fan_curve = Arc::new(RwLock::new(match cfg.fan_curve_path.as_deref() {
+            Some(path) => match crate::persistence::load_fan_curve(path) {
+                Ok(curve) => curve,
+                Err(e) => {
+                    warn!(path = %path.display(), %e, "saved fan curve ignored");
+                    None
+                }
+            },
+            None => None,
+        }));
         let caps = Arc::new(cfg.caps);
         let handle = ControlHandle {
             tx,
@@ -262,6 +295,7 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             caps: Arc::clone(&caps),
             desired: Arc::clone(&desired),
             observed: Arc::clone(&observed),
+            last_saved_fan_curve: Arc::clone(&last_saved_fan_curve),
         };
         let coord = Self {
             rx,
@@ -271,6 +305,7 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             feed: cfg.feed,
             journal,
             safety: SafetySupervisor::new(),
+            fan_curve: FanCurveController::new(),
             keepalive: KeepAliveService::with_period(cfg.keepalive_period),
             profiles: cfg.profiles,
             verify_polls: cfg.verify_polls,
@@ -282,6 +317,10 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             gpu_policy_dirty: false,
             power_limits_baseline: None,
             power_limits_dirty: false,
+            fan_control_dirty: false,
+            thermal_mode_dirty: false,
+            fan_curve_path: cfg.fan_curve_path,
+            last_saved_fan_curve,
         };
         std::thread::Builder::new()
             .name("control-coord".into())
@@ -411,8 +450,10 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
     fn compute_wait(&self) -> Duration {
         let now = Instant::now();
         let observed = self.observed();
-        let fan_held = matches!(observed.fan_mode.value(), Some(FanMode::Manual(_)))
-            || matches!(observed.max_fan.value(), Some(true))
+        let fan_held = matches!(
+            observed.fan_mode.value(),
+            Some(FanMode::Manual(_) | FanMode::Curve(_))
+        ) || matches!(observed.max_fan.value(), Some(true))
             || self.safety.override_active();
         let mut wait = self.keepalive.until_due(now, IDLE_WAIT);
         if fan_held {
@@ -427,6 +468,8 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         let observed = self.observed();
         if let Some(action) = self.safety.evaluate(&self.feed, &observed, now) {
             self.run_safety_action(action);
+        } else if !self.safety.override_active() {
+            self.run_fan_curve(now);
         }
         if self.keepalive.is_due(now) {
             self.run_heartbeat(now);
@@ -466,9 +509,9 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         //    rejected intent (AR-11).
         let observed = self.observed();
         for step_cmd in &plan {
-            if let Err(error) =
-                self.safety
-                    .validate(step_cmd, &self.caps, &self.feed, &observed)
+            if let Err(error) = self
+                .safety
+                .validate(step_cmd, &self.caps, &self.feed, &observed)
             {
                 let outcome = ControlOutcome {
                     receipt,
@@ -518,10 +561,7 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         if matches!(status, ControlStatus::Applied { .. })
             && let ControlCommand::ApplyProfile { profile } = &cmd
         {
-            self.desired
-                .write()
-                .expect("desired poisoned")
-                .profile = Some(profile.clone());
+            self.desired.write().expect("desired poisoned").profile = Some(profile.clone());
         }
 
         // 4. Reschedule keep-alive against the new observed state.
@@ -577,9 +617,12 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             plan.push(ControlCommand::SetPowerLimits(l));
         }
         if let Some(patch) = p.gpu_policy {
-            let hp = self.hp.as_ref().ok_or_else(|| ControlError::BackendUnavailable {
-                what: "HP platform (0x21 merge source)".into(),
-            })?;
+            let hp = self
+                .hp
+                .as_ref()
+                .ok_or_else(|| ControlError::BackendUnavailable {
+                    what: "HP platform (0x21 merge source)".into(),
+                })?;
             let current = hp.gpu_platform_policy().map_err(map_hp_error)?;
             plan.push(ControlCommand::SetGpuPlatformPolicy(patch.apply(current)));
         }
@@ -640,6 +683,7 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                         at: Instant::now(),
                     };
                 });
+                self.thermal_mode_dirty = true;
                 steps.push(StepOutcome {
                     step: "set_thermal_mode".into(),
                     backend: "hp-wmi 0x1A".into(),
@@ -653,12 +697,7 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 }
             }
             Err(e) => {
-                steps.push(failed_step(
-                    "set_thermal_mode",
-                    "hp-wmi 0x1A",
-                    &e,
-                    before,
-                ));
+                steps.push(failed_step("set_thermal_mode", "hp-wmi 0x1A", &e, before));
                 ControlStatus::Rejected {
                     error: map_hp_error(e),
                 }
@@ -686,23 +725,28 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 // §27 restore sequence: manual → 0x2E{0,0}; max → 0x27 off;
                 // unknown → both (fail closed toward auto).
                 let mut ok = true;
+                let mut wrote_any = false;
                 if !matches!(current.fan_mode.value(), Some(FanMode::FirmwareAuto)) {
-                    ok &= Self::fan_write(
+                    let wrote = Self::fan_write(
                         steps,
                         "fan->auto (0x2E {0,0})",
                         "hp-wmi 0x2E",
                         &before,
                         || hp.set_fan_levels(FanLevels::AUTO),
                     );
+                    ok &= wrote;
+                    wrote_any |= wrote;
                 }
                 if !matches!(current.max_fan.value(), Some(false)) {
-                    ok &= Self::fan_write(
+                    let wrote = Self::fan_write(
                         steps,
                         "max-fan off (0x27 0)",
                         "hp-wmi 0x27",
                         &before,
                         || hp.set_max_fan(false),
                     );
+                    ok &= wrote;
+                    wrote_any |= wrote;
                 }
                 if ok {
                     self.set_observed(|o| {
@@ -715,33 +759,34 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                             at: Instant::now(),
                         };
                     });
+                    self.fan_curve.clear();
+                    self.fan_control_dirty = false;
                     self.safety.note_user_fan_mode(FanMode::FirmwareAuto);
                     ControlStatus::Applied {
                         verification: Verification::Skipped, // firmware retakes control
                     }
                 } else {
+                    // A partial release still changed hardware and must be
+                    // attempted again during shutdown/fail-closed handling.
+                    self.fan_control_dirty |= wrote_any;
                     ControlStatus::Partial
                 }
             }
             FanMode::Max => {
-                // Manual → Max goes through auto first (§27 priority).
-                if matches!(current.fan_mode.value(), Some(FanMode::Manual(_)))
-                    && !Self::fan_write(
-                        steps,
-                        "manual->auto before max (0x2E {0,0})",
-                        "hp-wmi 0x2E",
-                        &before,
-                        || hp.set_fan_levels(FanLevels::AUTO),
-                    )
-                {
-                    return ControlStatus::Partial;
-                }
+                // Max fan is an overlay on the current 0x2E target. Do not
+                // reset that target to {0,0} first: on this firmware that
+                // hands control back to the BIOS/EC and causes a visible
+                // fan dip before 0x27 can ramp the fans back up. This is
+                // also how OmenSuperHub switches to its max mode.
                 if Self::fan_write(steps, "max-fan on (0x27 1)", "hp-wmi 0x27", &before, || {
                     hp.set_max_fan(true)
                 }) {
+                    self.fan_control_dirty = true;
                     self.set_observed(|o| {
+                        // Preserve the logical max mode while leaving the
+                        // underlying manual/curve target intact.
                         o.fan_mode = ObservedValue::TrustedWrite {
-                            value: FanMode::FirmwareAuto,
+                            value: FanMode::Max,
                             at: Instant::now(),
                         };
                         o.max_fan = ObservedValue::TrustedWrite {
@@ -749,6 +794,7 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                             at: Instant::now(),
                         };
                     });
+                    self.fan_curve.clear();
                     self.safety.note_user_fan_mode(FanMode::Max);
                     ControlStatus::Applied {
                         verification: Verification::TrustedNoReadback, // 0x26 unreliable
@@ -758,6 +804,27 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 }
             }
             FanMode::Manual(target) => {
+                let released_max = matches!(current.max_fan.value(), Some(true));
+                if released_max
+                    && !Self::fan_write(
+                        steps,
+                        "max-fan off before manual",
+                        "hp-wmi 0x27",
+                        &before,
+                        || hp.set_max_fan(false),
+                    )
+                {
+                    return ControlStatus::Partial;
+                }
+                if released_max {
+                    self.set_observed(|o| {
+                        o.max_fan = ObservedValue::TrustedWrite {
+                            value: false,
+                            at: Instant::now(),
+                        };
+                    });
+                    self.fan_control_dirty = true;
+                }
                 if !Self::fan_write(
                     steps,
                     "set manual fan levels",
@@ -765,12 +832,16 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                     &before,
                     || hp.set_fan_levels(target),
                 ) {
+                    if released_max {
+                        self.restore_firmware_auto(JournalOrigin::Safety);
+                    }
                     return ControlStatus::Rejected {
                         error: ControlError::FirmwareRejected {
                             detail: "0x2E write failed".into(),
                         },
                     };
                 }
+                self.fan_control_dirty = true;
                 // Delayed readback verification (0x2D, 1 Hz — §38 binds).
                 let verification = self.verify_fan_levels(hp, target);
                 let ok = matches!(verification, Verification::Verified);
@@ -794,6 +865,7 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                         at: Instant::now(),
                     };
                 });
+                self.fan_curve.clear();
                 self.safety.note_user_fan_mode(FanMode::Manual(target));
                 let after = format!("fan={verification:?}");
                 steps.push(StepOutcome {
@@ -812,6 +884,87 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                     ControlStatus::Applied {
                         verification: verification.clone(),
                     }
+                }
+            }
+            FanMode::Curve(curve) => {
+                let now = Instant::now();
+                let Some(temp_c) =
+                    effective_temperature(self.feed.pkg_temp_c(), self.feed.gpu_temp_c(), now)
+                else {
+                    return ControlStatus::Rejected {
+                        error: ControlError::UnsafeRequest {
+                            reason: "no fresh CPU temperature sample (≤5s); refusing blind fan curve control".into(),
+                        },
+                    };
+                };
+                let target = curve.target_at(temp_c);
+                let released_max = matches!(current.max_fan.value(), Some(true));
+                if released_max
+                    && !Self::fan_write(
+                        steps,
+                        "max-fan off before curve",
+                        "hp-wmi 0x27",
+                        &before,
+                        || hp.set_max_fan(false),
+                    )
+                {
+                    return ControlStatus::Partial;
+                }
+                if released_max {
+                    self.set_observed(|o| {
+                        o.max_fan = ObservedValue::TrustedWrite {
+                            value: false,
+                            at: Instant::now(),
+                        };
+                    });
+                    self.fan_control_dirty = true;
+                }
+                if !Self::fan_write(
+                    steps,
+                    "set fan curve target",
+                    "hp-wmi 0x2E",
+                    &before,
+                    || hp.set_fan_levels(target),
+                ) {
+                    self.fan_curve.record_failure(now);
+                    self.restore_firmware_auto(JournalOrigin::Safety);
+                    return ControlStatus::Rejected {
+                        error: ControlError::FirmwareRejected {
+                            detail: "0x2E curve write failed".into(),
+                        },
+                    };
+                }
+                self.fan_control_dirty = true;
+                // The curve itself has no firmware readback. The following
+                // telemetry tick is the live evidence for the resulting RPM;
+                // do not block the coordinator for the eight-second manual
+                // readback loop on every curve activation/update.
+                self.set_observed(|o| {
+                    o.fan_mode = ObservedValue::TrustedWrite {
+                        value: FanMode::Curve(curve),
+                        at: now,
+                    };
+                    o.max_fan = ObservedValue::TrustedWrite {
+                        value: false,
+                        at: now,
+                    };
+                });
+                self.fan_curve.reset(target, temp_c, now);
+                self.remember_fan_curve(curve);
+                self.safety.note_user_fan_mode(FanMode::Curve(curve));
+                steps.push(StepOutcome {
+                    step: "activate fan curve".into(),
+                    backend: "phelper curve + hp-wmi 0x2E".into(),
+                    firmware_return: None,
+                    before: Some(before),
+                    after: Some(format!(
+                        "temperature={temp_c:.1}C target_cpu={} target_gpu={} (x100 RPM)",
+                        target.cpu, target.gpu
+                    )),
+                    verification: Verification::TrustedNoReadback,
+                });
+                ControlStatus::Applied {
+                    verification: Verification::TrustedNoReadback,
                 }
             }
         }
@@ -877,7 +1030,11 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
 
     /// 0x22 write with 0x21 readback verification (a real readback exists
     /// here, unlike 0x1A/0x27 — so this path is Verified, not TrustedWrite).
-    fn exec_gpu_policy(&mut self, p: GpuPlatformPolicy, steps: &mut Vec<StepOutcome>) -> ControlStatus {
+    fn exec_gpu_policy(
+        &mut self,
+        p: GpuPlatformPolicy,
+        steps: &mut Vec<StepOutcome>,
+    ) -> ControlStatus {
         let Some(hp) = &self.hp else {
             return ControlStatus::Rejected {
                 error: ControlError::BackendUnavailable {
@@ -1026,7 +1183,11 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
     /// one). The baseline for shutdown-restore is captured from the feed
     /// right before our FIRST write — the firmware DEFAULT write
     /// ({0,0,FF,FF}) was observed not to take effect promptly on 8BAB.
-    fn exec_power_limits(&mut self, l: CpuPowerLimits, steps: &mut Vec<StepOutcome>) -> ControlStatus {
+    fn exec_power_limits(
+        &mut self,
+        l: CpuPowerLimits,
+        steps: &mut Vec<StepOutcome>,
+    ) -> ControlStatus {
         let Some(hp) = &self.hp else {
             return ControlStatus::Rejected {
                 error: ControlError::BackendUnavailable {
@@ -1050,11 +1211,7 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         if self.power_limits_baseline.is_none()
             && let Some((p1, p2, _)) = self.feed.power_limits_w()
         {
-            let p4 = self
-                .feed
-                .pl4_w()
-                .map(|(v, _)| v.round() as u8)
-                .unwrap_or(0);
+            let p4 = self.feed.pl4_w().map(|(v, _)| v.round() as u8).unwrap_or(0);
             self.power_limits_baseline = Some((p1.round() as u8, p2.round() as u8, p4));
         }
         let written_at = Instant::now();
@@ -1198,10 +1355,7 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                                 Verification::Verified
                             } else {
                                 Verification::Failed {
-                                    expected: format!(
-                                        "ac={:?} dc={:?}",
-                                        p.epp_ac, p.epp_dc
-                                    ),
+                                    expected: format!("ac={:?} dc={:?}", p.epp_ac, p.epp_dc),
                                     actual: format!("ac={ac} dc={dc}"),
                                 }
                             }
@@ -1226,7 +1380,12 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 }
                 Err(e) => {
                     failed = true;
-                    steps.push(platform_failed_step("write EPP", "powrprof PERFEPP", &e, before));
+                    steps.push(platform_failed_step(
+                        "write EPP",
+                        "powrprof PERFEPP",
+                        &e,
+                        before,
+                    ));
                 }
             }
         }
@@ -1259,10 +1418,7 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                                 Verification::Verified
                             } else {
                                 Verification::Failed {
-                                    expected: format!(
-                                        "ac={:?} dc={:?}",
-                                        p.epp1_ac, p.epp1_dc
-                                    ),
+                                    expected: format!("ac={:?} dc={:?}", p.epp1_ac, p.epp1_dc),
                                     actual: format!("ac={ac} dc={dc}"),
                                 }
                             }
@@ -1303,7 +1459,10 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 .read_max_freq_mhz()
                 .map(|(ac, dc)| format!("maxfreq ac={ac} dc={dc}"))
                 .unwrap_or_else(|e| format!("maxfreq unreadable: {e}"));
-            match self.ppm.write_max_freq_mhz(p.max_freq_mhz_ac, p.max_freq_mhz_dc) {
+            match self
+                .ppm
+                .write_max_freq_mhz(p.max_freq_mhz_ac, p.max_freq_mhz_dc)
+            {
                 Ok(()) => {
                     let verification = match self.ppm.read_max_freq_mhz() {
                         Ok((ac, dc)) => {
@@ -1417,6 +1576,74 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
 
     // ------------------------------------------------------------ safety
 
+    /// Evaluate the active software curve on the coordinator thread. This is
+    /// intentionally separate from `exec_fan_mode`: a curve tick is an
+    /// internal policy update, not a new user command, and must not block the
+    /// single writer on the eight-second manual readback verification loop.
+    fn run_fan_curve(&mut self, now: Instant) {
+        let Some(FanMode::Curve(curve)) = self.observed().fan_mode.value().copied() else {
+            self.fan_curve.clear();
+            return;
+        };
+        let Some((target, temp_c)) =
+            self.fan_curve
+                .next_target(&curve, self.feed.pkg_temp_c(), self.feed.gpu_temp_c(), now)
+        else {
+            return;
+        };
+        let Some(hp) = &self.hp else {
+            self.fan_curve.record_failure(now);
+            self.restore_firmware_auto(JournalOrigin::Safety);
+            return;
+        };
+        let before = format!(
+            "curve_temp={temp_c:.1}C target={:?}",
+            self.fan_curve.last_target()
+        );
+        let mut steps = Vec::new();
+        if !Self::fan_write(
+            &mut steps,
+            "update fan curve target",
+            "hp-wmi 0x2E",
+            &before,
+            || hp.set_fan_levels(target),
+        ) {
+            self.fan_curve.record_failure(now);
+            self.journal(
+                JournalOrigin::Safety,
+                &ControlOutcome {
+                    receipt: ControlReceipt(0),
+                    command: ControlCommand::SetFanMode(FanMode::Curve(curve)),
+                    status: ControlStatus::Rejected {
+                        error: ControlError::FirmwareRejected {
+                            detail: "0x2E curve update failed".into(),
+                        },
+                    },
+                    steps,
+                    duration: Duration::ZERO,
+                },
+            );
+            // A failed update means the application can no longer prove it
+            // is maintaining the selected curve. Return ownership to the
+            // firmware immediately instead of retrying a blind controller.
+            self.restore_firmware_auto(JournalOrigin::Safety);
+            return;
+        }
+        self.fan_curve.record_write(target, now);
+        self.journal(
+            JournalOrigin::Safety,
+            &ControlOutcome {
+                receipt: ControlReceipt(0),
+                command: ControlCommand::SetFanMode(FanMode::Curve(curve)),
+                status: ControlStatus::Applied {
+                    verification: Verification::TrustedNoReadback,
+                },
+                steps,
+                duration: Duration::ZERO,
+            },
+        );
+    }
+
     fn run_safety_action(&mut self, action: SafetyAction) {
         warn!(?action, "safety action");
         let started = Instant::now();
@@ -1424,19 +1651,22 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         match action {
             SafetyAction::ForceMaxFan => {
                 if let Some(hp) = &self.hp {
-                    let _ = Self::fan_write(
+                    let ok = Self::fan_write(
                         &mut steps,
                         "SAFETY max-fan on",
                         "hp-wmi 0x27",
                         "thermal override",
                         || hp.set_max_fan(true),
                     );
-                    self.set_observed(|o| {
-                        o.max_fan = ObservedValue::TrustedWrite {
-                            value: true,
-                            at: Instant::now(),
-                        };
-                    });
+                    if ok {
+                        self.fan_control_dirty = true;
+                        self.set_observed(|o| {
+                            o.max_fan = ObservedValue::TrustedWrite {
+                                value: true,
+                                at: Instant::now(),
+                            };
+                        });
+                    }
                 }
                 self.journal(
                     JournalOrigin::Safety,
@@ -1535,6 +1765,10 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                     },
                     ReAssert::FanLevels => match observed.fan_mode.value() {
                         Some(FanMode::Manual(levels)) => hp.set_fan_levels(*levels),
+                        Some(FanMode::Curve(_)) => self
+                            .fan_curve
+                            .last_target()
+                            .map_or(Ok(()), |levels| hp.set_fan_levels(levels)),
                         _ => Ok(()),
                     },
                     ReAssert::MaxFan => hp.set_max_fan(true),
@@ -1580,45 +1814,75 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
 
     // ------------------------------------------------------------ restore
 
-    /// AR-12 restore: 0x2E{0,0} + 0x27 off + thermal Balanced (+ the startup
-    /// GPU policy when this session changed it). Best-effort — every step is
-    /// attempted even if earlier ones fail; the firmware clawback (~120 s)
-    /// is the ultimate backstop regardless.
+    /// AR-12 restore: return only the domains this session actually changed
+    /// to their safe baseline. In particular, a read-only session must not
+    /// write 0x2E{0,0}; on 8BAB that releases the fan to cold idle fan-stop
+    /// and was the source of the startup-at-zero symptom.
+    ///
+    /// Every requested step is best-effort and attempted even if an earlier
+    /// step fails; the firmware clawback (~120 s) remains the ultimate
+    /// backstop for a process that disappears without a graceful shutdown.
     /// EPP/max-freq/boost are deliberately NOT restored: they are
     /// Windows-native settings with no firmware-session semantics.
     fn restore_firmware_auto(&mut self, origin: JournalOrigin) {
+        let restore_fan = self.fan_control_dirty;
+        let restore_thermal = self.thermal_mode_dirty;
+        let restore_gpu = self.gpu_policy_dirty;
+        let restore_power = self.power_limits_dirty;
+        if !restore_fan && !restore_thermal && !restore_gpu && !restore_power {
+            return;
+        }
+
         let started = Instant::now();
         let mut steps = Vec::new();
+        let mut fan_auto_ok = !restore_fan;
+        let mut max_fan_off_ok = !restore_fan;
+        let mut thermal_ok = !restore_thermal;
+        let mut gpu_ok = !restore_gpu;
+        let mut power_ok = !restore_power;
+
         if let Some(hp) = &self.hp {
-            let _ = Self::fan_write(&mut steps, "restore fan auto", "hp-wmi 0x2E", "restore", || {
-                hp.set_fan_levels(FanLevels::AUTO)
-            });
-            let _ = Self::fan_write(&mut steps, "restore max-fan off", "hp-wmi 0x27", "restore", || {
-                hp.set_max_fan(false)
-            });
-            if self.gpu_policy_dirty
-                && let Some(startup) = self.gpu_policy_startup
-            {
+            if restore_fan {
+                fan_auto_ok = Self::fan_write(
+                    &mut steps,
+                    "restore fan auto",
+                    "hp-wmi 0x2E",
+                    "restore",
+                    || hp.set_fan_levels(FanLevels::AUTO),
+                );
+                max_fan_off_ok = Self::fan_write(
+                    &mut steps,
+                    "restore max-fan off",
+                    "hp-wmi 0x27",
+                    "restore",
+                    || hp.set_max_fan(false),
+                );
+            }
+            if restore_gpu && let Some(startup) = self.gpu_policy_startup {
                 match hp.set_gpu_platform_policy(startup) {
-                    Ok(()) => steps.push(StepOutcome {
-                        step: "restore gpu policy (startup value)".into(),
-                        backend: "hp-wmi 0x22".into(),
-                        firmware_return: Some("rc=0".into()),
-                        before: Some("restore".into()),
-                        after: None,
-                        verification: Verification::TrustedNoReadback,
-                    }),
-                    Err(e) => steps.push(failed_step(
-                        "restore gpu policy (startup value)",
-                        "hp-wmi 0x22",
-                        &e,
-                        "restore".into(),
-                    )),
+                    Ok(()) => {
+                        gpu_ok = true;
+                        steps.push(StepOutcome {
+                            step: "restore gpu policy (startup value)".into(),
+                            backend: "hp-wmi 0x22".into(),
+                            firmware_return: Some("rc=0".into()),
+                            before: Some("restore".into()),
+                            after: None,
+                            verification: Verification::TrustedNoReadback,
+                        });
+                    }
+                    Err(e) => {
+                        gpu_ok = false;
+                        steps.push(failed_step(
+                            "restore gpu policy (startup value)",
+                            "hp-wmi 0x22",
+                            &e,
+                            "restore".into(),
+                        ));
+                    }
                 }
             }
-            if self.power_limits_dirty
-                && let Some((b1, b2, b4)) = self.power_limits_baseline
-            {
+            if restore_power && let Some((b1, b2, b4)) = self.power_limits_baseline {
                 let baseline = CpuPowerLimits {
                     pl1_w: b1,
                     pl2_w: b2,
@@ -1626,57 +1890,80 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                     cpu_gpu_concurrent_w: 0,
                 };
                 match hp.set_power_limits(baseline) {
-                    Ok(()) => steps.push(StepOutcome {
-                        step: "restore power limits (captured baseline)".into(),
-                        backend: "hp-wmi 0x29".into(),
-                        firmware_return: Some("rc=0".into()),
-                        before: Some("restore".into()),
-                        after: Some(if b4 != 0 {
-                            format!("pl1={b1}W pl2={b2}W pl4={b4}W")
-                        } else {
-                            format!("pl1={b1}W pl2={b2}W (pl4 untouched)")
-                        }),
-                        verification: Verification::TrustedNoReadback,
-                    }),
-                    Err(e) => steps.push(failed_step(
-                        "restore power limits (captured baseline)",
-                        "hp-wmi 0x29",
-                        &e,
-                        "restore".into(),
-                    )),
+                    Ok(()) => {
+                        power_ok = true;
+                        steps.push(StepOutcome {
+                            step: "restore power limits (captured baseline)".into(),
+                            backend: "hp-wmi 0x29".into(),
+                            firmware_return: Some("rc=0".into()),
+                            before: Some("restore".into()),
+                            after: Some(if b4 != 0 {
+                                format!("pl1={b1}W pl2={b2}W pl4={b4}W")
+                            } else {
+                                format!("pl1={b1}W pl2={b2}W (pl4 untouched)")
+                            }),
+                            verification: Verification::TrustedNoReadback,
+                        });
+                    }
+                    Err(e) => {
+                        power_ok = false;
+                        steps.push(failed_step(
+                            "restore power limits (captured baseline)",
+                            "hp-wmi 0x29",
+                            &e,
+                            "restore".into(),
+                        ));
+                    }
                 }
             }
-            match hp.set_thermal_mode(ThermalMode::Balanced) {
-                Ok(()) => steps.push(StepOutcome {
-                    step: "restore thermal balanced".into(),
-                    backend: "hp-wmi 0x1A".into(),
-                    firmware_return: Some("rc=0".into()),
-                    before: Some("restore".into()),
-                    after: None,
-                    verification: Verification::TrustedNoReadback,
-                }),
-                Err(e) => steps.push(failed_step(
-                    "restore thermal balanced",
-                    "hp-wmi 0x1A",
-                    &e,
-                    "restore".into(),
-                )),
+            if restore_thermal {
+                match hp.set_thermal_mode(ThermalMode::Balanced) {
+                    Ok(()) => {
+                        thermal_ok = true;
+                        steps.push(StepOutcome {
+                            step: "restore thermal balanced".into(),
+                            backend: "hp-wmi 0x1A".into(),
+                            firmware_return: Some("rc=0".into()),
+                            before: Some("restore".into()),
+                            after: None,
+                            verification: Verification::TrustedNoReadback,
+                        });
+                    }
+                    Err(e) => {
+                        thermal_ok = false;
+                        steps.push(failed_step(
+                            "restore thermal balanced",
+                            "hp-wmi 0x1A",
+                            &e,
+                            "restore".into(),
+                        ));
+                    }
+                }
             }
         }
+
+        let fan_restored = !restore_fan || (fan_auto_ok && max_fan_off_ok);
         self.set_observed(|o| {
-            o.fan_mode = ObservedValue::TrustedWrite {
-                value: FanMode::FirmwareAuto,
-                at: Instant::now(),
-            };
-            o.max_fan = ObservedValue::TrustedWrite {
-                value: false,
-                at: Instant::now(),
-            };
-            o.thermal_mode = ObservedValue::TrustedWrite {
-                value: ThermalMode::Balanced,
-                at: Instant::now(),
-            };
-            if self.gpu_policy_dirty
+            if restore_fan && fan_auto_ok {
+                o.fan_mode = ObservedValue::TrustedWrite {
+                    value: FanMode::FirmwareAuto,
+                    at: Instant::now(),
+                };
+            }
+            if restore_fan && max_fan_off_ok {
+                o.max_fan = ObservedValue::TrustedWrite {
+                    value: false,
+                    at: Instant::now(),
+                };
+            }
+            if restore_thermal && thermal_ok {
+                o.thermal_mode = ObservedValue::TrustedWrite {
+                    value: ThermalMode::Balanced,
+                    at: Instant::now(),
+                };
+            }
+            if restore_gpu
+                && gpu_ok
                 && let Some(startup) = self.gpu_policy_startup
             {
                 o.gpu_platform_policy = ObservedValue::TrustedWrite {
@@ -1684,7 +1971,8 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                     at: Instant::now(),
                 };
             }
-            if self.power_limits_dirty
+            if restore_power
+                && power_ok
                 && let Some((b1, b2, b4)) = self.power_limits_baseline
             {
                 o.power_limits = ObservedValue::TrustedWrite {
@@ -1698,18 +1986,37 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 };
             }
         });
-        self.gpu_policy_dirty = false;
-        self.power_limits_dirty = false;
-        self.safety.note_user_fan_mode(FanMode::FirmwareAuto);
+
+        if fan_restored {
+            self.fan_control_dirty = false;
+            self.fan_curve.clear();
+            if restore_fan {
+                self.safety.note_user_fan_mode(FanMode::FirmwareAuto);
+            }
+        }
+        if thermal_ok {
+            self.thermal_mode_dirty = false;
+        }
+        if gpu_ok {
+            self.gpu_policy_dirty = false;
+        }
+        if power_ok {
+            self.power_limits_dirty = false;
+        }
         self.keepalive
             .reschedule_tracked(&self.tracked_set(), Instant::now());
+        let restored = fan_restored && thermal_ok && gpu_ok && power_ok;
         self.journal(
             origin,
             &ControlOutcome {
                 receipt: ControlReceipt(0),
                 command: ControlCommand::SetFanMode(FanMode::FirmwareAuto),
-                status: ControlStatus::Applied {
-                    verification: Verification::Skipped,
+                status: if restored {
+                    ControlStatus::Applied {
+                        verification: Verification::Skipped,
+                    }
+                } else {
+                    ControlStatus::Partial
                 },
                 steps,
                 duration: started.elapsed(),
@@ -1725,6 +2032,21 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
 
     fn set_observed(&self, f: impl FnOnce(&mut ObservedState)) {
         f(&mut self.observed.write().expect("observed poisoned"));
+    }
+
+    fn remember_fan_curve(&self, curve: FanCurve) {
+        *self
+            .last_saved_fan_curve
+            .write()
+            .expect("saved fan curve poisoned") = Some(curve);
+        if let Some(path) = &self.fan_curve_path
+            && let Err(e) = crate::persistence::save_fan_curve(path, &curve)
+        {
+            // Disk persistence must never turn a successful hardware write
+            // into a failed control command. The in-memory copy remains
+            // available to the UI for this session.
+            warn!(path = %path.display(), %e, "could not persist fan curve");
+        }
     }
 
     fn journal(&mut self, origin: JournalOrigin, outcome: &ControlOutcome) {
@@ -1824,6 +2146,12 @@ impl ThermalFeed for SnapshotFeed {
         Some((s.value.as_f64()?, s.timestamp))
     }
 
+    fn gpu_temp_c(&self) -> Option<(f64, Instant)> {
+        let snap = self.telemetry.snapshot();
+        let s = snap.samples.get(&ids::GPU_TEMP_C)?;
+        Some((s.value.as_f64()?, s.timestamp))
+    }
+
     fn fan_levels(&self) -> Option<(FanLevels, Instant)> {
         let snap = self.telemetry.snapshot();
         let cpu = snap.samples.get(&ids::FAN_CPU_RPM)?;
@@ -1857,9 +2185,9 @@ mod tests {
     use phelper_domain::error::PlatformError;
     use phelper_domain::hp::{FanTable, SystemDesignData};
     use phelper_domain::identity::{CpuIdentity, DeviceIdentity};
-    use phelper_domain::profile::{GpuPolicyPatch, PerformanceProfile};
-    use phelper_domain::policy::{BoostPolicy, GpuPlatformPolicy, MuxMode};
+    use phelper_domain::policy::{BoostPolicy, FanCurve, GpuPlatformPolicy, MuxMode};
     use phelper_domain::ports::{HpControl, HpPlatform};
+    use phelper_domain::profile::{GpuPolicyPatch, PerformanceProfile};
     use std::sync::Mutex;
 
     // ------------------------------------------------------------ mocks
@@ -2169,6 +2497,7 @@ mod tests {
         assert_eq!(o2.receipt, ControlReceipt(2));
         assert_eq!(o3.receipt, ControlReceipt(3));
         assert!(matches!(o1.status, ControlStatus::Applied { .. }));
+        assert_eq!(rig.handle.observed().fan_mode.value(), Some(&FanMode::Max));
         rig.handle.shutdown();
     }
 
@@ -2198,6 +2527,87 @@ mod tests {
         let j = rig.journal_text();
         assert!(j.contains("\"origin\":\"user\""));
         assert!(j.contains("\"before\":"));
+        rig.handle.shutdown();
+    }
+
+    #[test]
+    fn max_fan_preserves_manual_target_without_auto_reset() {
+        let rig = TestRig::start("max-preserve-manual");
+        let target = FanLevels::new(30, 30);
+        rig.hp.state().readback_script = vec![target];
+        let manual = block(
+            &rig.handle,
+            ControlCommand::SetFanMode(FanMode::Manual(target)),
+        );
+        assert!(matches!(
+            manual.status,
+            ControlStatus::Applied {
+                verification: Verification::Verified
+            }
+        ));
+        let fan_writes_before_max = rig.hp.state().fan_writes.len();
+
+        let max = block(&rig.handle, ControlCommand::SetFanMode(FanMode::Max));
+        assert!(matches!(
+            max.status,
+            ControlStatus::Applied {
+                verification: Verification::TrustedNoReadback
+            }
+        ));
+        let state = rig.hp.state();
+        assert_eq!(state.fan_writes.len(), fan_writes_before_max);
+        assert_eq!(state.max_fan_writes, vec![true]);
+        assert_eq!(rig.handle.observed().fan_mode.value(), Some(&FanMode::Max));
+        rig.handle.shutdown();
+    }
+
+    #[test]
+    fn max_fan_switches_directly_to_manual() {
+        let rig = TestRig::start("max-to-manual");
+        block(&rig.handle, ControlCommand::SetFanMode(FanMode::Max));
+
+        let target = FanLevels::new(30, 30);
+        rig.hp.state().readback_script = vec![target];
+        let outcome = block(
+            &rig.handle,
+            ControlCommand::SetFanMode(FanMode::Manual(target)),
+        );
+
+        assert!(matches!(
+            outcome.status,
+            ControlStatus::Applied {
+                verification: Verification::Verified
+            }
+        ));
+        assert_eq!(rig.hp.state().max_fan_writes, vec![true, false]);
+        assert_eq!(
+            rig.handle.observed().fan_mode.value(),
+            Some(&FanMode::Manual(target))
+        );
+        rig.handle.shutdown();
+    }
+
+    #[test]
+    fn fan_curve_activation_writes_one_initial_target_without_blocking_readback() {
+        let rig = TestRig::start("curve-start");
+        let curve = FanCurve::balanced();
+        let expected = curve.target_at(70.0);
+        let o = block(
+            &rig.handle,
+            ControlCommand::SetFanMode(FanMode::Curve(curve)),
+        );
+        assert!(matches!(
+            o.status,
+            ControlStatus::Applied {
+                verification: Verification::TrustedNoReadback
+            }
+        ));
+        assert_eq!(rig.hp.state().fan_writes, vec![expected]);
+        assert_eq!(
+            rig.handle.observed().fan_mode.value(),
+            Some(&FanMode::Curve(curve))
+        );
+        assert_eq!(rig.handle.last_saved_fan_curve(), Some(curve));
         rig.handle.shutdown();
     }
 
@@ -2283,6 +2693,29 @@ mod tests {
     }
 
     #[test]
+    fn read_only_shutdown_does_not_touch_fan_or_thermal_registers() {
+        let rig = TestRig::start("read-only-shutdown");
+        rig.handle.shutdown();
+        let state = rig.hp.state();
+        assert!(
+            state.fan_writes.is_empty(),
+            "a session that never owned fan control must not write 0x2E"
+        );
+        assert!(
+            state.max_fan_writes.is_empty(),
+            "a session that never owned fan control must not write 0x27"
+        );
+        assert!(
+            state.thermal_writes.is_empty(),
+            "a session that never changed thermal mode must not restore it"
+        );
+        assert!(
+            !rig.journal_text().contains("\"origin\":\"shutdown\""),
+            "a no-op shutdown should not create a fake restore entry"
+        );
+    }
+
+    #[test]
     fn queue_full_reports_busy() {
         let rig = TestRig::start("busy");
         // Occupy the coordinator thread with a slow verification (5 polls
@@ -2290,14 +2723,17 @@ mod tests {
         rig.hp.state().readback_script = vec![FanLevels::new(10, 10)];
         let (r1, _rx1) = rig
             .handle
-            .dispatch(ControlCommand::SetFanMode(FanMode::Manual(
-                FanLevels::new(50, 50),
-            )))
+            .dispatch(ControlCommand::SetFanMode(FanMode::Manual(FanLevels::new(
+                50, 50,
+            ))))
             .unwrap();
         assert_eq!(r1, ControlReceipt(1));
         let mut busy = false;
         for _ in 0..(QUEUE_DEPTH + 4) {
-            match rig.handle.dispatch(ControlCommand::SetFanMode(FanMode::Max)) {
+            match rig
+                .handle
+                .dispatch(ControlCommand::SetFanMode(FanMode::Max))
+            {
                 Ok(_) => {}
                 Err(ControlError::Busy) => busy = true,
                 Err(e) => panic!("unexpected dispatch error: {e}"),
@@ -2560,10 +2996,8 @@ mod tests {
         with_link: bool,
         has_pl4: bool,
     ) -> (ControlHandle, MockHp) {
-        let dir = std::env::temp_dir().join(format!(
-            "phelper-coord-test-{tag}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("phelper-coord-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let journal_path = dir.join("journal.jsonl");
         let hp = MockHp::default();
@@ -2774,7 +3208,8 @@ mod tests {
             }
         }
 
-        let dir = std::env::temp_dir().join(format!("phelper-coord-test-hyst-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("phelper-coord-test-hyst-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let journal_path = dir.join("journal.jsonl");
         let temp = std::sync::Arc::new(Mutex::new(70.0_f64));
@@ -2825,6 +3260,72 @@ mod tests {
         assert_eq!(observed.max_fan.value(), Some(&false));
         let j = std::fs::read_to_string(&journal_path).unwrap_or_default();
         assert!(j.contains("SAFETY max-fan off"));
+        handle.shutdown();
+    }
+
+    #[test]
+    fn hysteresis_release_restores_max_user_mode() {
+        struct MutableFeed(std::sync::Arc<Mutex<f64>>);
+        impl ThermalFeed for MutableFeed {
+            fn pkg_temp_c(&self) -> Option<(f64, Instant)> {
+                Some((*self.0.lock().unwrap(), Instant::now()))
+            }
+            fn fan_levels(&self) -> Option<(FanLevels, Instant)> {
+                Some((FanLevels::new(20, 20), Instant::now()))
+            }
+            fn power_limits_w(&self) -> Option<(f64, f64, Instant)> {
+                Some((55.0, 130.0, Instant::now()))
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "phelper-coord-test-hyst-max-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let journal_path = dir.join("journal.jsonl");
+        let temp = std::sync::Arc::new(Mutex::new(70.0_f64));
+        let hp = MockHp::default();
+        let ppm = MockPpm(std::sync::Arc::new(Mutex::new((50, 50, 50, 50))));
+        let mut cfg = ControlConfig::new(
+            caps_full(),
+            test_identity("hyst-max"),
+            Some(hp.clone()),
+            ppm,
+            MutableFeed(std::sync::Arc::clone(&temp)),
+            journal_path,
+        );
+        cfg.verify_poll_interval = Duration::from_millis(5);
+        cfg.keepalive_period = Duration::from_millis(120);
+        cfg.safety_tick = Duration::from_millis(20);
+        let handle = ControlCoordinator::start(cfg).unwrap();
+
+        let o = block(&handle, ControlCommand::SetFanMode(FanMode::Max));
+        assert!(matches!(o.status, ControlStatus::Applied { .. }));
+        assert_eq!(handle.observed().fan_mode.value(), Some(&FanMode::Max));
+
+        *temp.lock().unwrap() = 92.0;
+        std::thread::sleep(Duration::from_millis(300));
+        *temp.lock().unwrap() = 80.0;
+        std::thread::sleep(Duration::from_millis(400));
+
+        let s = hp.state();
+        let writes = &s.max_fan_writes;
+        let first_on = writes.iter().position(|w| *w).expect("0x27-on missing");
+        let off = writes
+            .iter()
+            .enumerate()
+            .skip(first_on + 1)
+            .find_map(|(index, on)| (!*on).then_some(index))
+            .expect("release never wrote 0x27-off");
+        assert!(
+            writes.iter().skip(off + 1).any(|on| *on),
+            "release did not restore max fan after clearing the override: {writes:?}"
+        );
+        drop(s);
+        let observed = handle.observed();
+        assert_eq!(observed.fan_mode.value(), Some(&FanMode::Max));
+        assert_eq!(observed.max_fan.value(), Some(&true));
         handle.shutdown();
     }
 
@@ -2879,8 +3380,14 @@ mod tests {
         assert_eq!(s.thermal_writes, vec![ThermalMode::Performance]);
         assert_eq!(s.max_fan_writes, vec![true]);
         assert_eq!(s.gpu_policy_writes.len(), 1);
-        assert!(!s.gpu_policy_writes[0].ctgp, "patch must merge over live 0x21");
-        assert!(s.gpu_policy_writes[0].ppab, "unset fields preserve live 0x21");
+        assert!(
+            !s.gpu_policy_writes[0].ctgp,
+            "patch must merge over live 0x21"
+        );
+        assert!(
+            s.gpu_policy_writes[0].ppab,
+            "unset fields preserve live 0x21"
+        );
         drop(s);
         // Observed + desired stamped; profile name recorded.
         let observed = rig.handle.observed();
@@ -2931,7 +3438,10 @@ mod tests {
         );
         assert!(matches!(o.status, ControlStatus::Partial));
         let s = rig.hp.state();
-        assert!(s.max_fan_writes.is_empty(), "steps after the failure must not run");
+        assert!(
+            s.max_fan_writes.is_empty(),
+            "steps after the failure must not run"
+        );
         drop(s);
         assert_eq!(rig.handle.observed().epp_ac.value(), Some(&21));
         // Partial apply does NOT stamp the profile name.

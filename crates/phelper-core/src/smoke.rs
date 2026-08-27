@@ -159,14 +159,16 @@ pub fn hp_write_spike(cpu: u16, gpu: u16) -> Result<String, phelper_domain::erro
             // Tach hunts; accept within ±10 units (±1000 RPM). The target
             // MUST sit further than this from the baseline or the check is
             // vacuous (see fn docs).
-            if (l.cpu as i32 - cpu as i32).abs() <= 10
-                && (l.gpu as i32 - gpu as i32).abs() <= 10
-            {
+            if (l.cpu as i32 - cpu as i32).abs() <= 10 && (l.gpu as i32 - gpu as i32).abs() <= 10 {
                 converged = true;
                 break;
             }
         }
-        s.push_str(if converged { " CONVERGED\n" } else { " NOT-CONVERGED\n" });
+        s.push_str(if converged {
+            " CONVERGED\n"
+        } else {
+            " NOT-CONVERGED\n"
+        });
         Ok(s)
     })();
 
@@ -226,7 +228,11 @@ pub fn mchbar_probe() -> Result<String, phelper_domain::error::EngineError> {
     let base_sane = (0xF000_0000..=0xFFFF_FFFF).contains(&base);
     out.push_str(&format!(
         "A. MCHBAR base = 0x{base:08X} — {}\n",
-        if base_sane { "sane (PCI MMIO window)" } else { "UNEXPECTED" }
+        if base_sane {
+            "sane (PCI MMIO window)"
+        } else {
+            "UNEXPECTED"
+        }
     ));
 
     // --- B. 0x59A0 qword vs MSR 0x610
@@ -279,7 +285,9 @@ pub fn mchbar_probe() -> Result<String, phelper_domain::error::EngineError> {
         } else {
             ""
         };
-        out.push_str(&format!("  +0x{off:04X} = 0x{d:08X} → field={w:.1}W{tag}\n"));
+        out.push_str(&format!(
+            "  +0x{off:04X} = 0x{d:08X} → field={w:.1}W{tag}\n"
+        ));
     }
     if nonzero == 0 {
         out.push_str("  (entire sweep read 0/0xFFFFFFFF — no power registers visible here)\n");
@@ -546,7 +554,9 @@ pub fn power_limits_spike(
         } else if near(f1, b1) && near(f2, b2) {
             "VERDICT: NO EFFECT — 0x29 explicit write ignored by this firmware (fail closed)".into()
         } else {
-            format!("VERDICT: INCONCLUSIVE — final PL1={f1:.1}W PL2={f2:.1}W matches neither intent nor baseline")
+            format!(
+                "VERDICT: INCONCLUSIVE — final PL1={f1:.1}W PL2={f2:.1}W matches neither intent nor baseline"
+            )
         };
         s.push_str(&format!("\nfinal: PL1={f1:.1}W PL2={f2:.1}W\n{verdict}\n"));
         Ok(s)
@@ -567,7 +577,9 @@ pub fn power_limits_spike(
                 Err(e) => out.push_str(&format!("post-restore 0x610 read failed: {e}\n")),
             }
         }
-        Err(e) => out.push_str(&format!("RESTORE FAILED: {e} — power-cycle expectation: values may persist; check 0x610!\n")),
+        Err(e) => out.push_str(&format!(
+            "RESTORE FAILED: {e} — power-cycle expectation: values may persist; check 0x610!\n"
+        )),
     }
     Ok(out)
 }

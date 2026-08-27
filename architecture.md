@@ -325,13 +325,17 @@ firmware automatic control
 
 而不是让软件成为维持散热安全的唯一依赖。
 
+这条路径是故障恢复语义，不是用户可选的“自动曲线”：`0x2E {0,0}` 的
+含义是释放软件控制权，由 BIOS/EC 接管。正常运行时，应用只展示和使用
+软件风扇曲线、手动和全速三种控制方式。
+
 ---
 
 # 5. Top-Level Architecture
 
 ```mermaid
 flowchart TB
-    UI["GPUI Desktop<br/>Dashboard / Performance / Thermal / Monitor / Profiles / Settings"]
+    UI["GPUI Desktop<br/>Dashboard / Performance+Fan / Monitor / Profiles / Settings"]
     APP["Application Layer<br/>App State / Commands / Coordinators"]
     TELE["Telemetry Engine"]
     CTRL["Control Engine"]
@@ -660,8 +664,12 @@ Thermal Mode = Performance
 CPU EPP = 35
 Thermal Mode = Performance
 GPU cTGP = Unknown
-Fan Mode = Firmware Auto
+Fan Mode = Curve
+
 ```
+
+> `FirmwareAuto` 只作为退出、看门狗和写入失败时的内部恢复状态；它不是
+> 应用层的自动温控算法。
 
 ---
 
@@ -1323,45 +1331,48 @@ HP WMI
 Firmware Auto
 Thermal Profile
 Max Fan
-Manual Fan Level（仅 capability confirmed）
+Software Fan Curve / Manual Fan Level（仅 capability confirmed）
 ```
 
-第一版不应默认实现需要高速软件闭环的复杂 custom fan curve。
+软件曲线是应用层策略，不是新的固件协议。默认仍由 Firmware Auto 接管；
+只有用户显式选择曲线或手动模式时，应用才会暂停固件风扇曲线并通过
+ControlCoordinator 写入 0x2E。
 
 ---
 
 ## 27.1 Custom Fan Curve
 
-如果 reference platform 实测确认：
-
-```text
-WMI 0x2E
-```
-
-可以长期稳定更新 fan levels，并且 firmware 有可靠 auto/fallback 行为，则后续可实现：
+第一版已实现，边界固定为：
 
 ```text
 Telemetry
    ↓
 Fan Curve Evaluator
    ↓
-rate limiter
+temperature smoothing + 1 s rate limiter
    ↓
 ControlCoordinator
    ↓
 WMI Set Fan Level
 ```
 
-但必须满足：
+实现约束：
 
-- 调用频率受限；
-- 固件 fallback 行为已验证；
-- app shutdown 恢复 auto；
-- command failure 自动退回 auto；
-- telemetry stale 时不继续闭环；
-- 温度 emergency 时交回 firmware 或 max fan。
+- 固定 4 个温度节点，CPU/GPU 输出仍使用本板原生 100-RPM 单位；
+- 控制温度取新鲜 CPU/GPU 样本中的较高值，GPU 不可用时退回 CPU；
+- 温度平滑、每秒最多一次写入，避免风扇追着采样抖动；
+- 曲线节点禁止 0，0 只保留给显式 Firmware Auto；
+- 硬件 clamp、≤5 s 新鲜 CPU 温度门和现有能力门禁仍在写入前执行；
+- ≥90°C 进入现有 ForceMaxFan，≤85°C 才恢复原曲线；
+- 曲线更新写失败、传感器长期冻结或应用退出时恢复 Firmware Auto；
+- 退出恢复按会话所有权执行：本次没有成功接管风扇就不写 `0x2E {0,0}` / `0x27 off`；
+- 最近一次成功应用的曲线保存到 `state/fan_curve.toml`，仅用于下次编辑，启动不自动接管；
+- 0x2D 只能读当前转速，0x2F 是平台风扇表，固件没有可回读的温度→转速曲线；
+- keep-alive 继续重断言当前曲线目标，不新增第二写线程。
 
-前提状态更新：**内核已在 8BAB 同系板实测 0x2E 可控**（原"待 WMI manual fan 验证"前提已满足）；剩余门槛是 keep-alive 可靠性（§33.1）与温度应急交回固件——这两条不验证完，custom fan curve 不进稳定 UI。
+当前 UI 只在 Performance 页的“曲线设置”中显式展开；普通路径仍然是
+总体 Profile 或 Firmware Auto。长时间高负载、睡眠唤醒和强制终止场景的
+实机 soak 仍是曲线进入默认 Profile 前的验收项。
 
 ---
 
@@ -1934,51 +1945,42 @@ UI 组件不直接拥有 domain truth。
 ```text
 Dashboard
 
-Performance
-
-Thermals
+Performance（CPU + 风扇）
 
 Monitor
 
 Profiles
 
 Settings
-
-Diagnostics
 ```
+
+Diagnostics is an engineering/support surface, not a user-facing page. The
+normal control flow is Dashboard → Performance（CPU + fan） → Profiles, with
+Monitor and Settings retained as secondary pages.
 
 ---
 
 ## 41.2 Dashboard
 
-只放高价值实时信息：
+只放高价值实时信息，不展示数据来源、采样周期或底层寄存器：
 
 ```text
-CPU
-Temp
-Power
-Effective Clock
-Utilization
-
-GPU
-Temp
-Power
-Clock
-Utilization
-
-Fans
-
 Current Profile
 Current Thermal Mode
+Power / Battery
+CPU: Temp / Power / Utilization
+GPU: Temp / Power / Utilization
+Fans
+Optional frame metrics
 ```
 
-并提供短时趋势。
+并提供短时趋势；没有数据的可选区域不占位。
 
 ---
 
 ## 41.3 Performance
 
-主要控制：
+主要控制（CPU 与风扇合并）：
 
 ```text
 CPU Responsiveness (EPP)
@@ -1987,7 +1989,9 @@ CPU Frequency Ceiling
 
 GPU platform power mode
 
-Thermal Mode
+Fan control mode / fan curve / manual RPM
+
+Temperature and fan trends
 ```
 
 不要把几十个原始参数一次性暴露给用户。
@@ -1995,6 +1999,9 @@ Thermal Mode
 ---
 
 ## 41.4 Thermals
+
+已并入 Performance 页面。风扇模式、手动转速和温度/转速趋势不再作为
+独立导航页存在，但底层安全门控和风扇恢复逻辑保持不变。
 
 主要显示：
 
@@ -2005,31 +2012,28 @@ Fan control mode
 Max Fan
 ```
 
-如果 custom fan curve 尚未达到足够安全验证，不在 stable UI 中开放。
+曲线编辑器默认收起；显式选择“曲线设置”后才出现。默认 Profile 不自动
+切换到软件曲线，实机 soak 完成前也不把曲线写进内置 Profile。
 
 ---
 
 ## 41.5 Monitor
 
-面向高级用户：
+面向高级用户，只回答“机器现在在做什么”：
 
 ```text
-CPU package power
-CPU effective clock
-thermal status
-RAPL
-GPU P-state
-GPU throttle reason
-GPU clocks
-VRAM
-system memory
-disk/network
-frame metrics
+Current values
+Freshness / availability
 ```
 
+原始指标、数据源、周期和归属映射属于工程信息，不进入 Monitor 的用户
+主视图。
 ---
 
 ## 41.6 Diagnostics
+
+桌面端诊断页已移除；日志、报告和诊断数据仍保留在 core/CLI，供开发和
+故障排查使用。
 
 这里显示 implementation detail：
 
@@ -2192,6 +2196,7 @@ hardware/
 
 state/
     last-known-safe-state
+    fan_curve.toml
 ```
 
 不要生成一个巨大的 registry/config dump。
@@ -2515,7 +2520,7 @@ NVIDIA GPU authoritative driver API
 | OmenHwCtl | **无 LICENSE（保留所有权利）** | 只参考已发表的协议行为，不复制代码 |
 | Linux `hp-wmi` | **GPLv2**（内核） | 协议事实来源（命令表/insize/keep-alive），不复制代码 |
 | PawnIO 驱动 | **GPL + ioctl 使用例外** | 通过 DeviceIoControl 使用，不构成衍生作品 |
-| PawnIO 模块（IntelMSR.bin 等） | **LGPL** | 作为运行时**数据文件**分发并附带其 COPYING 文本；不嵌进二进制、不静态链接 |
+| PawnIO 模块（IntelMSR.bin 等） | **LGPL** | 模块字节与 COPYING 文本在构建期嵌入最终 exe；不静态链接 PawnIO 驱动，运行时仍通过 DeviceIoControl 加载签名模块 |
 
 ---
 
@@ -2759,7 +2764,7 @@ CLI control：status / epp / max-freq / boost / thermal / fan
   auto|max|manual，BEFORE/COMMAND/AFTER 证据输出，--hold 默认 120s
   心跳保持，Ctrl+C/Break 优雅恢复，--hold 0=发后即退（clawback 兜底）
 明确未做（留 M3+）：0x29 功率限制、0x22 GPU 策略写、MUX 写、profiles、
-  风扇曲线、EC、PERFEPP1
+  EC、PERFEPP1；software fan curve 后续已作为安全 MVP 落地
 ```
 
 实机验收（16 步 HIL，2026-08-25/26，提权终端）：EPP 写 25/45 与
@@ -2834,7 +2839,7 @@ victus 重实际化是 Performance 专属路径），keepalive 重断言留作�
 默认编译无 power-limits 子命令（unrecognized subcommand）。
 单元测试 69（默认）/ 74（全 feature）全绿，clippy 双配置零警告。
 
-明确未做（留 M4+）：MUX 写（需重启）、profiles、风扇曲线、pl4/cc 显式
+明确未做（留 M4+）：MUX 写（需重启）、profiles、pl4/cc 显式
 写（未验证）、MUX/0x29 稳定 UI。
 
 ---
@@ -2920,8 +2925,8 @@ journal origin=shutdown、风扇回自动 0 RPM；gaming 全绿；负向全前�
 端到端双通道 Verified 1104ms + 恢复。
 单元测试 81（默认）/ 89（全 feature）全绿，clippy 双配置零警告。
 
-明确未做：profile 热键/托盘切换（属 UI 层）、profile 内自定义风扇曲线
-（Phase 6）、MUX（需重启，永不在 profile 内）。
+明确未做：profile 热键/托盘切换（属 UI 层）、默认 Profile 内置软件曲线
+（需先完成 soak）、MUX（需重启，永不在 profile 内）。
 
 ---
 
@@ -2931,13 +2936,13 @@ journal origin=shutdown、风扇回自动 0 RPM；gaming 全绿；负向全前�
 
 ```text
 Dashboard
-Performance
+Performance + Fan
 Monitor
+Profiles
 Settings
-Diagnostics
 ```
 
-UI 只依赖 AppState。
+UI 只依赖 AppState；Thermals 已并入 Performance，桌面 Diagnostics 入口已移除。
 
 ---
 
@@ -2960,7 +2965,9 @@ Custom
 
 ## Phase 5 — Gaming Telemetry
 
-集成 PresentMon：
+已落地第一阶段基础设施：通过动态加载 PresentMonAPI2.dll，使用显式
+`PHELPER_PRESENTMON_PID` 建立只读 frame query；provider 失败时降级为
+Unavailable/Degraded，不阻断其他遥测或控制。canonical registry 已包含：
 
 ```text
 FPS
@@ -2969,19 +2976,17 @@ frame time
 latency
 ```
 
-为 profile benchmark 奠定基础。
+CPU busy / GPU time 也会在 Monitor/Diagnostics 中暴露。当前 Dashboard 展示 FPS、
+1% Low、帧时间和显示延迟；真实游戏 HIL、进程选择器和 benchmark 导出仍待完成。
+详细运行方式见 `docs/presentmon-integration.md`。
 
 ---
 
 ## Phase 6 — Thermal Advanced
 
-验证 WMI manual fan 后，再决定：
-
-```text
-custom fan curve
-```
-
-是否进入 stable。
+第一版 software fan curve 已落地：固定四点、CPU/GPU 最高温驱动、平滑、
+每秒限速、失联恢复和高温迟滞均复用 ControlCoordinator/SafetySupervisor。
+后续只剩实机 soak 和默认 Profile 策略评估，不再扩展为底层参数编辑器。
 
 ---
 
@@ -3121,7 +3126,7 @@ higher GPU platform budget
 | Direct EC write | Rejected for stable architecture（8BAB 在 OmenMon-Reborn max-fan 冻结黑名单） |
 | Multi-process architecture | Deferred |
 | Hardware Windows service | Deferred |
-| Custom software fan curve | Deferred（前提已部分满足：0x2E 内核实测可控；剩余门槛 keep-alive 可靠性 + 温度应急交回） |
+| Custom software fan curve | Implemented（四点安全 MVP；默认 Profile 仍等待实机 soak） |
 
 ---
 

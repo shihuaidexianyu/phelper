@@ -49,7 +49,10 @@ fn ensure_elevated() -> bool {
     match relaunch_elevated() {
         Relaunch::Launched => false,
         Relaunch::Declined => {
-            message_box("phelper 需要管理员权限", "控制硬件需要提权运行。已取消启动。");
+            message_box(
+                "phelper 需要管理员权限",
+                "控制硬件需要提权运行。已取消启动。",
+            );
             false
         }
         Relaunch::Failed(e) => {
@@ -66,7 +69,12 @@ fn message_box(title: &str, body: &str) {
     let t: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
     let b: Vec<u16> = body.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
-        MessageBoxW(None, PCWSTR(b.as_ptr()), PCWSTR(t.as_ptr()), MB_OK | MB_ICONERROR);
+        MessageBoxW(
+            None,
+            PCWSTR(b.as_ptr()),
+            PCWSTR(t.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
     }
 }
 
@@ -106,7 +114,7 @@ fn main() {
     let _log_guard = init_logging();
     tracing::info!("phelper-desktop starting");
 
-    let app = AppHandle::start();
+    let app = AppHandle::start_fast();
 
     gpui_platform::application().run(move |cx| {
         gpui_component::init(cx);
@@ -116,73 +124,71 @@ fn main() {
         if let Some(w) = warn {
             tracing::warn!("{w}");
         }
-        pages::settings::apply_pref(ui_settings.theme, cx);
+        let theme = ui_settings.theme;
+        pages::settings::apply_pref(theme, cx);
 
         let app_w = app.clone();
-        cx.spawn(async move |cx| {
-            let bounds = WindowBounds::Windowed(Bounds {
-                origin: point(px(120.), px(60.)),
-                size: size(px(1440.), px(900.)),
-            });
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(bounds),
-                    ..Default::default()
-                },
-                |window, cx| {
-                    // Tray (D12): install on THIS thread — tray-icon's
-                    // Windows impl rides the calling thread's message pump,
-                    // which is GPUI's main loop here. The poll task drains
-                    // TrayCmd and owns minimize-to-tray hiding.
-                    let hwnd = {
-                        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-                        match HasWindowHandle::window_handle(window).map(|h| h.as_raw()) {
-                            Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
-                            _ => 0,
-                        }
-                    };
-                    let tray_rx = tray::install();
-                    let app_t = app_w.clone();
-                    cx.spawn(async move |cx| {
-                        loop {
-                            cx.background_executor()
-                                .timer(Duration::from_millis(250))
-                                .await;
-                            let mut quit = false;
-                            while let Ok(cmd) = tray_rx.try_recv() {
-                                match cmd {
-                                    tray::TrayCmd::Show => tray::show_window(hwnd),
-                                    tray::TrayCmd::Quit => quit = true,
-                                }
-                            }
-                            if hwnd != 0 {
-                                tray::hide_if_minimized(hwnd);
-                            }
-                            if quit {
-                                // Same graceful path as the window close
-                                // button (AR-12): engine restore, then quit.
-                                cx.update(|cx| {
-                                    let t = std::time::Instant::now();
-                                    tracing::info!("ui shutdown begin (tray quit)");
-                                    app_t.shutdown(Duration::from_secs(40));
-                                    tracing::info!(
-                                        elapsed_ms = t.elapsed().as_millis(),
-                                        "ui shutdown end (tray quit)"
-                                    );
-                                    cx.quit();
-                                });
-                                break;
+        let bounds = WindowBounds::Windowed(Bounds {
+            origin: point(px(180.), px(90.)),
+            size: size(px(900.), px(600.)),
+        });
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(bounds),
+                ..Default::default()
+            },
+            |window, cx| {
+                // Tray (D12): install on THIS thread — tray-icon's
+                // Windows impl rides the calling thread's message pump,
+                // which is GPUI's main loop here. The poll task drains
+                // TrayCmd and owns minimize-to-tray hiding.
+                let hwnd = {
+                    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                    match HasWindowHandle::window_handle(window).map(|h| h.as_raw()) {
+                        Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
+                        _ => 0,
+                    }
+                };
+                let tray_rx = tray::install();
+                let app_t = app_w.clone();
+                cx.spawn(async move |cx| {
+                    loop {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(250))
+                            .await;
+                        let mut quit = false;
+                        while let Ok(cmd) = tray_rx.try_recv() {
+                            match cmd {
+                                tray::TrayCmd::Show => tray::show_window(hwnd),
+                                tray::TrayCmd::Quit => quit = true,
                             }
                         }
-                    })
-                    .detach();
-                    let view = cx.new(|cx| ShellView::new(app_w, window, cx));
-                    cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
-                },
-            )
-            .expect("open window");
-        })
-        .detach();
+                        if hwnd != 0 {
+                            tray::hide_if_minimized(hwnd);
+                        }
+                        if quit {
+                            // Same graceful path as the window close
+                            // button (AR-12): engine restore, then quit.
+                            cx.update(|cx| {
+                                let t = std::time::Instant::now();
+                                tracing::info!("ui shutdown begin (tray quit)");
+                                app_t.shutdown(Duration::from_secs(40));
+                                tracing::info!(
+                                    elapsed_ms = t.elapsed().as_millis(),
+                                    "ui shutdown end (tray quit)"
+                                );
+                                cx.quit();
+                            });
+                            break;
+                        }
+                    }
+                })
+                .detach();
+                let view = cx.new(|cx| ShellView::new(app_w, theme, window, cx));
+                cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
+            },
+        )
+        .expect("open window");
 
         // AR-12: closing the last window drives the full graceful engine
         // shutdown (firmware-auto restore) BEFORE process exit. Timed

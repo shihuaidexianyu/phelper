@@ -3,9 +3,10 @@
 //! or a hardware handle. It publishes an immutable `AppState` snapshot
 //! behind a lock; the UI clones it once per tick.
 //!
-//! Loop (100 ms cadence):
+//! Loop (up to 100 ms idle cadence):
 //! 1. telemetry snapshots (drain to latest);
-//! 2. UI messages (Dispatch / RefreshProfiles / Shutdown);
+//! 2. UI messages (Dispatch / RefreshProfiles / Shutdown); the pump waits on
+//!    this channel, so a control request wakes it immediately;
 //! 3. coalescer poll → dispatch through `ControlHandle` (Busy → backoff);
 //! 4. in-flight outcome sweep → evidence + desired/observed refresh;
 //! 5. ~2 s desired/observed refresh; ~1 s journal tail.
@@ -48,6 +49,16 @@ impl AppHandle {
     /// Spawn the pump thread; returns immediately (engine startup happens
     /// on the pump — the UI renders the `Starting` state meanwhile).
     pub fn start() -> Self {
+        Self::start_with_ogh_scan(true)
+    }
+
+    /// UI startup variant: leave the diagnostic OGH scan off the critical
+    /// path. The scan is performed after the engine is usable.
+    pub fn start_fast() -> Self {
+        Self::start_with_ogh_scan(false)
+    }
+
+    fn start_with_ogh_scan(scan_ogh: bool) -> Self {
         let state = Arc::new(RwLock::new(AppState::default()));
         let (to_pump, rx) = mpsc::channel();
         let telemetry = Arc::new(RwLock::new(None));
@@ -58,7 +69,7 @@ impl AppHandle {
         };
         std::thread::Builder::new()
             .name("app-pump".into())
-            .spawn(move || pump_main(state, rx, telemetry))
+            .spawn(move || pump_main(state, rx, telemetry, scan_ogh))
             .expect("spawn app-pump thread");
         handle
     }
@@ -68,14 +79,9 @@ impl AppHandle {
         self.state.read().expect("appstate poisoned").clone()
     }
 
-    /// Enqueue a user intent. Validation happens UI-side first (validate.rs)
-    /// for instant feedback; the pump re-applies the command-level gates.
+    /// Enqueue a user intent. Validation happens UI-side first (validate.rs),
+    /// and the pump re-applies the command-level gates before dispatch.
     pub fn dispatch(&self, knob: KnobId, cmd: ControlCommand) {
-        // Immediate feedback; the pump confirms or replaces this.
-        self.state
-            .write()
-            .expect("appstate poisoned")
-            .set_knob(knob, KnobStatus::Pending);
         let _ = self.to_pump.send(PumpMsg::Dispatch(knob, cmd));
     }
 
@@ -125,8 +131,13 @@ fn pump_main(
     state: Arc<RwLock<AppState>>,
     rx: mpsc::Receiver<PumpMsg>,
     telemetry_slot: Arc<RwLock<Option<TelemetryHandle>>>,
+    scan_ogh: bool,
 ) {
-    let engine = match Engine::start() {
+    let engine = match if scan_ogh {
+        Engine::start()
+    } else {
+        Engine::start_without_ogh_scan()
+    } {
         Ok(e) => Some(e),
         Err(e) => {
             state.write().expect("appstate poisoned").engine = EngineStatus::Failed(e.to_string());
@@ -151,12 +162,25 @@ fn pump_main(
             s.caps = Some(caps);
             s.desired = c.desired();
             s.observed = c.observed();
+            s.last_saved_fan_curve = c.last_saved_fan_curve();
             s.engine = EngineStatus::Running;
         } else {
             s.engine = EngineStatus::TelemetryOnly;
         }
         s.set_profiles(&registry);
     }
+
+    let mut ogh_scan = (!scan_ogh).then(|| {
+        std::thread::Builder::new()
+            .name("ogh-watch".into())
+            .spawn(|| {
+                // Diagnostic-only work: let the first usable state settle
+                // before the WMI and registry scan runs in the background.
+                std::thread::sleep(Duration::from_secs(2));
+                crate::platform::ogh_watch::scan()
+            })
+            .expect("spawn ogh-watch")
+    });
 
     let snap_rx = engine.telemetry().subscribe();
     let mut engine = Some(engine);
@@ -168,6 +192,13 @@ fn pump_main(
     let mut last_observed_reprobe = Instant::now();
 
     loop {
+        if ogh_scan.as_ref().is_some_and(|scan| scan.is_finished())
+            && let Some(scan) = ogh_scan.take()
+        {
+            let findings = scan.join().unwrap_or_default();
+            state.write().expect("appstate poisoned").ogh_findings = findings;
+        }
+
         // v0.2-e: stage timing. The M6 HIL saw ONE ~38 s window-close whose
         // root cause was never isolated (every call in this loop is
         // non-blocking by audit). Any iteration over SLOW_ITER logs its
@@ -176,17 +207,23 @@ fn pump_main(
         let iter_start = Instant::now();
         let mut stages = [Duration::ZERO; 6];
 
-        // 1. Telemetry: drain to the latest snapshot only.
-        match snap_rx.recv_timeout(Duration::from_millis(100)) {
+        // 1. Telemetry: drain to the latest snapshot only. Do not wait on
+        // this channel: waiting here used to make a user command sit behind
+        // the 100 ms telemetry timeout. The UI channel below is now the
+        // blocking wait and wakes the pump as soon as a command arrives.
+        match snap_rx.try_recv() {
             Ok(latest) => {
                 let mut newest = latest;
                 while let Ok(n) = snap_rx.try_recv() {
                     newest = n;
                 }
-                state.write().expect("appstate poisoned").apply_snapshot(newest);
+                state
+                    .write()
+                    .expect("appstate poisoned")
+                    .apply_snapshot(newest);
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
                 state.write().expect("appstate poisoned").engine =
                     EngineStatus::Failed("遥测协调器意外断开".into());
                 if let Some(e) = engine.take() {
@@ -199,48 +236,60 @@ fn pump_main(
         stages[0] = iter_start.elapsed();
         let t = Instant::now();
 
-        // 2. UI messages.
-        while let Ok(msg) = rx.try_recv() {
-            match msg {
-                PumpMsg::Dispatch(knob, cmd) => {
-                    let fail = dispatch_gate(&cmd, &registry, &state, control.is_some());
-                    if let Some(err) = fail {
-                        state.write().expect("appstate poisoned").set_knob(
-                            knob,
-                            KnobStatus::Failed {
-                                error: err,
-                                at_epoch_ms: now_epoch_ms(),
-                            },
+        // 2. UI messages. Waiting on the UI channel keeps the idle loop
+        // cheap while making Dispatch/Shutdown event-driven rather than
+        // dependent on the telemetry cadence.
+        let mut shutdown_ack = None;
+        let ui_wait = if coalescer.has_work() {
+            // While a command is active, keep outcome/next-value latency
+            // below one frame without making the idle pump spin.
+            Duration::from_millis(10)
+        } else {
+            Duration::from_millis(100)
+        };
+        match rx.recv_timeout(ui_wait) {
+            Ok(msg) => {
+                shutdown_ack = handle_pump_msg(
+                    msg,
+                    &state,
+                    &mut registry,
+                    &mut coalescer,
+                    control.is_some(),
+                );
+                if shutdown_ack.is_none() {
+                    while let Ok(msg) = rx.try_recv() {
+                        shutdown_ack = handle_pump_msg(
+                            msg,
+                            &state,
+                            &mut registry,
+                            &mut coalescer,
+                            control.is_some(),
                         );
-                    } else {
-                        coalescer.enqueue(knob, cmd);
-                        state
-                            .write()
-                            .expect("appstate poisoned")
-                            .set_knob(knob, KnobStatus::Pending);
+                        if shutdown_ack.is_some() {
+                            break;
+                        }
                     }
-                }
-                PumpMsg::RefreshProfiles => {
-                    registry = crate::profiles::ProfileRegistry::load_default();
-                    // The display registry refreshes; the COORDINATOR's
-                    // registry was loaded at engine start and does NOT hot-
-                    // reload (known M6 limitation — a mid-session TOML edit
-                    // can make apply answer UnknownProfile; surfaced as-is).
-                    state.write().expect("appstate poisoned").set_profiles(&registry);
-                }
-                PumpMsg::Shutdown(ack) => {
-                    let t_sd = Instant::now();
-                    if let Some(e) = engine.take() {
-                        e.shutdown();
-                    }
-                    tracing::info!(
-                        elapsed_ms = t_sd.elapsed().as_millis(),
-                        "app-pump: engine.shutdown() completed (AR-12 restore path)"
-                    );
-                    let _ = ack.send(());
-                    return;
                 }
             }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if let Some(e) = engine.take() {
+                    e.shutdown();
+                }
+                return;
+            }
+        }
+        if let Some(ack) = shutdown_ack {
+            let t_sd = Instant::now();
+            if let Some(e) = engine.take() {
+                e.shutdown();
+            }
+            tracing::info!(
+                elapsed_ms = t_sd.elapsed().as_millis(),
+                "app-pump: engine.shutdown() completed (AR-12 restore path)"
+            );
+            let _ = ack.send(());
+            return;
         }
         stages[1] = t.elapsed();
         let t = Instant::now();
@@ -335,6 +384,7 @@ fn pump_main(
             if let Some(c) = &control {
                 s.desired = c.desired();
                 s.observed = c.observed();
+                s.last_saved_fan_curve = c.last_saved_fan_curve();
             }
         }
         stages[3] = t.elapsed();
@@ -347,6 +397,7 @@ fn pump_main(
                 let mut s = state.write().expect("appstate poisoned");
                 s.desired = c.desired();
                 s.observed = c.observed();
+                s.last_saved_fan_curve = c.last_saved_fan_curve();
             }
         }
 
@@ -389,6 +440,53 @@ fn pump_main(
                 "app-pump iteration exceeded 2 s — stage timings above"
             );
         }
+    }
+}
+
+/// Apply one pump message. Returning a shutdown acknowledgement keeps the
+/// engine-owning shutdown path in `pump_main`, while allowing the message
+/// receive itself to be event-driven.
+fn handle_pump_msg(
+    msg: PumpMsg,
+    state: &Arc<RwLock<AppState>>,
+    registry: &mut crate::profiles::ProfileRegistry,
+    coalescer: &mut Coalescer,
+    has_control: bool,
+) -> Option<mpsc::Sender<()>> {
+    match msg {
+        PumpMsg::Dispatch(knob, cmd) => {
+            let fail = dispatch_gate(&cmd, registry, state, has_control);
+            if let Some(err) = fail {
+                state.write().expect("appstate poisoned").set_knob(
+                    knob,
+                    KnobStatus::Failed {
+                        error: err,
+                        at_epoch_ms: now_epoch_ms(),
+                    },
+                );
+            } else {
+                if coalescer.enqueue(knob, cmd) {
+                    state
+                        .write()
+                        .expect("appstate poisoned")
+                        .set_knob(knob, KnobStatus::Pending);
+                }
+            }
+            None
+        }
+        PumpMsg::RefreshProfiles => {
+            *registry = crate::profiles::ProfileRegistry::load_default();
+            // The display registry refreshes; the COORDINATOR's registry was
+            // loaded at engine start and does NOT hot-reload (known M6
+            // limitation — a mid-session TOML edit can make apply answer
+            // UnknownProfile; surfaced as-is).
+            state
+                .write()
+                .expect("appstate poisoned")
+                .set_profiles(registry);
+            None
+        }
+        PumpMsg::Shutdown(ack) => Some(ack),
     }
 }
 

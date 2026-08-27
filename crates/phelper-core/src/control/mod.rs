@@ -2,6 +2,7 @@
 //! safety supervisor + keep-alive. See architecture.md §30-34, §43-45.
 
 mod coordinator;
+mod fan_curve;
 pub mod journal;
 pub mod keepalive;
 pub mod safety;

@@ -5,15 +5,16 @@
 //! - per-knob latest-wins: enqueue 40→41→42→43, only 43 is dispatched;
 //! - per-knob serial: a knob with an in-flight command queues, never
 //!   overlaps itself (different knobs dispatch independently);
-//! - rate limit: one dispatch per knob per `MIN_INTERVAL` (250 ms) so a
-//!   held slider can never fill the coordinator's 32-deep queue;
+//! - rate limit: firmware-sensitive knobs remain at `MIN_INTERVAL` (250 ms),
+//!   while CPU policy sliders use `FAST_INTERVAL` (50 ms); per-knob serial
+//!   dispatch still prevents a held slider from filling the coordinator;
 //! - Busy backoff: a `Busy` dispatch error re-stages the command after
 //!   `BUSY_BACKOFF` (300 ms); only `BUSY_TIMEOUT` (5 s) of continuous
 //!   Busy fails the knob.
 //! - idempotent dedup: a command identical to the last ACCEPTED one for
 //!   the same knob is dropped. Remote-desktop pointer streams (and held
 //!   drags) re-emit the same slider value continuously — without this the
-//!   coalescer re-dispatches it every 250 ms forever (observed on-device
+//!   coalescer re-dispatches it every interval forever (observed on-device
 //!   M6-D6: an 8× identical-EPP storm from a remote pointer feed). A
 //!   failed outcome clears the memory so the user can retry the same
 //!   value; ApplyProfile is exempt (re-apply is a meaningful re-assert,
@@ -30,6 +31,11 @@ use phelper_domain::command::{ControlCommand, ControlReceipt};
 use super::state::KnobId;
 
 pub const MIN_INTERVAL: Duration = Duration::from_millis(250);
+/// CPU policy writes are ordinary Windows power-policy calls on this
+/// machine (roughly 80–130 ms end-to-end in the journal), so the old global
+/// 250 ms gate made a drag feel slower than the backend. The in-flight guard
+/// remains the hard serialization boundary.
+pub const FAST_INTERVAL: Duration = Duration::from_millis(50);
 pub const BUSY_BACKOFF: Duration = Duration::from_millis(300);
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -63,6 +69,7 @@ pub enum BusyVerdict {
 pub struct Coalescer {
     slots: BTreeMap<KnobId, Slot>,
     min_interval: Duration,
+    fast_interval: Duration,
     busy_backoff: Duration,
     busy_timeout: Duration,
 }
@@ -75,7 +82,13 @@ impl Default for Coalescer {
 
 impl Coalescer {
     pub fn new() -> Self {
-        Self::with_intervals(MIN_INTERVAL, BUSY_BACKOFF, BUSY_TIMEOUT)
+        Self {
+            slots: BTreeMap::new(),
+            min_interval: MIN_INTERVAL,
+            fast_interval: FAST_INTERVAL,
+            busy_backoff: BUSY_BACKOFF,
+            busy_timeout: BUSY_TIMEOUT,
+        }
     }
 
     pub fn with_intervals(
@@ -86,8 +99,28 @@ impl Coalescer {
         Self {
             slots: BTreeMap::new(),
             min_interval,
+            // Test helper: custom interval keeps all knobs on one injected
+            // clock policy, preserving deterministic timing tests.
+            fast_interval: min_interval,
             busy_backoff,
             busy_timeout,
+        }
+    }
+
+    fn interval_for(&self, knob: KnobId) -> Duration {
+        match knob {
+            KnobId::EppAc
+            | KnobId::EppDc
+            | KnobId::Epp1Ac
+            | KnobId::Epp1Dc
+            | KnobId::MaxFreqAc
+            | KnobId::MaxFreqDc
+            | KnobId::Boost => self.fast_interval,
+            KnobId::ThermalMode
+            | KnobId::FanMode
+            | KnobId::GpuPolicy
+            | KnobId::PowerLimits
+            | KnobId::Profile => self.min_interval,
         }
     }
 
@@ -95,12 +128,17 @@ impl Coalescer {
     /// pending command (latest-wins); never touches an in-flight one.
     /// Drops the intent when it is identical to the last accepted command
     /// for this knob (idempotent dedup — ApplyProfile exempt).
-    pub fn enqueue(&mut self, knob: KnobId, cmd: ControlCommand) {
+    ///
+    /// Returns `true` when the command became pending. A duplicate returns
+    /// `false` so the application layer can leave the existing lifecycle
+    /// state alone instead of showing a stale Pending badge.
+    pub fn enqueue(&mut self, knob: KnobId, cmd: ControlCommand) -> bool {
         let slot = self.slots.entry(knob).or_default();
         if knob != KnobId::Profile && slot.last_dispatched.as_ref() == Some(&cmd) {
-            return;
+            return false;
         }
         slot.pending = Some(cmd);
+        true
     }
 
     /// Commands eligible to dispatch right now: pending, nothing in flight,
@@ -121,6 +159,16 @@ impl Coalescer {
         out
     }
 
+    /// Whether the pump should keep a short receive timeout. An active slot
+    /// means either an outcome may arrive or a latest-wins value may become
+    /// eligible soon; sleeping for the idle 100 ms cadence here makes the
+    /// second step of a drag visibly lag behind the first.
+    pub fn has_work(&self) -> bool {
+        self.slots
+            .values()
+            .any(|slot| slot.pending.is_some() || slot.in_flight.is_some())
+    }
+
     /// Dispatch accepted by the coordinator. The accepted command is
     /// recorded in the dedup memory (poll took it out of the slot, so the
     /// pump hands it back here).
@@ -131,10 +179,11 @@ impl Coalescer {
         receipt: ControlReceipt,
         now: Instant,
     ) {
+        let interval = self.interval_for(knob);
         let slot = self.slots.entry(knob).or_default();
         slot.in_flight = Some(receipt);
         slot.last_dispatched = Some(cmd);
-        slot.next_attempt_at = Some(now + self.min_interval);
+        slot.next_attempt_at = Some(now + interval);
         slot.busy_since = None;
     }
 
@@ -217,7 +266,7 @@ mod tests {
 
     #[test]
     fn rate_limit_spaces_dispatches() {
-        let mut c = Coalescer::new();
+        let mut c = Coalescer::with_intervals(MIN_INTERVAL, BUSY_BACKOFF, BUSY_TIMEOUT);
         let t0 = Instant::now();
         c.enqueue(KnobId::EppAc, cmd());
         let (k, _) = c.poll(t0).pop().unwrap();
@@ -229,6 +278,32 @@ mod tests {
         // After the outcome AND the interval: dispatched.
         c.note_completed(k, true);
         assert_eq!(c.poll(t0 + Duration::from_millis(251)).len(), 1);
+    }
+
+    #[test]
+    fn cpu_policy_rate_limit_is_fast_but_still_serial() {
+        let mut c = Coalescer::new();
+        let t0 = Instant::now();
+        c.enqueue(KnobId::EppAc, cmd());
+        let (k, cmd1) = c.poll(t0).pop().unwrap();
+        c.note_dispatched(k, cmd1, receipt(1), t0);
+        c.enqueue(KnobId::EppAc, cmd2());
+        c.note_completed(k, true);
+        assert!(c.poll(t0 + Duration::from_millis(49)).is_empty());
+        assert_eq!(c.poll(t0 + FAST_INTERVAL).len(), 1);
+    }
+
+    #[test]
+    fn firmware_knobs_keep_conservative_rate_limit() {
+        let mut c = Coalescer::new();
+        let t0 = Instant::now();
+        c.enqueue(KnobId::FanMode, cmd());
+        let (k, cmd1) = c.poll(t0).pop().unwrap();
+        c.note_dispatched(k, cmd1, receipt(1), t0);
+        c.enqueue(KnobId::FanMode, cmd2());
+        c.note_completed(k, true);
+        assert!(c.poll(t0 + Duration::from_millis(249)).is_empty());
+        assert_eq!(c.poll(t0 + MIN_INTERVAL).len(), 1);
     }
 
     #[test]
@@ -283,7 +358,10 @@ mod tests {
         // Still Busy at t0+300ms, but a NEWER intent arrived meanwhile —
         // latest-wins replaces the re-staged command, backoff continues.
         c.enqueue(k, cmd());
-        assert_eq!(c.note_busy(k, cmd2, t0 + Duration::from_millis(300)), BusyVerdict::Retry);
+        assert_eq!(
+            c.note_busy(k, cmd2, t0 + Duration::from_millis(300)),
+            BusyVerdict::Retry
+        );
 
         // Continuous Busy past the 2 s test timeout: TimedOut, slot cleared.
         let (_, cmd3) = c.poll(t0 + Duration::from_millis(600)).pop().unwrap();
@@ -333,7 +411,10 @@ mod tests {
         let (k, _) = c.poll(t0).pop().unwrap();
         c.note_dispatched(k, apply(), receipt(1), t0);
         c.note_completed(k, true);
-        assert!(c.poll(t0 + Duration::from_secs(1)).is_empty(), "no pending left");
+        assert!(
+            c.poll(t0 + Duration::from_secs(1)).is_empty(),
+            "no pending left"
+        );
         // ...but a fresh explicit re-apply is NOT deduped (re-assert).
         c.enqueue(KnobId::Profile, apply());
         assert_eq!(c.poll(t0 + Duration::from_secs(1)).len(), 1);
@@ -357,7 +438,10 @@ mod tests {
             );
         }
         // A DIFFERENT value still passes.
-        c.enqueue(KnobId::EppAc, ControlCommand::SetThermalMode(ThermalMode::Performance));
+        c.enqueue(
+            KnobId::EppAc,
+            ControlCommand::SetThermalMode(ThermalMode::Performance),
+        );
         assert_eq!(c.poll(t0 + Duration::from_secs(3)).len(), 1);
     }
 
@@ -375,5 +459,18 @@ mod tests {
             1,
             "failed outcome clears the memory — same value retries"
         );
+    }
+
+    #[test]
+    fn dedup_reports_that_no_new_work_was_queued() {
+        let mut c = Coalescer::new();
+        let t0 = Instant::now();
+        assert!(c.enqueue(KnobId::EppAc, cmd()));
+        let (k, cmd1) = c.poll(t0).pop().unwrap();
+        c.note_dispatched(k, cmd1, receipt(1), t0);
+        c.note_completed(k, true);
+
+        assert!(!c.enqueue(KnobId::EppAc, cmd()));
+        assert!(!c.has_work());
     }
 }

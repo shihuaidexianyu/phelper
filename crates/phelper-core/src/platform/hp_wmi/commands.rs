@@ -253,8 +253,10 @@ pub(crate) fn encode_thermal_mode_v1(mode: ThermalMode) -> [u8; 2] {
 /// guard, and both fail closed rather than truncate.
 #[allow(dead_code)] // call sites live behind `control` (W5); unconditional for tests
 pub(crate) fn encode_fan_levels(levels: FanLevels) -> Result<[u8; 2], HpWmiError> {
-    let cpu = u8::try_from(levels.cpu).map_err(|_| HpWmiError::InvalidInput("cpu fan level > 255"))?;
-    let gpu = u8::try_from(levels.gpu).map_err(|_| HpWmiError::InvalidInput("gpu fan level > 255"))?;
+    let cpu =
+        u8::try_from(levels.cpu).map_err(|_| HpWmiError::InvalidInput("cpu fan level > 255"))?;
+    let gpu =
+        u8::try_from(levels.gpu).map_err(|_| HpWmiError::InvalidInput("gpu fan level > 255"))?;
     Ok([cpu, gpu])
 }
 
@@ -534,7 +536,11 @@ mod tests {
     #[test]
     fn write_args_always_carry_input_len() {
         // insize=0 is a READ-side probe; writes must never see size=0.
-        let w = BiosArgs::write(HpCommandGroup::Gaming, cmd::SET_PERFORMANCE_MODE, &[0xFF, 0x31]);
+        let w = BiosArgs::write(
+            HpCommandGroup::Gaming,
+            cmd::SET_PERFORMANCE_MODE,
+            &[0xFF, 0x31],
+        );
         assert_eq!(w.command, 0x20008);
         assert_eq!(w.command_type, 0x1A);
         assert_eq!(w.size, 2);

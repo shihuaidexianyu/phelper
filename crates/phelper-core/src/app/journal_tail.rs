@@ -99,7 +99,9 @@ impl Default for JournalTail {
 mod tests {
     use super::*;
     use crate::control::journal::{ControlJournal, JournalOrigin};
-    use phelper_domain::command::{ControlCommand, ControlOutcome, ControlReceipt, ControlStatus, Verification};
+    use phelper_domain::command::{
+        ControlCommand, ControlOutcome, ControlReceipt, ControlStatus, Verification,
+    };
     use phelper_domain::policy::ThermalMode;
     use std::time::Duration;
 
@@ -132,7 +134,8 @@ mod tests {
     fn reads_entries_written_by_real_journal() {
         let path = tmp("real");
         let mut j = ControlJournal::open(&path, "8BAB", "F.30").unwrap();
-        j.append(&j.new_entry(JournalOrigin::User, outcome(1))).unwrap();
+        j.append(&j.new_entry(JournalOrigin::User, outcome(1)))
+            .unwrap();
         let mut t = JournalTail::new(path.clone());
         let got = t.poll();
         assert_eq!(got.len(), 1);
@@ -141,8 +144,10 @@ mod tests {
         // Second poll: nothing new.
         assert!(t.poll().is_empty());
         // Append more (cross-process simulation: a second writer handle).
-        j.append(&j.new_entry(JournalOrigin::Shutdown, outcome(2))).unwrap();
-        j.append(&j.new_entry(JournalOrigin::Safety, outcome(3))).unwrap();
+        j.append(&j.new_entry(JournalOrigin::Shutdown, outcome(2)))
+            .unwrap();
+        j.append(&j.new_entry(JournalOrigin::Safety, outcome(3)))
+            .unwrap();
         let got = t.poll();
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].origin, JournalOrigin::Shutdown);
@@ -161,7 +166,10 @@ mod tests {
         let mut t = JournalTail::new(path.clone());
         assert!(t.poll().is_empty(), "torn line must not parse");
         use std::io::Write as _;
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         f.write_all(line[cut..].as_bytes()).unwrap();
         f.write_all(b"\n").unwrap();
         let got = t.poll();

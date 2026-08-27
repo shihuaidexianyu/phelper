@@ -332,12 +332,21 @@ mod imp {
             for out in [OutputSize::Zero, OutputSize::Small4, OutputSize::Medium128] {
                 match self.invoker.invoke(out.method_name(), &args) {
                     Ok(resp) if resp.return_code == 0 => {
-                        info!(cmd_type, outsize = out.method_name(), "hp-wmi write accepted");
+                        info!(
+                            cmd_type,
+                            outsize = out.method_name(),
+                            "hp-wmi write accepted"
+                        );
                         return Ok(());
                     }
                     Ok(resp) => {
                         let rc = resp.return_code;
-                        debug!(cmd_type, outsize = out.method_name(), rc, "write rejected by firmware");
+                        debug!(
+                            cmd_type,
+                            outsize = out.method_name(),
+                            rc,
+                            "write rejected by firmware"
+                        );
                         last_err = Some(HpWmiError::from_firmware_code(rc));
                         // rc 3/4 (unknown command/cmdtype) may be a wrong
                         // method variant — try the next outsize. rc 5
@@ -363,7 +372,10 @@ mod imp {
 
     #[cfg(feature = "control")]
     impl phelper_domain::ports::HpControl for HpWmiTransport {
-        fn set_thermal_mode(&self, mode: phelper_domain::policy::ThermalMode) -> Result<(), HpWmiError> {
+        fn set_thermal_mode(
+            &self,
+            mode: phelper_domain::policy::ThermalMode,
+        ) -> Result<(), HpWmiError> {
             let payload = commands::encode_thermal_mode_v1(mode);
             self.write_execute(HpCommandGroup::Gaming, cmd::SET_PERFORMANCE_MODE, &payload)
         }
@@ -383,7 +395,10 @@ mod imp {
             self.write_execute(HpCommandGroup::Gaming, cmd::GPU_POLICY_SET, &payload)
         }
 
-        fn set_power_limits(&self, l: phelper_domain::policy::CpuPowerLimits) -> Result<(), HpWmiError> {
+        fn set_power_limits(
+            &self,
+            l: phelper_domain::policy::CpuPowerLimits,
+        ) -> Result<(), HpWmiError> {
             // Defense in depth after the safety layer: pl1/pl2 (M3) and pl4
             // (M4.1, MCHBAR 0x59B0 readback) may go on the wire; cc has no
             // readback channel AND no restore semantics — permanently

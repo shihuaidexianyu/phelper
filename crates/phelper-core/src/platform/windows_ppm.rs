@@ -11,7 +11,9 @@
 use phelper_domain::error::PlatformError;
 use phelper_domain::policy::BoostPolicy;
 use windows::Win32::Foundation::{HLOCAL, LocalFree};
-use windows::Win32::System::Power::{PowerGetActiveScheme, PowerReadACValueIndex, PowerReadDCValueIndex};
+use windows::Win32::System::Power::{
+    PowerGetActiveScheme, PowerReadACValueIndex, PowerReadDCValueIndex,
+};
 #[cfg(feature = "control")]
 use windows::Win32::System::Power::{
     PowerSetActiveScheme, PowerWriteACValueIndex, PowerWriteDCValueIndex,
@@ -333,23 +335,48 @@ mod tests {
         }
         assert_eq!(
             t(&SUB_PROCESSOR),
-            (0x54533251, 0x82be, 0x4824, [0x96, 0xc1, 0x47, 0xb6, 0x0b, 0x74, 0x0d, 0x00])
+            (
+                0x54533251,
+                0x82be,
+                0x4824,
+                [0x96, 0xc1, 0x47, 0xb6, 0x0b, 0x74, 0x0d, 0x00]
+            )
         );
         assert_eq!(
             t(&PERFEPP),
-            (0x36687f9e, 0xe3a5, 0x4dbf, [0xb1, 0xdc, 0x15, 0xeb, 0x38, 0x1c, 0x68, 0x63])
+            (
+                0x36687f9e,
+                0xe3a5,
+                0x4dbf,
+                [0xb1, 0xdc, 0x15, 0xeb, 0x38, 0x1c, 0x68, 0x63]
+            )
         );
         assert_eq!(
             t(&PERFEPP1),
-            (0x36687f9e, 0xe3a5, 0x4dbf, [0xb1, 0xdc, 0x15, 0xeb, 0x38, 0x1c, 0x68, 0x64])
+            (
+                0x36687f9e,
+                0xe3a5,
+                0x4dbf,
+                [0xb1, 0xdc, 0x15, 0xeb, 0x38, 0x1c, 0x68, 0x64]
+            )
         );
         assert_eq!(
             t(&PROCFREQMAX),
-            (0x75b0ae3f, 0xbce0, 0x45a7, [0x8c, 0x89, 0xc9, 0x61, 0x1c, 0x25, 0xe1, 0x00])
+            (
+                0x75b0ae3f,
+                0xbce0,
+                0x45a7,
+                [0x8c, 0x89, 0xc9, 0x61, 0x1c, 0x25, 0xe1, 0x00]
+            )
         );
         assert_eq!(
             t(&PERFBOOSTMODE),
-            (0xbe337238, 0x0d82, 0x4146, [0xa9, 0x60, 0x4f, 0x37, 0x49, 0xd4, 0x70, 0xc7])
+            (
+                0xbe337238,
+                0x0d82,
+                0x4146,
+                [0xa9, 0x60, 0x4f, 0x37, 0x49, 0xd4, 0x70, 0xc7]
+            )
         );
     }
 

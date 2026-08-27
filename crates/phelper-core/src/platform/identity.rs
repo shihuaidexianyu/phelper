@@ -52,15 +52,21 @@ pub(crate) fn probe_identity() -> Result<DeviceIdentity, EngineError> {
     let conn = WMIConnection::new()
         .map_err(|e| EngineError::IdentityFailed(format!("connect cimv2: {e}")))?;
 
-    let board: Vec<Win32BaseBoard> =
-        query_typed(&conn, "identity", "SELECT Manufacturer, Product FROM Win32_BaseBoard")?;
+    let board: Vec<Win32BaseBoard> = query_typed(
+        &conn,
+        "identity",
+        "SELECT Manufacturer, Product FROM Win32_BaseBoard",
+    )?;
     let board = board
         .into_iter()
         .next()
         .ok_or_else(|| EngineError::IdentityFailed("no Win32_BaseBoard".into()))?;
 
-    let bios: Vec<Win32Bios> =
-        query_typed(&conn, "identity", "SELECT SMBIOSBIOSVersion FROM Win32_BIOS")?;
+    let bios: Vec<Win32Bios> = query_typed(
+        &conn,
+        "identity",
+        "SELECT SMBIOSBIOSVersion FROM Win32_BIOS",
+    )?;
     let bios_version = bios
         .into_iter()
         .next()

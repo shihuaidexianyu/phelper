@@ -17,7 +17,9 @@ use tracing::{info, warn};
 use crate::capability::load_board_profile;
 use crate::platform::hp_wmi::actor::{HpActor, HpHandle};
 use crate::platform::identity::probe_identity;
-use crate::telemetry::collectors::{BatteryCollector, HpFanCollector, PdhCollector, PpmCollector};
+use crate::telemetry::collectors::{
+    BatteryCollector, HpFanCollector, PdhCollector, PpmCollector, PresentMonCollector,
+};
 use crate::telemetry::{CollectorBox, TelemetryCoordinator, TelemetryHandle};
 
 pub struct Engine {
@@ -37,6 +39,17 @@ impl Engine {
     /// Probe identity, load the board profile, spawn providers and the
     /// telemetry coordinator.
     pub fn start() -> Result<Self, EngineError> {
+        Self::start_inner(true)
+    }
+
+    /// UI startup variant: OGH detection is diagnostic-only and is completed
+    /// by the app pump after the engine is available. It must not delay the
+    /// first usable telemetry/control state.
+    pub(crate) fn start_without_ogh_scan() -> Result<Self, EngineError> {
+        Self::start_inner(false)
+    }
+
+    fn start_inner(scan_ogh: bool) -> Result<Self, EngineError> {
         let identity = probe_identity()?;
         let board = load_board_profile(&identity.board_id).ok_or_else(|| {
             EngineError::Config(format!(
@@ -49,7 +62,11 @@ impl Engine {
         // §33.1 supplement: second-writer watch. Warn-only, never kills,
         // never blocks startup — a running OGH would fight our single
         // writer from outside the process.
-        let ogh_findings = crate::platform::ogh_watch::scan();
+        let ogh_findings = if scan_ogh {
+            crate::platform::ogh_watch::scan()
+        } else {
+            Vec::new()
+        };
 
         let mut collectors: Vec<CollectorBox> = Vec::new();
         let mut unavailable: Vec<(&'static str, String)> = Vec::new();
@@ -88,6 +105,17 @@ impl Engine {
                 unavailable.push(("windows/pdh", e.to_string()));
             }
         }
+
+        // PresentMon is an optional read-only frame source. It attaches only
+        // when PHELPER_PRESENTMON_PID is explicitly set; a missing service or
+        // target is represented in Diagnostics and never blocks startup.
+        match PresentMonCollector::open() {
+            Ok(c) => collectors.push(Box::new(c)),
+            Err(e) => {
+                warn!(%e, "presentmon provider unavailable");
+                unavailable.push(("presentmon/frames", e.to_string()));
+            }
+        }
         collectors.push(Box::new(BatteryCollector::new()));
         // PPM readbacks (EPP AC/DC): unconditional, unprivileged reads.
         collectors.push(Box::new(PpmCollector::new()));
@@ -117,7 +145,8 @@ impl Engine {
             let report = crate::capability::CapabilityService::probe_runtime(
                 identity.clone(),
                 Some(&board),
-                hp.as_deref().map(|h| h as &dyn phelper_domain::ports::HpPlatform),
+                hp.as_deref()
+                    .map(|h| h as &dyn phelper_domain::ports::HpPlatform),
             );
             for note in &report.capabilities.notes {
                 info!(note = %note, "capability note");
@@ -133,6 +162,7 @@ impl Engine {
                     },
                     crate::control::journal::ControlJournal::default_path(),
                 );
+                cfg.fan_curve_path = Some(crate::persistence::fan_curve_path());
                 let registry = crate::profiles::ProfileRegistry::load_default();
                 for w in &registry.warnings {
                     warn!(warning = %w, "profile load warning");
@@ -194,16 +224,25 @@ impl Engine {
         #[cfg(feature = "control")]
         if let Some(c) = &self.control {
             c.shutdown();
-            info!(elapsed_ms = t.elapsed().as_millis(), "shutdown stage: control coordinator done");
+            info!(
+                elapsed_ms = t.elapsed().as_millis(),
+                "shutdown stage: control coordinator done"
+            );
         }
         let t = std::time::Instant::now();
         self.telemetry.shutdown();
-        info!(elapsed_ms = t.elapsed().as_millis(), "shutdown stage: telemetry done");
+        info!(
+            elapsed_ms = t.elapsed().as_millis(),
+            "shutdown stage: telemetry done"
+        );
         let t = std::time::Instant::now();
         if let Some(hp) = &self.hp {
             hp.shutdown();
         }
-        info!(elapsed_ms = t.elapsed().as_millis(), "shutdown stage: hp actor done");
+        info!(
+            elapsed_ms = t.elapsed().as_millis(),
+            "shutdown stage: hp actor done"
+        );
         info!("engine stopped");
     }
 }

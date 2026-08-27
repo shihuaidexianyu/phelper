@@ -77,7 +77,10 @@ impl KeepAliveService {
         {
             v.push(ReAssert::ThermalMode);
         }
-        if let Some(FanMode::Manual(_)) = observed.fan_mode.value() {
+        if matches!(
+            observed.fan_mode.value(),
+            Some(FanMode::Manual(_) | FanMode::Curve(_))
+        ) {
             v.push(ReAssert::FanLevels);
         }
         if matches!(observed.max_fan.value(), Some(true)) {
@@ -136,7 +139,7 @@ impl KeepAliveService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use phelper_domain::policy::FanLevels;
+    use phelper_domain::policy::{FanCurve, FanLevels};
     use phelper_domain::state::ObservedValue;
 
     fn trusted<T>(value: T) -> ObservedValue<T> {
@@ -167,6 +170,11 @@ mod tests {
         assert_eq!(KeepAliveService::tracked(&o), vec![ReAssert::FanLevels]);
         o.fan_mode = trusted(FanMode::FirmwareAuto);
         assert!(KeepAliveService::tracked(&o).is_empty());
+
+        // A software curve owns the same manual 0x2E path and therefore
+        // needs the same keep-alive signal.
+        o.fan_mode = trusted(FanMode::Curve(FanCurve::balanced()));
+        assert_eq!(KeepAliveService::tracked(&o), vec![ReAssert::FanLevels]);
 
         // Max fan on → tracked; off → not.
         let mut o = ObservedState::default();

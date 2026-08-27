@@ -170,7 +170,9 @@ fn main() -> Result<()> {
         #[cfg(feature = "experimental")]
         Cmd::PowerSpike { order, pl1, pl2 } => {
             if pl1 == pl2 {
-                anyhow::bail!("--pl1 must differ from --pl2 (asymmetric limits arbitrate the byte order)");
+                anyhow::bail!(
+                    "--pl1 must differ from --pl2 (asymmetric limits arbitrate the byte order)"
+                );
             }
             if !(15..=130).contains(&pl1) {
                 anyhow::bail!("--pl1 {pl1}W out of sane envelope 15..=130");

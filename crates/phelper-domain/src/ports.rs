@@ -82,7 +82,10 @@ pub trait HpControl: Send {
     /// `{ctgp, ppab, dstate, gpu_slowdown_temp}`, outsize=0 (hp-wmi.c
     /// `HPWMI_SET_GPU_THERMAL_MODES_QUERY`). Full-structure write — callers
     /// read-modify-write via 0x21 to preserve untouched fields.
-    fn set_gpu_platform_policy(&self, p: crate::policy::GpuPlatformPolicy) -> Result<(), HpWmiError>;
+    fn set_gpu_platform_policy(
+        &self,
+        p: crate::policy::GpuPlatformPolicy,
+    ) -> Result<(), HpWmiError>;
     /// 0x29 CPU power limits (PL1/PL2). On 8BAB the wire order is
     /// `{PL2, PL1, 0xFF, 0xFF}` (S2-arbitrated 2026-08-26 — NOT the kernel
     /// struct order). pl4/cc are not writable yet: implementations reject

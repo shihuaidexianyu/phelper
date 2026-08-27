@@ -3,26 +3,62 @@
 //! Plus the outcome banner (§34: one human sentence, technical detail one
 //! expand away). Pure presentation; dispatch happens in the page/shell.
 
-use gpui::{App, Context, Div, InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px};
+use gpui::{
+    App, Context, Div, InteractiveElement, IntoElement, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+};
 use gpui_component::{ActiveTheme, StyledExt};
 use phelper_core::app::fmt;
 use phelper_core::app::state::{KnobStatus, OutcomeRecord};
-use phelper_domain::command::{ControlStatus, Verification};
+use phelper_domain::command::ControlCommand;
+use phelper_domain::command::ControlStatus;
+use phelper_domain::error::ControlError;
+use phelper_domain::policy::FanMode;
+
+fn command_label(cmd: &ControlCommand) -> String {
+    match cmd {
+        ControlCommand::ApplyProfile { profile } => format!("配置档 · {profile}"),
+        ControlCommand::SetCpuPolicy(_) => "CPU 性能策略".into(),
+        ControlCommand::SetThermalMode(mode) => format!("散热 · {}", fmt::thermal_mode_zh(*mode)),
+        ControlCommand::SetFanMode(FanMode::FirmwareAuto) => "风扇 · 释放控制".into(),
+        ControlCommand::SetFanMode(mode) => format!("风扇 · {}", fmt::fan_mode_zh(mode)),
+        ControlCommand::SetGpuPlatformPolicy(_) | ControlCommand::SetGpuPlatformPolicyPatch(_) => {
+            "GPU 平台".into()
+        }
+        ControlCommand::SetPowerLimits(_) => "功耗限制".into(),
+        ControlCommand::SetMuxMode(_) => "显示模式".into(),
+    }
+}
+
+fn error_label(error: &ControlError) -> &'static str {
+    match error {
+        ControlError::Unsupported => "当前设备不支持",
+        ControlError::UnsafeRequest { .. } => "请求未通过安全检查",
+        ControlError::PermissionDenied => "需要管理员权限",
+        ControlError::DriverUnavailable { .. } | ControlError::BackendUnavailable { .. } => {
+            "控制组件不可用"
+        }
+        ControlError::FirmwareRejected { .. } => "设备拒绝了设置",
+        ControlError::VerificationFailed { .. } => "设置未生效",
+        ControlError::Timeout => "操作超时",
+        ControlError::Busy => "请稍后重试",
+        ControlError::UnknownProfile { .. } => "找不到该配置档",
+    }
+}
 
 /// Short lifecycle badge for a knob row; `None` when Idle.
 pub fn status_badge(cx: &App, status: &KnobStatus) -> Option<Div> {
     let theme = cx.theme();
     let (text, color) = match status {
         KnobStatus::Idle => return None,
-        KnobStatus::Pending => ("排队中…", theme.info),
-        KnobStatus::InFlight(_) => ("执行中…", theme.info),
-        KnobStatus::Applied { verification, .. } => match verification {
-            Verification::Verified => ("已验证", theme.success),
-            Verification::TrustedNoReadback => ("信任写入", theme.success),
-            Verification::Skipped => ("已应用", theme.muted_foreground),
-            Verification::Failed { .. } => ("验证失败", theme.danger),
-        },
-        KnobStatus::Partial { .. } => ("部分完成", theme.warning),
+        // The button's disabled state already prevents duplicate writes.
+        // Showing a transient lifecycle word beside every control adds noise
+        // and was especially misleading during the normal coalescing window.
+        KnobStatus::Pending | KnobStatus::InFlight(_) => return None,
+        // The page-level outcome banner already confirms success. Repeating
+        // "已应用" beside every control adds noise without a new decision.
+        KnobStatus::Applied { .. } => return None,
+        KnobStatus::Partial { .. } => ("未完全应用", theme.warning),
         KnobStatus::Failed { .. } => ("失败", theme.danger),
     };
     Some(
@@ -35,8 +71,8 @@ pub fn status_badge(cx: &App, status: &KnobStatus) -> Option<Div> {
     )
 }
 
-/// One knob row. `observed` is the honest AR-10 readback text ("当前：42
-/// （已验证）" / "期望值" for knobs with no readback channel).
+/// One knob row. `observed` is the current value or the intended value when
+/// the platform has no readback channel.
 #[allow(clippy::too_many_arguments)]
 pub fn knob_row(
     cx: &App,
@@ -76,8 +112,6 @@ pub fn knob_row(
         );
     if let Some(badge) = status_badge(cx, status) {
         row = row.child(badge);
-    } else {
-        row = row.child(div().w(px(72.)));
     }
     let mut col = div().v_flex().w_full().child(row);
     if let Some(reason) = disabled_reason {
@@ -92,6 +126,60 @@ pub fn knob_row(
     col
 }
 
+/// Compact control row used by the performance cockpit. The regular row is
+/// intentionally generous for evidence-heavy pages; this variant puts the
+/// value and lifecycle badge above a full-width control so several related
+/// knobs can share one column without sacrificing slider width.
+#[allow(clippy::too_many_arguments)]
+pub fn compact_knob_row(
+    cx: &App,
+    label: &'static str,
+    control: impl IntoElement,
+    value: String,
+    status: &KnobStatus,
+    disabled_reason: Option<&'static str>,
+) -> Div {
+    let theme = cx.theme();
+    let disabled = disabled_reason.is_some();
+    let mut meta = div()
+        .h_flex()
+        .items_center()
+        .gap_2()
+        .child(div().text_sm().child(label))
+        .child(
+            div()
+                .h_flex()
+                .items_center()
+                .gap_2()
+                .flex_1()
+                .justify_end()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(value),
+                ),
+        );
+    if let Some(badge) = status_badge(cx, status) {
+        meta = meta.child(badge);
+    }
+    let mut row = div().v_flex().gap_1().w_full().py_1().child(meta).child(
+        div()
+            .w_full()
+            .when(disabled, |d| d.opacity(0.45))
+            .child(control),
+    );
+    if let Some(reason) = disabled_reason {
+        row = row.child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(reason),
+        );
+    }
+    row
+}
+
 /// §34 outcome banner: one human sentence for the latest outcome; expand
 /// for the per-step evidence table + the raw error detail.
 pub fn outcome_banner<V: 'static>(
@@ -102,54 +190,61 @@ pub fn outcome_banner<V: 'static>(
 ) -> Option<impl IntoElement> {
     let theme = cx.theme();
     let rec = record?;
+    if matches!(rec.outcome.status, ControlStatus::Applied { .. }) {
+        // A successful write is reflected by the control's current value.
+        // Keeping a second confirmation block only consumes vertical space;
+        // actionable rejected/partial outcomes remain visible.
+        return None;
+    }
     let now = phelper_core::app::now_epoch_ms();
 
     let (status_text, color) = match &rec.outcome.status {
-        ControlStatus::Applied { verification } => {
-            (format!("已应用 · {}", fmt::verification_zh(verification)), theme.success)
-        }
+        ControlStatus::Applied { .. } => return None,
         ControlStatus::Rejected { error } => {
-            (format!("已拒绝 · {}", fmt::control_error_zh(error)), theme.danger)
+            (format!("未应用 · {}", error_label(error)), theme.danger)
         }
-        ControlStatus::Partial => ("部分完成（多步计划中途失败）".into(), theme.warning),
+        ControlStatus::Partial => ("未完全应用".into(), theme.warning),
     };
 
-    let mut body = div()
-        .v_flex()
-        .gap_1()
-        .child(
-            div()
-                .h_flex()
-                .gap_2()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(color)
-                        .child(fmt::command_summary_zh(&rec.outcome.command)),
-                )
-                .child(div().text_sm().text_color(color).child(status_text))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(fmt::age_zh(now, rec.at_epoch_ms)),
-                )
-                .child(
-                    div()
-                        .id(SharedString::from("banner-toggle"))
-                        .px_2()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .text_xs()
-                        .text_color(theme.info)
-                        .hover(|s| s.bg(theme.list_hover))
-                        .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _: &mut Window, cx| {
+    let mut body = div().v_flex().gap_1().child(
+        div()
+            .h_flex()
+            .gap_2()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(color)
+                    .child(command_label(&rec.outcome.command)),
+            )
+            .child(div().text_sm().text_color(color).child(status_text))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(fmt::age_zh(now, rec.at_epoch_ms)),
+            )
+            .child(
+                div()
+                    .id(SharedString::from("banner-toggle"))
+                    .px_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(theme.info)
+                    .hover(|s| s.bg(theme.list_hover))
+                    .on_click(
+                        cx.listener(move |this, _: &gpui::ClickEvent, _: &mut Window, cx| {
                             on_toggle(this);
                             cx.notify();
-                        }))
-                        .child(if expanded { "收起详情" } else { "展开详情" }),
-                ),
-        );
+                        }),
+                    )
+                    .child(if expanded {
+                        "收起详情"
+                    } else {
+                        "展开详情"
+                    }),
+            ),
+    );
 
     if expanded {
         let mut steps = div().v_flex().gap_1().mt_1();

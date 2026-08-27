@@ -233,6 +233,48 @@ pub(crate) const REGISTRY: &[MetricMeta] = &[
          re-pushed ~60 s; GetPowerManagementLimit is NOT_SUPPORTED on AD107)"
     ),
     m!(
+        ids::FRAME_DISPLAYED_FPS,
+        "FPS",
+        MetricSource::PresentMon,
+        250,
+        "PresentMon frame query; explicit PHELPER_PRESENTMON_PID target"
+    ),
+    m!(
+        ids::FRAME_ONE_PERCENT_LOW_FPS,
+        "FPS",
+        MetricSource::PresentMon,
+        250,
+        "1 s rolling p99 displayed frame time, derived from PresentMon"
+    ),
+    m!(
+        ids::FRAME_TIME_MS,
+        "ms",
+        MetricSource::PresentMon,
+        250,
+        "average displayed frame time in the latest PresentMon batch"
+    ),
+    m!(
+        ids::FRAME_CPU_BUSY_MS,
+        "ms",
+        MetricSource::PresentMon,
+        250,
+        "average per-frame CPU busy time from PresentMon"
+    ),
+    m!(
+        ids::FRAME_GPU_TIME_MS,
+        "ms",
+        MetricSource::PresentMon,
+        250,
+        "average per-frame GPU time from PresentMon"
+    ),
+    m!(
+        ids::FRAME_DISPLAY_LATENCY_MS,
+        "ms",
+        MetricSource::PresentMon,
+        250,
+        "average per-frame display latency from PresentMon"
+    ),
+    m!(
         ids::FAN_CPU_RPM,
         "RPM",
         MetricSource::HpWmi,
