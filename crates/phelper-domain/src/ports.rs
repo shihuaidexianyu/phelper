@@ -12,7 +12,9 @@
 
 use crate::error::{HpWmiError, PlatformError};
 use crate::hp::{FanTable, SystemDesignData};
-use crate::policy::{BoostPolicy, FanLevels, GpuPlatformPolicy, MuxMode, ThermalMode};
+use crate::policy::{
+    BoostPolicy, CpuPolicy, FanLevels, GpuPlatformPolicy, MuxMode, ThermalMode, WindowsPpmState,
+};
 use crate::telemetry::{CpuSiliconSample, GpuSample, PowerSample, ProviderStatus, SystemSample};
 
 /// HP platform read surface (implemented by the HpActor handle; the actor
@@ -112,10 +114,55 @@ pub trait CpuPolicyBackend: Send {
     fn read_max_freq_mhz(&self) -> Result<(u32, u32), PlatformError>;
     /// PERFBOOSTMODE as (AC, DC).
     fn read_boost_policy(&self) -> Result<(BoostPolicy, BoostPolicy), PlatformError>;
+    /// PPM minimum performance percentage as (AC, DC).
+    fn read_min_performance(&self) -> Result<(u8, u8), PlatformError>;
+    /// PPM maximum performance percentage as (AC, DC).
+    fn read_max_performance(&self) -> Result<(u8, u8), PlatformError>;
     fn write_epp(&self, ac: Option<u8>, dc: Option<u8>) -> Result<(), PlatformError>;
     fn write_epp1(&self, ac: Option<u8>, dc: Option<u8>) -> Result<(), PlatformError>;
     fn write_max_freq_mhz(&self, ac: Option<u32>, dc: Option<u32>) -> Result<(), PlatformError>;
-    /// The domain models ONE boost value; Windows stores it per rail, so
-    /// the implementation writes the same mode to both AC and DC.
-    fn write_boost_policy(&self, mode: BoostPolicy) -> Result<(), PlatformError>;
+    /// Windows stores boost policy per rail. `None` leaves that rail alone.
+    fn write_boost_policy(
+        &self,
+        ac: Option<BoostPolicy>,
+        dc: Option<BoostPolicy>,
+    ) -> Result<(), PlatformError>;
+    fn write_min_performance(&self, ac: Option<u8>, dc: Option<u8>) -> Result<(), PlatformError>;
+    fn write_max_performance(&self, ac: Option<u8>, dc: Option<u8>) -> Result<(), PlatformError>;
+
+    /// Read the complete Windows software-policy snapshot in one backend
+    /// operation. Backends that do not expose the optional Windows 11 mode
+    /// APIs may return `Ok(None)`; the individual PPM methods remain the
+    /// compatibility surface for the control path.
+    fn read_windows_ppm_state(&self) -> Result<Option<WindowsPpmState>, PlatformError> {
+        Ok(None)
+    }
+
+    /// Convert a complete backend read into the domain CPU model. This is a
+    /// convenience for future backends and makes the sparse-policy meaning
+    /// explicit at the port boundary.
+    fn read_cpu_policy(&self) -> Result<CpuPolicy, PlatformError> {
+        let (epp_ac, epp_dc) = self.read_epp()?;
+        let (epp1_ac, epp1_dc) = self.read_epp1()?;
+        let (max_freq_mhz_ac, max_freq_mhz_dc) = self.read_max_freq_mhz()?;
+        let (boost_policy_ac, boost_policy_dc) = self.read_boost_policy()?;
+        let (min_performance_ac, min_performance_dc) = self.read_min_performance()?;
+        let (max_performance_ac, max_performance_dc) = self.read_max_performance()?;
+        Ok(CpuPolicy {
+            epp_ac: Some(epp_ac),
+            epp_dc: Some(epp_dc),
+            epp1_ac: Some(epp1_ac),
+            epp1_dc: Some(epp1_dc),
+            max_freq_mhz_ac: Some(max_freq_mhz_ac),
+            max_freq_mhz_dc: Some(max_freq_mhz_dc),
+            boost_policy: None,
+            boost_policy_ac: Some(boost_policy_ac),
+            boost_policy_dc: Some(boost_policy_dc),
+            min_performance_ac: Some(min_performance_ac),
+            min_performance_dc: Some(min_performance_dc),
+            max_performance_ac: Some(max_performance_ac),
+            max_performance_dc: Some(max_performance_dc),
+            power_limits: None,
+        })
+    }
 }

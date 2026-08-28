@@ -5,14 +5,17 @@
 //! knowledge lives in phelper-core's platform modules; this crate defines the
 //! vocabulary they speak.
 
+pub mod automatic;
 pub mod board;
 pub mod capability;
 pub mod command;
 pub mod error;
 pub mod hp;
 pub mod identity;
+pub mod os_policy;
 pub mod policy;
 pub mod ports;
 pub mod profile;
+pub mod resident;
 pub mod state;
 pub mod telemetry;

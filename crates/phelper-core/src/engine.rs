@@ -14,18 +14,25 @@ use phelper_domain::error::EngineError;
 use phelper_domain::identity::DeviceIdentity;
 use tracing::{info, warn};
 
+use crate::automatic_scheduler::AutomaticSchedulerHandle;
 use crate::capability::load_board_profile;
+use crate::os_policy::OsPolicyHandle;
 use crate::platform::hp_wmi::actor::{HpActor, HpHandle};
 use crate::platform::identity::probe_identity;
-use crate::telemetry::collectors::{
-    BatteryCollector, HpFanCollector, PdhCollector, PpmCollector, PresentMonCollector,
-};
+use crate::telemetry::collectors::{BatteryCollector, HpFanCollector, PdhCollector, PpmCollector};
 use crate::telemetry::{CollectorBox, TelemetryCoordinator, TelemetryHandle};
 
 pub struct Engine {
     identity: DeviceIdentity,
     board: BoardProfile,
     telemetry: TelemetryHandle,
+    /// Windows process/thread policy writer.  It is independent from the
+    /// HP/EC coordinator but follows the same explicit restore-on-shutdown
+    /// contract.
+    os_policy: OsPolicyHandle,
+    /// Power-aware automatic OS scheduler.  It starts idle and performs no
+    /// process writes until the user selects an automatic mode.
+    automatic_scheduler: AutomaticSchedulerHandle,
     /// Kept for shutdown ordering and for M2 (control + keep-alive will
     /// share this same actor handle).
     hp: Option<Arc<HpHandle>>,
@@ -58,6 +65,12 @@ impl Engine {
             ))
         })?;
         info!(board = %identity.board_id, model = %board.device.marketing_name, "engine starting");
+
+        // Construction is intentionally lazy: CPU topology and process
+        // enumeration happen only when the caller opens the scheduling
+        // surface, not on the first-screen startup path.
+        let os_policy = OsPolicyHandle::new();
+        let automatic_scheduler = AutomaticSchedulerHandle::start(os_policy.clone());
 
         // §33.1 supplement: second-writer watch. Warn-only, never kills,
         // never blocks startup — a running OGH would fight our single
@@ -106,16 +119,6 @@ impl Engine {
             }
         }
 
-        // PresentMon is an optional read-only frame source. It attaches only
-        // when PHELPER_PRESENTMON_PID is explicitly set; a missing service or
-        // target is represented in Diagnostics and never blocks startup.
-        match PresentMonCollector::open() {
-            Ok(c) => collectors.push(Box::new(c)),
-            Err(e) => {
-                warn!(%e, "presentmon provider unavailable");
-                unavailable.push(("presentmon/frames", e.to_string()));
-            }
-        }
         collectors.push(Box::new(BatteryCollector::new()));
         // PPM readbacks (EPP AC/DC): unconditional, unprivileged reads.
         collectors.push(Box::new(PpmCollector::new()));
@@ -162,6 +165,11 @@ impl Engine {
                     },
                     crate::control::journal::ControlJournal::default_path(),
                 );
+                // CapabilityService already took the complete PowrProf
+                // snapshot. Reuse it for the coordinator's initial
+                // ObservedState instead of paying the same startup walk
+                // twice.
+                cfg.windows_ppm = report.windows_ppm.clone();
                 cfg.fan_curve_path = Some(crate::persistence::fan_curve_path());
                 let registry = crate::profiles::ProfileRegistry::load_default();
                 for w in &registry.warnings {
@@ -182,6 +190,8 @@ impl Engine {
             identity,
             board,
             telemetry,
+            os_policy,
+            automatic_scheduler,
             hp,
             ogh_findings,
             #[cfg(feature = "control")]
@@ -201,6 +211,17 @@ impl Engine {
         &self.telemetry
     }
 
+    /// Windows process/thread scheduling policy service.
+    pub fn os_policy(&self) -> &OsPolicyHandle {
+        &self.os_policy
+    }
+
+    /// Power-aware automatic process scheduler.  It is idle by default;
+    /// enabling a mode remains an explicit user action.
+    pub fn automatic_scheduler(&self) -> &AutomaticSchedulerHandle {
+        &self.automatic_scheduler
+    }
+
     /// Second-writer scan findings from startup (empty = clean baseline).
     pub fn ogh_findings(&self) -> &[crate::platform::ogh_watch::OghFinding] {
         &self.ogh_findings
@@ -213,13 +234,28 @@ impl Engine {
         self.control.as_ref()
     }
 
-    /// Graceful stop, AR-12 order: control first (restores firmware
-    /// automatic state: 0x2E{0,0} + 0x27 off + thermal Balanced), then
-    /// telemetry (stops issuing firmware calls), then the HP actor.
+    /// Graceful stop, AR-12 order: stop automatic OS scheduling and restore
+    /// its targets, restore any remaining process/thread OS policies, then
+    /// control (restores firmware automatic state: 0x2E{0,0} + 0x27 off +
+    /// thermal Balanced), telemetry and the HP actor.
     pub fn shutdown(self) {
         // v0.2-e: per-stage timing — the M6 HIL saw one ~38 s window-close
         // that never got a root cause; if a stage ever stalls again, the
         // log names it instead of leaving a silent gap.
+        let t = std::time::Instant::now();
+        self.automatic_scheduler.shutdown();
+        info!(
+            elapsed_ms = t.elapsed().as_millis(),
+            "shutdown stage: automatic scheduler stopped"
+        );
+        let t = std::time::Instant::now();
+        if let Err(error) = self.os_policy.restore_all() {
+            warn!(%error, "shutdown stage: OS policy restore had failures");
+        }
+        info!(
+            elapsed_ms = t.elapsed().as_millis(),
+            "shutdown stage: OS policy restore done"
+        );
         let t = std::time::Instant::now();
         #[cfg(feature = "control")]
         if let Some(c) = &self.control {

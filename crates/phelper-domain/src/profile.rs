@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::os_policy::OsSchedulingPolicy;
 use crate::policy::{CpuPolicy, CpuPowerLimits, FanMode, GpuPlatformPolicy, ThermalMode};
 
 /// A named bundle of desired knob values (architecture.md §36). Every field
@@ -34,6 +35,10 @@ pub struct PerformanceProfile {
     /// a stable build rejects the WHOLE profile before any write (AR-11:
     /// never apply half of a rejected intent).
     pub power_limits: Option<CpuPowerLimits>,
+    /// Optional OS-level policy for a managed process.  A profile only
+    /// describes the policy; applying it still needs an explicit PID/launch
+    /// target so a profile cannot silently alter an unrelated process.
+    pub os_policy: Option<OsSchedulingPolicy>,
 }
 
 /// The 0x22 subset a profile may touch. All fields optional — None merges
@@ -94,6 +99,7 @@ mod tests {
         assert_eq!(p.cpu, CpuPolicy::default());
         assert!(p.gpu_policy.is_none());
         assert!(p.power_limits.is_none());
+        assert!(p.os_policy.is_none());
     }
 
     #[test]

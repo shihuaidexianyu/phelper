@@ -119,6 +119,62 @@ pub(crate) const REGISTRY: &[MetricMeta] = &[
         "PERFEPP1 (class-1 / E-core) DC readback"
     ),
     m!(
+        ids::CPU_MAX_FREQ_AC,
+        "MHz",
+        MetricSource::WindowsPpm,
+        5000,
+        "PROCFREQMAX AC readback — 0 means unlimited"
+    ),
+    m!(
+        ids::CPU_MAX_FREQ_DC,
+        "MHz",
+        MetricSource::WindowsPpm,
+        5000,
+        "PROCFREQMAX DC readback — 0 means unlimited"
+    ),
+    m!(
+        ids::CPU_MIN_PERF_AC,
+        "%",
+        MetricSource::WindowsPpm,
+        5000,
+        "PROCTHROTTLEMIN AC readback"
+    ),
+    m!(
+        ids::CPU_MIN_PERF_DC,
+        "%",
+        MetricSource::WindowsPpm,
+        5000,
+        "PROCTHROTTLEMIN DC readback"
+    ),
+    m!(
+        ids::CPU_MAX_PERF_AC,
+        "%",
+        MetricSource::WindowsPpm,
+        5000,
+        "PROCTHROTTLEMAX AC readback"
+    ),
+    m!(
+        ids::CPU_MAX_PERF_DC,
+        "%",
+        MetricSource::WindowsPpm,
+        5000,
+        "PROCTHROTTLEMAX DC readback"
+    ),
+    m!(
+        ids::CPU_BOOST_AC,
+        "mode",
+        MetricSource::WindowsPpm,
+        5000,
+        "PERFBOOSTMODE AC wire value 0..=6"
+    ),
+    m!(
+        ids::CPU_BOOST_DC,
+        "mode",
+        MetricSource::WindowsPpm,
+        5000,
+        "PERFBOOSTMODE DC wire value 0..=6"
+    ),
+    m!(
         ids::CPU_UTIL_PERCENT,
         "%",
         MetricSource::WindowsPdh,
@@ -231,48 +287,6 @@ pub(crate) const REGISTRY: &[MetricMeta] = &[
         500,
         "NVML nvmlDeviceGetEnforcedPowerLimit (TGP cap, quasi-static — \
          re-pushed ~60 s; GetPowerManagementLimit is NOT_SUPPORTED on AD107)"
-    ),
-    m!(
-        ids::FRAME_DISPLAYED_FPS,
-        "FPS",
-        MetricSource::PresentMon,
-        250,
-        "PresentMon frame query; explicit PHELPER_PRESENTMON_PID target"
-    ),
-    m!(
-        ids::FRAME_ONE_PERCENT_LOW_FPS,
-        "FPS",
-        MetricSource::PresentMon,
-        250,
-        "1 s rolling p99 displayed frame time, derived from PresentMon"
-    ),
-    m!(
-        ids::FRAME_TIME_MS,
-        "ms",
-        MetricSource::PresentMon,
-        250,
-        "average displayed frame time in the latest PresentMon batch"
-    ),
-    m!(
-        ids::FRAME_CPU_BUSY_MS,
-        "ms",
-        MetricSource::PresentMon,
-        250,
-        "average per-frame CPU busy time from PresentMon"
-    ),
-    m!(
-        ids::FRAME_GPU_TIME_MS,
-        "ms",
-        MetricSource::PresentMon,
-        250,
-        "average per-frame GPU time from PresentMon"
-    ),
-    m!(
-        ids::FRAME_DISPLAY_LATENCY_MS,
-        "ms",
-        MetricSource::PresentMon,
-        250,
-        "average per-frame display latency from PresentMon"
     ),
     m!(
         ids::FAN_CPU_RPM,

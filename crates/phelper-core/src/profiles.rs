@@ -165,6 +165,7 @@ fn builtins() -> Vec<(&'static str, PerformanceProfile)> {
                 },
                 gpu_policy: None,
                 power_limits: None,
+                os_policy: None,
             },
         ),
         (
@@ -196,6 +197,7 @@ fn builtins() -> Vec<(&'static str, PerformanceProfile)> {
                     slowdown_temp_c: None,
                 }),
                 power_limits: None,
+                os_policy: None,
             },
         ),
         (
@@ -219,6 +221,7 @@ fn builtins() -> Vec<(&'static str, PerformanceProfile)> {
                     slowdown_temp_c: None,
                 }),
                 power_limits: None,
+                os_policy: None,
             },
         ),
         (
@@ -237,6 +240,7 @@ fn builtins() -> Vec<(&'static str, PerformanceProfile)> {
                 },
                 gpu_policy: None,
                 power_limits: None,
+                os_policy: None,
             },
         ),
     ]
@@ -287,6 +291,12 @@ fan = { manual = { cpu = 25, gpu = 30 } }
 [cpu]
 epp_ac = 80
 boost_policy = "efficient_aggressive"
+boost_ac = "aggressive"
+boost_dc = "efficient_enabled"
+min_perf_ac = 20
+min_perf_dc = 5
+max_perf_ac = 100
+max_perf_dc = 80
 
 [gpu_policy]
 ctgp = false
@@ -296,6 +306,13 @@ pl1_w = 45
 pl2_w = 90
 pl4_w = 150
 cpu_gpu_concurrent_w = 0
+
+[os_policy]
+cpu_placement = "performance"
+qos = "high"
+process_priority = "above_normal"
+memory_priority = "normal"
+gpu_preference = "high_performance"
 "#;
         let p: PerformanceProfile = toml::from_str(text).expect("parse");
         assert_eq!(p.description, "测试档");
@@ -303,6 +320,12 @@ cpu_gpu_concurrent_w = 0
         assert_eq!(p.fan, Some(FanMode::Manual(FanLevels::new(25, 30))));
         assert_eq!(p.cpu.epp_ac, Some(80));
         assert_eq!(p.cpu.boost_policy, Some(BoostPolicy::EfficientAggressive));
+        assert_eq!(p.cpu.boost_policy_ac, Some(BoostPolicy::Aggressive));
+        assert_eq!(p.cpu.boost_policy_dc, Some(BoostPolicy::EfficientEnabled));
+        assert_eq!(p.cpu.min_performance_ac, Some(20));
+        assert_eq!(p.cpu.min_performance_dc, Some(5));
+        assert_eq!(p.cpu.max_performance_ac, Some(100));
+        assert_eq!(p.cpu.max_performance_dc, Some(80));
         assert_eq!(p.gpu_policy.unwrap().ctgp, Some(false));
         assert_eq!(p.gpu_policy.unwrap().ppab, None);
         assert_eq!(
@@ -313,6 +336,20 @@ cpu_gpu_concurrent_w = 0
                 pl4_w: 150,
                 cpu_gpu_concurrent_w: 0,
             })
+        );
+        let os = p.os_policy.as_ref().expect("os policy");
+        assert_eq!(
+            os.cpu_placement,
+            Some(phelper_domain::os_policy::CpuPlacement::Performance)
+        );
+        assert_eq!(os.qos, Some(phelper_domain::os_policy::QosLevel::High));
+        assert_eq!(
+            os.process_priority,
+            Some(phelper_domain::os_policy::ProcessPriority::AboveNormal)
+        );
+        assert_eq!(
+            os.gpu_preference,
+            Some(phelper_domain::os_policy::GpuPreference::HighPerformance)
         );
         // And it serializes back to parseable TOML.
         let out = to_toml(&p).expect("serialize");

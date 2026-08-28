@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 description = "GPUI desktop shell for phelper (OMEN 16-wf0032TX / board 8BAB). Self-elevating (runas relaunch) — see below."
+build = "build.rs"
 
 # The requireAdministrator manifest this crate would need is impossible:
 # gpui.lib force-embeds its own asInvoker RT_MANIFEST resource (gpui's
@@ -64,10 +65,16 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 
+[build-dependencies]
+# The generated resource contains only the app icon. GPUI already owns the
+# manifest resource, so this deliberately does not add a second manifest.
+embed-resource = "3.0"
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }

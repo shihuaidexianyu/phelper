@@ -15,7 +15,7 @@
 
 它不是对现有 Omen Gaming Hub（OGH）的简单重制，也不是对 OmenSuperHub 的 UI 换皮。项目的目标是建立一个长期可维护、可验证、低开销、控制行为透明的性能控制平台：
 
-- 统一观察 CPU、GPU、散热、系统负载和游戏帧性能；
+- 统一观察 CPU、GPU、散热和系统负载；
 - 统一管理 CPU power policy、HP 平台性能模式、GPU power policy 和风扇；MUX 只保留必要的只读状态/能力记录；
 - 明确区分“软件希望硬件处于什么状态”与“硬件实际上处于什么状态”；
 - 优先使用 Windows、HP Firmware、NVIDIA 等正式接口；
@@ -85,11 +85,10 @@ Windows 11
 4. NVIDIA GPU 遥测；
 5. 风扇与 thermal mode 管理；
 6. Profile 管理；
-7. 游戏性能帧遥测；
-8. 可解释的控制状态；
-9. 可追踪日志和诊断能力；
-10. 低空闲资源占用；
-11. 明确的硬件安全边界。
+7. 可解释的控制状态；
+8. 可追踪日志和诊断能力；
+9. 低空闲资源占用；
+10. 明确的硬件安全边界。
 
 ---
 
@@ -349,7 +348,6 @@ flowchart TB
     CAP["Capability Service"]
 
     WIN["Windows Native APIs<br/>PowrProf / PerfLib / PSAPI / IP Helper"]
-    PM["PresentMon"]
     PAWN["PawnIO + Intel MSR<br/>Read-only"]
     NV["NVIDIA APIs<br/>NVAPI / NVML"]
     HP["HP Platform<br/>WMI BIOS / HP Events"]
@@ -362,7 +360,6 @@ flowchart TB
     APP --> CAP
 
     TELE --> WIN
-    TELE --> PM
     TELE --> PAWN
     TELE --> NV
     TELE --> HP
@@ -538,7 +535,6 @@ PerfLib / PDH
 PSAPI
 IP Helper
 Power notifications
-PresentMon adapter
 Tray
 Autostart
 Windows lifecycle
@@ -557,6 +553,9 @@ board overrides
 logs metadata
 migration
 ```
+
+常驻桌面集成（开机自启、OMEN 键和悬浮窗）的边界、权限模型和实施顺序见
+[`docs/resident-desktop-integrations.md`](docs/resident-desktop-integrations.md)。
 
 ---
 
@@ -774,24 +773,20 @@ pub enum MetricQuality {
 
 | Metric | Primary Source | Fallback |
 |---|---|---|
-| FPS | PresentMon | None |
-| Frame time | PresentMon | None |
-| Present latency | PresentMon | None |
-| GPU busy/frame metrics | PresentMon | None |
-| CPU utilization | Windows | PresentMon |
+| CPU utilization | Windows | None |
 | Per-core utilization | Windows | None |
-| CPU package temperature | PawnIO / Intel MSR | PresentMon if verified |
+| CPU package temperature | PawnIO / Intel MSR | None |
 | CPU effective frequency | APERF/MPERF | Windows |
 | CPU package energy | PawnIO / RAPL | None |
-| CPU package power | RAPL delta | PresentMon if verified |
+| CPU package power | RAPL delta | None |
 | CPU thermal status | PawnIO / Intel MSR | None |
-| GPU temperature | NVAPI / NVML | PresentMon |
+| GPU temperature | NVAPI / NVML | None |
 | GPU power | **NVML `nvmlDeviceGetPowerUsage`**（2026-08-25 实机推翻 R5：AD107 Laptop + 驱动 581.x 上 NVML 功率连续可信——睡眠 1.8W / memset 负载 61.7W / 回落 8.4W；同负载与 nvidia-smi 对表一致） | NVAPI ClientPowerTopology（本机实测 num_entries=0，空闲与满载皆然——仅作声明式 fallback） |
-| GPU utilization | NVML/NVAPI | PresentMon |
+| GPU utilization | NVML/NVAPI | None |
 | GPU clocks | NVAPI | NVML |
 | GPU P-State | NVAPI | None |
 | GPU throttle reason | NVAPI GetPerfDecreaseInfo | None |
-| VRAM usage | NVAPI GetMemoryInfoEx（GPU handle；GetMemoryInfo 需要 display handle，hybrid 模式 dGPU 没有） | PresentMon |
+| VRAM usage | NVAPI GetMemoryInfoEx（GPU handle；GetMemoryInfo 需要 display handle，hybrid 模式 dGPU 没有） | None |
 | RAM | Windows | None |
 | Disk | Windows | None |
 | Network | Windows | None |
@@ -805,32 +800,10 @@ pub enum MetricQuality {
 
 ---
 
-# 13. PresentMon 的定位
+# 13. Workload telemetry boundary
 
-PresentMon 不作为万能硬件传感器库。
-
-它的主要职责是：
-
-```text
-FPS
-frame time
-present mode
-CPU/GPU frame timing
-display latency
-process ↔ graphics workload
-游戏性能统计
-```
-
-PresentMon 2.x 的 service/API 同时能够暴露多种硬件 telemetry，因此可以作为部分指标 fallback，但项目不依赖它来保证 CPU package temperature / power 的唯一可用性。
-
-为什么保留 PresentMon：
-
-- Windows 上游戏帧测量成熟；
-- ETW-based；
-- 支持不同 graphics API；
-- SDK/API 可供程序使用；
-- MIT License；
-- 后续可以直接支持游戏 overlay、benchmark 和 profile 对比。
+游戏进程识别、帧率/帧时间采集、延迟分析和 benchmark 链路不属于当前产品范围。
+Telemetry 只负责硬件与 Windows 系统指标；配置档也不会根据前台进程自动切换。
 
 ---
 
@@ -953,31 +926,43 @@ PL1 slider
 
 ```rust
 pub struct CpuPolicy {
-    pub energy_preference_ac: Option<u8>,
-    pub energy_preference_dc: Option<u8>,
+    pub epp_ac: Option<u8>,
+    pub epp_dc: Option<u8>,
 
-    pub max_frequency_ac: Option<u32>,
-    pub max_frequency_dc: Option<u32>,
+    pub epp1_ac: Option<u8>,
+    pub epp1_dc: Option<u8>,
 
+    pub max_freq_mhz_ac: Option<u32>,
+    pub max_freq_mhz_dc: Option<u32>,
+
+    pub min_performance_ac: Option<u8>,
+    pub min_performance_dc: Option<u8>,
+    pub max_performance_ac: Option<u8>,
+    pub max_performance_dc: Option<u8>,
+
+    // Legacy same-value shorthand; rail-specific fields take precedence.
     pub boost_policy: Option<BoostPolicy>,
+    pub boost_policy_ac: Option<BoostPolicy>,
+    pub boost_policy_dc: Option<BoostPolicy>,
 
-    pub power_limits: CpuPowerLimits,
+    pub power_limits: Option<CpuPowerLimits>,
 }
 ```
 
 ---
 
-# 17. CPU Policy 的四个控制维度
+# 17. CPU Policy 的控制维度
 
 ```text
-Responsiveness
-    → EPP
+Performance preference
+    → P-core EPP / E-core EPP
 
 Frequency Envelope
-    → Max Frequency
+    → maximum frequency ceiling
+    → PPM minimum / maximum performance
     → Boost policy
 
-Power Envelope
+Hardware Power Envelope
     → PL1
     → PL2
     → PL4 / concurrent limit
@@ -1049,19 +1034,18 @@ background wakeups
 
 ## 18.2 AC/DC 分离
 
-Profile 应支持：
+Profile 和 CLI 应支持 AC/DC 分离：
 
 ```text
-EPP AC
-EPP DC
-```
-
-未来也可以扩展：
-
-```text
+EPP / EPP1 AC/DC
 Max Frequency AC/DC
+Minimum / Maximum Performance AC/DC
 Boost AC/DC
 ```
+
+这些参数不在同一层：EPP 是偏好；最低/最高性能是 PPM 范围；频率上限是 MHz
+天花板；Boost 是睿频策略；PL1/PL2/PL4 则是 HP 硬件功耗包络。UI 不把它们
+压成一个“性能模式”或一条混合单位的曲线。
 
 ---
 
@@ -1075,6 +1059,9 @@ PowerReadACValueIndex
 PowerReadDCValueIndex
 PowerWriteACValueIndex
 PowerWriteDCValueIndex
+PowerGetUserConfiguredACPowerMode
+PowerGetUserConfiguredDCPowerMode
+PowerRegisterForEffectivePowerModeNotifications
 PowerSetActiveScheme
 ```
 
@@ -1087,6 +1074,33 @@ PowerSetActiveScheme
 - test fixture。
 
 正式软件走原生 Win32 API。
+
+写入边界固定为：解析一次活动计划 GUID → 对指定 AC/DC index 写入 → 用同一个
+GUID 调 `PowerSetActiveScheme` 提交 → 读回验证。`None` 表示该电源轨不修改。
+Windows 11 的用户配置模式和实际生效模式只进入 `WindowsPpmState` 读模型；本项目
+当前不写它们，也不为了让状态标签一致而偷偷切换高层模式。
+
+## 19.1 Windows 模式、活动计划和 PPM index 的关系
+
+```text
+Windows 设置的高层模式
+    └─ 用户选择/策略投票（configured mode，读回）
+
+活动电源计划 GUID
+    └─ PPM setting index
+       ├─ PERFEPP / PERFEPP1
+       ├─ PROCFREQMAX
+       ├─ PROCTHROTTLEMIN / PROCTHROTTLEMAX
+       └─ PERFBOOSTMODE
+
+PowrProf effective-mode notification
+    └─ Windows 当前判定的实际模式（读回）
+```
+
+活动计划中的 AC/DC index 是 phelper 能够精细控制的软件层；它与 HP WMI 的
+Thermal、风扇和 GPU 平台策略，以及实验性的 `0x29` 功耗墙相互独立。Windows
+高层选择和实际生效模式可能与活动计划或 PPM index 呈现不同结果，因此不能把
+任意一个读回值当成其它层的替代品。
 
 ---
 
@@ -1418,9 +1432,7 @@ NVIDIA 层由：
 
 ```text
 NVAPI（hand-rolled FFI：LoadLibrary nvapi64.dll → nvapi_QueryInterface → 函数 ID 表；
-      函数 ID 与结构布局以 LibreHardwareMonitor NvApi.cs + NVIDIA 官方 spec 表交叉定案）
-+
-PresentMon（帧指标，Phase 5）
+       函数 ID 与结构布局以 LibreHardwareMonitor NvApi.cs + NVIDIA 官方 spec 表交叉定案）
 ```
 
 组成。
@@ -1475,13 +1487,9 @@ GeForce / laptop GPU 的具体 metric availability 必须 capability probe。
 ```text
 gpu.temperature
     NVAPI/NVML
-    ↓ fallback
-    PresentMon
 
 gpu.power
     NVML
-    ↓ fallback
-    PresentMon
 
 gpu.clock
     NVAPI
@@ -1578,11 +1586,11 @@ resolve profile
 validate against CapabilitySet
     ↓
 build ControlPlan
-        1. Windows CPU EPP
-        2. CPU frequency envelope
-        3. HP thermal mode
-        4. HP CPU power limits
-        5. HP GPU platform policy
+        1. Windows CPU PPM（EPP / EPP1 / 频率上限 / 性能范围 / Boost）
+        2. HP CPU power limits（0x29，experimental）
+        3. HP GPU platform policy（0x22）
+        4. HP thermal mode
+        5. HP fan / software curve（最后接管）
         6. fan mode
     ↓
 execute
@@ -1832,19 +1840,8 @@ GPU cTGP / PPAB enabled
 aggressive thermal policy
 ```
 
-未来可以使用 PresentMon 数据比较：
-
-```text
-FPS
-1% low
-frame time
-GPU utilization
-CPU package power
-GPU power
-temperature
-```
-
-来标定最优策略。
+最优策略只根据硬件温度、功率、利用率和 Windows 策略读回进行标定，
+不依赖游戏进程或帧数据。
 
 ---
 
@@ -1870,7 +1867,6 @@ benchmark
 
 | Domain | Cadence |
 |---|---|
-| PresentMon frame data | event-driven |
 | CPU/GPU power/temp | 250–500 ms |
 | CPU/GPU utilization | 250–500 ms |
 | Effective clock | 250–500 ms |
@@ -2051,7 +2047,6 @@ SystemDesignData summary
 WMI capabilities
 PawnIO state
 NVAPI state
-PresentMon state
 metric source map
 last control commands
 errors
@@ -2265,7 +2260,6 @@ recent WMI errors
 recent control commands
 PawnIO status
 NVAPI status
-PresentMon status
 ```
 
 避免导出敏感个人数据。
@@ -2468,20 +2462,10 @@ safety fixes
 
 ---
 
-## 53.7 PresentMon
+## 53.7 Workload-specific telemetry
 
-定位：
-
-```text
-gaming / frame telemetry infrastructure
-```
-
-借鉴：
-
-- ETW frame collection；
-- frame metric model；
-- hardware telemetry integration；
-- percentile / frame analytics。
+游戏进程、帧率、帧时间和延迟遥测不纳入当前产品范围。性能控制使用
+硬件传感器与 Windows PPM 读回，避免引入独立的进程追踪和帧采集服务。
 
 ---
 
@@ -2520,7 +2504,7 @@ NVIDIA GPU authoritative driver API
 | 项目 | 许可证 | 本项目使用方式 |
 |---|---|---|
 | OmenCore | **MIT** | 可自由参考实现细节 |
-| PresentMon / NVAPI SDK | **MIT / NVIDIA SDK** | 可直接使用/链接 |
+| NVIDIA NVAPI SDK | **NVIDIA SDK** | 按 SDK 条款使用 |
 | OmenSuperHub | **GPLv3** | 只参考协议行为与实机事实，**不复制代码** |
 | OmenMon / OmenMon-Reborn | **GPLv3** | 同上 |
 | OmenHwCtl | **无 LICENSE（保留所有权利）** | 只参考已发表的协议行为，不复制代码 |
@@ -2582,7 +2566,6 @@ reference hardware verification
 - Linux hp-wmi：GPL；
 - PawnIO：GPL；
 - PawnIO Modules：LGPL 系列；
-- PresentMon：MIT；
 - NVIDIA NVAPI public SDK：MIT；
 - 其他项目按各自 LICENSE。
 
@@ -2699,7 +2682,7 @@ HP WMI 传输（hpqBIntM @ ACPI\PNP0C14\0_0 ✓，insize=0 模式 ✓，
 0x21 GPU 策略 ✓ / 0x52 MUX=Hybrid ✓ / 0x26 诊断位 ✓
 NVIDIA（NVAPI 全指标 ✓；ClientPowerTopology 恒 num_entries=0 → M1 改判 NVML 为功率权威源）
 PawnIO（IntelMSR 模块：TjMax/封装温度/RAPL 功率 ✓，能量单位取 0x606[12:8]）
-Windows PPM（EPP AC/DC、频率上限 ✓）
+Windows PPM（EPP/EPP1、频率上限、性能上下限、Boost 的 AC/DC 读回 ✓）
 ```
 
 产出：capability snapshot JSON + SDD/风扇表实机 fixtures（`crates/phelper-core/tests/fixtures`）。
@@ -2936,6 +2919,42 @@ journal origin=shutdown、风扇回自动 0 RPM；gaming 全绿；负向全前�
 
 ---
 
+## Phase 2.8 — Windows PPM 细粒度软件策略（已完成第一版）
+
+这一步不是增加一组“高性能/均衡”按钮，而是把 Windows 的软件策略拆成可验证
+的参数域，并与 HP 硬件控制保持边界：
+
+```text
+domain：WindowsPpmValues / WindowsPpmState；CpuPolicy 增加
+  min/max performance AC/DC、Boost AC/DC；保留 boost_policy 作为旧 profile
+  的同值兼容简写；Option 仍表示“未指定即不改”
+port：CpuPolicyBackend 增加性能上下限和 AC/DC Boost 的独立读写，以及完整
+  Windows PPM snapshot 读口
+PowrProf：一次 snapshot 读取活动计划、PPM index、Windows 11 configured
+  mode 和 effective mode；写入只针对活动计划的指定 AC/DC index，随后用同一
+  scheme GUID 提交并立即 readback
+capability/safety：每个参数按 AC/DC 完整读回才标记 Supported；写入要求
+  提权；性能下限不得超过同一电源轨的上限；未知值 fail closed
+control：启动复用 capability probe 的 snapshot，避免重复 PowrProf 扫描；
+  EPP → EPP1 → max-freq → min/max performance → Boost 顺序执行；批次后刷新
+  aggregate snapshot；退出不恢复 Windows PPM（它不是 phelper 会话态）
+CLI/UI：新增 min-perf / max-perf，以及 boost --ac/--dc；性能页首屏保留
+  常用 EPP/EPP1/频率上限，“更多参数”展示性能上下限；高层模式只读
+```
+
+Windows 设置中的“最佳节能/均衡/最佳性能”通过
+`PowerGetUserConfiguredAC/DCPowerMode` 观察，实际模式通过
+`PowerRegisterForEffectivePowerModeNotifications` 观察。它们都不会触发 phelper
+写入：高层模式是 Windows 的策略选择/投票结果，不等价于某个 PPM index。MUX
+切换同样继续保持只读并延期。
+
+第一版验证结果：core 163 个单元测试、workspace 全量测试和 clippy 均通过；本机
+`control status` 能读回活动计划、configured/effective mode、EPP/EPP1、Boost、
+频率上限以及 AC/DC 性能上下限。详细参数表和官方 API 链接见
+`docs/windows-power-policy.md`。
+
+---
+
 ## Phase 3 — GPUI Shell
 
 建立：
@@ -2949,6 +2968,8 @@ Settings
 ```
 
 UI 只依赖 AppState；Thermals 已并入 Performance，桌面 Diagnostics 入口已移除。
+Performance 页的首屏只放 EPP/EPP1 和频率上限；PPM 性能上下限放在“更多参数”中，
+并在页头显示活动计划、Windows 配置模式和实际生效模式的简短上下文。
 
 ---
 
@@ -2969,22 +2990,11 @@ Custom
 
 ---
 
-## Phase 5 — Gaming Telemetry
+## Phase 5 — Workload telemetry decision
 
-已落地第一阶段基础设施：通过动态加载 PresentMonAPI2.dll，使用显式
-`PHELPER_PRESENTMON_PID` 建立只读 frame query；provider 失败时降级为
-Unavailable/Degraded，不阻断其他遥测或控制。canonical registry 已包含：
-
-```text
-FPS
-frame time
-1% low
-latency
-```
-
-CPU busy / GPU time 也会在 Monitor/Diagnostics 中暴露。当前 Dashboard 展示 FPS、
-1% Low、帧时间和显示延迟；真实游戏 HIL、进程选择器和 benchmark 导出仍待完成。
-详细运行方式见 `docs/presentmon-integration.md`。
+原计划的游戏进程识别、帧率/帧时间和 benchmark 遥测不纳入当前产品范围，
+相关 provider、metric 和 UI 已移除。现有 telemetry 只覆盖硬件与 Windows
+系统指标。
 
 ---
 
@@ -2996,23 +3006,19 @@ CPU busy / GPU time 也会在 Monitor/Diagnostics 中暴露。当前 Dashboard �
 
 ---
 
-# 59. Future: Auto Tuning
+# 59. Future: Policy Tuning
 
-长期可以利用 telemetry + PresentMon 实现：
+长期可以利用硬件 telemetry 和 Windows PPM 读回实现：
 
 ```text
-workload starts
+observe CPU/GPU load, power and temperature
     ↓
-classify CPU/GPU bottleneck
+compare against the active policy
     ↓
-apply profile
-    ↓
-observe FPS / power / thermal
-    ↓
-adjust power allocation
+suggest a profile or a parameter change
 ```
 
-例如游戏 GPU-bound：
+例如 GPU 长时间高负载而 CPU 功率占用过高：
 
 ```text
 CPU PL1 过高
@@ -3027,7 +3033,38 @@ lower CPU sustained power
 higher GPU platform budget
 ```
 
-但该功能属于未来 policy layer，而不是第一阶段目标。
+但该功能属于未来 policy layer，而不是当前控制闭环的一部分。
+
+---
+
+# 59.1 Future: Power-Aware Automatic Scheduling
+
+自动调度的专项架构设计和 Phase 1 实现边界见 [`docs/automatic-scheduling-architecture.md`](docs/automatic-scheduling-architecture.md)。
+当前已经实现 `Off` / `BatteryEfficiency` 的 core/UI/CLI 闭环；下面的更复杂层仍按文档分阶段推进：
+
+```text
+PowerContext（AC/DC、电量、节能状态、Windows 电源方案）
+    ↓
+Workload / Process eligibility（可接管范围、例外、前后台事实）
+    ↓
+OS policy（CPU Sets、QoS，默认不使用硬 Affinity）
+    ↓
+Hardware intent（通过既有 ControlCoordinator，慢速且有滞回）
+    ↓
+Ownership ledger（baseline、Manual/Automatic owner、PID identity）
+    ↓
+Diff apply / readback / restore
+```
+
+当前决议：
+
+- 第一阶段只验证电池供电下的 `E-core CPU Sets + EcoQoS` 节能路径；
+- 电源事件只触发完整状态重新读取，不在事件回调中直接写入；
+- 不默认修改 Windows 活动电源方案、全局优先级或硬件功耗墙；
+- 前台/后台调度、硬锁 E 核和硬件 profile 联动必须分别经过 A/B 与 HIL 验证；
+- 不重新引入游戏识别、PresentMon、帧率或帧时间功能。
+
+后续每一层在扩大控制范围前必须先通过本文件 §60 的架构审查清单。
 
 ---
 
@@ -3085,7 +3122,7 @@ higher GPU platform budget
       ▼       ▼       ▼     │
  Windows   HP WMI   NVIDIA  │
                             │
-      Windows / PawnIO / NVIDIA / PresentMon
+       Windows / PawnIO / NVIDIA
                      │
                      ▼
                Metric Resolver
@@ -3118,11 +3155,13 @@ higher GPU platform budget
 | Read/write separation | Accepted |
 | ControlCoordinator single writer | Accepted |
 | Windows PPM for EPP | Accepted（实机读回 ✓） |
+| Windows PPM fine controls（EPP/EPP1、频率上限、性能上下限、Boost，AC/DC） | Accepted（PowrProf 读写 + readback ✓） |
+| Windows configured/effective power mode | Read-only context（不与 Windows 设置抢写） |
 | HP WMI as primary OEM control | Accepted（8BAB 实机传输打通 ✓） |
 | PawnIO read-only MSR telemetry | Accepted（实机 RAPL/温度 ✓） |
 | NVIDIA native APIs | Accepted（hand-rolled NVAPI FFI + NVML 功率 mini-FFI） |
 | GPU power = NVML 权威源，ClientPowerTopology 声明式 fallback | Accepted（2026-08-25 实机修订，推翻 R5：NVML 在本机连续可信 1.8→61.7W；Topology 恒 0 条目） |
-| PresentMon for gaming telemetry | Accepted（Phase 5） |
+| Workload/frame telemetry | Rejected（不追踪游戏进程，不采集帧数据） |
 | KeepAliveService（0x10 心跳 60 s + TrustedWrite 重断言） | Accepted（§33.1，M2 随控制落地） |
 | 0x26 max-fan 回读降级为诊断；状态应用自追踪 | Accepted（内核先例） |
 | 0x29 字节序冲突 → 三步验证定案（byte0=PL2/byte1=PL1）→ 永久 Experimental 门禁 | Accepted（§25，M3 实机定案） |
@@ -3133,6 +3172,8 @@ higher GPU platform budget
 | Multi-process architecture | Deferred |
 | Hardware Windows service | Deferred |
 | Custom software fan curve | Implemented（四点安全 MVP；默认 Profile 仍等待实机 soak） |
+| Power-aware automatic scheduling | Phase 1 implemented（`Off` / `BatteryEfficiency`；默认关闭；见 `docs/automatic-scheduling-architecture.md`） |
+| Resident desktop integrations（autostart / OMEN key / overlay） | 已实现；实机 HIL 待完成（见 `docs/resident-desktop-integrations.md`） |
 
 ---
 
@@ -3172,10 +3213,24 @@ higher GPU platform budget
 - `PowerWriteACValueIndex`  
   https://learn.microsoft.com/en-us/windows/win32/api/powersetting/nf-powersetting-powerwriteacvalueindex
 
-## Telemetry
+## Windows Automatic Scheduling（Phase 1 implemented）
 
-- PresentMon  
-  https://github.com/GameTechDev/PresentMon
+- phelper 自动调度架构设计
+  `docs/automatic-scheduling-architecture.md`
+- Windows CPU Sets
+  https://learn.microsoft.com/en-us/windows/win32/procthread/cpu-sets
+- `SetProcessDefaultCpuSets`
+  https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setprocessdefaultcpusets
+- Windows Quality of Service
+  https://learn.microsoft.com/en-us/windows/win32/procthread/quality-of-service
+- `GetSystemPowerStatus`
+  https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getsystempowerstatus
+- `PowerGetActiveScheme`
+  https://learn.microsoft.com/en-us/windows/win32/api/powersetting/nf-powersetting-powergetactivescheme
+- Power Setting GUIDs
+  https://learn.microsoft.com/en-us/windows/win32/power/power-setting-guids
+
+## Telemetry
 
 - PawnIO  
   https://github.com/namazso/PawnIO

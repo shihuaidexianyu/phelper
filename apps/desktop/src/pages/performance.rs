@@ -17,7 +17,9 @@ use phelper_core::app::runtime::AppHandle;
 use phelper_core::app::state::{KnobId, knob_enabled};
 use phelper_core::app::{AppState, validate};
 use phelper_domain::command::ControlCommand;
-use phelper_domain::policy::{CpuPolicy, GpuPlatformPolicy};
+use phelper_domain::policy::{
+    CpuPolicy, GpuPlatformPolicy, WindowsConfiguredPowerMode, WindowsEffectivePowerMode,
+};
 use phelper_domain::profile::GpuPolicyPatch;
 use phelper_domain::state::ObservedValue;
 use phelper_domain::telemetry::ids;
@@ -69,6 +71,30 @@ pub fn freq_dc_cmd(f: f32) -> ControlCommand {
         ..Default::default()
     })
 }
+pub fn min_perf_ac_cmd(f: f32) -> ControlCommand {
+    ControlCommand::SetCpuPolicy(CpuPolicy {
+        min_performance_ac: Some(f.round().clamp(0., 100.) as u8),
+        ..Default::default()
+    })
+}
+pub fn min_perf_dc_cmd(f: f32) -> ControlCommand {
+    ControlCommand::SetCpuPolicy(CpuPolicy {
+        min_performance_dc: Some(f.round().clamp(0., 100.) as u8),
+        ..Default::default()
+    })
+}
+pub fn max_perf_ac_cmd(f: f32) -> ControlCommand {
+    ControlCommand::SetCpuPolicy(CpuPolicy {
+        max_performance_ac: Some(f.round().clamp(0., 100.) as u8),
+        ..Default::default()
+    })
+}
+pub fn max_perf_dc_cmd(f: f32) -> ControlCommand {
+    ControlCommand::SetCpuPolicy(CpuPolicy {
+        max_performance_dc: Some(f.round().clamp(0., 100.) as u8),
+        ..Default::default()
+    })
+}
 
 fn slider_f32(v: SliderValue) -> f32 {
     match v {
@@ -82,6 +108,50 @@ fn observed_u8(v: &ObservedValue<u8>) -> String {
         Some(x) => format!("当前 {x}"),
         None => "当前 —".to_string(),
     }
+}
+
+fn observed_u32(v: &ObservedValue<u32>) -> String {
+    match v.value() {
+        Some(0) => "当前不限".to_string(),
+        Some(x) => format!("当前 {x} MHz"),
+        None => "当前 —".to_string(),
+    }
+}
+
+fn configured_mode_zh(mode: WindowsConfiguredPowerMode) -> &'static str {
+    match mode {
+        WindowsConfiguredPowerMode::BestEfficiency => "节能",
+        WindowsConfiguredPowerMode::Balanced => "均衡",
+        WindowsConfiguredPowerMode::BestPerformance => "性能",
+    }
+}
+
+fn effective_mode_zh(mode: WindowsEffectivePowerMode) -> &'static str {
+    match mode {
+        WindowsEffectivePowerMode::BatterySaver => "电池节能",
+        WindowsEffectivePowerMode::BetterBattery => "更佳电池",
+        WindowsEffectivePowerMode::Balanced => "均衡",
+        WindowsEffectivePowerMode::HighPerformance => "高性能",
+        WindowsEffectivePowerMode::MaxPerformance => "最高性能",
+        WindowsEffectivePowerMode::GameMode => "游戏",
+        WindowsEffectivePowerMode::MixedReality => "混合现实",
+    }
+}
+
+fn windows_policy_summary(state: &AppState) -> Option<String> {
+    let policy = state.windows_ppm.as_ref()?;
+    let effective = policy.effective_mode.map(effective_mode_zh).unwrap_or("—");
+    let configured = match (policy.configured_ac_mode, policy.configured_dc_mode) {
+        (Some(ac), Some(dc)) if ac == dc => configured_mode_zh(ac).to_string(),
+        (Some(ac), Some(dc)) => format!("{} / {}", configured_mode_zh(ac), configured_mode_zh(dc)),
+        (Some(ac), None) => configured_mode_zh(ac).to_string(),
+        (None, Some(dc)) => configured_mode_zh(dc).to_string(),
+        (None, None) => "—".into(),
+    };
+    Some(format!(
+        "{} · Windows {} · 实际 {}",
+        policy.active_scheme_name, configured, effective
+    ))
 }
 
 pub fn render(
@@ -199,8 +269,8 @@ pub fn render(
                 ),
             ));
 
-        // Max frequency has no readback channel; keep the distinction in a
-        // small value line rather than giving it a whole separate card.
+        // Keep the frequency ceiling in the same compact row as EPP. It has
+        // a PowrProf readback now, so show both target and actual value.
         let max_freq =
             |label: &'static str,
              knob: KnobId,
@@ -211,7 +281,12 @@ pub fn render(
                 } else {
                     format!("{set_v} MHz")
                 };
-                compact_slider(label, knob, entity, format!("目标 {set_label}"))
+                let current = if knob == KnobId::MaxFreqAc {
+                    observed_u32(&state.observed.max_freq_ac)
+                } else {
+                    observed_u32(&state.observed.max_freq_dc)
+                };
+                compact_slider(label, knob, entity, format!("目标 {set_label} · {current}"))
             };
         let ac_column = ac_column.child(max_freq("频率上限", KnobId::MaxFreqAc, &perf.freq_ac));
         let dc_column = dc_column.child(max_freq("频率上限", KnobId::MaxFreqDc, &perf.freq_dc));
@@ -250,6 +325,111 @@ pub fn render(
             )
     };
 
+    let bounds_toggle = Button::new("ppm-bounds-toggle")
+        .label(if perf.software_advanced_expanded {
+            "收起"
+        } else {
+            "更多参数"
+        })
+        .outline()
+        .on_click(cx.listener(
+            |this: &mut ShellView, _: &gpui::ClickEvent, _: &mut Window, cx| {
+                let perf = this
+                    .perf
+                    .as_mut()
+                    .expect("performance controls initialized");
+                perf.software_advanced_expanded = !perf.software_advanced_expanded;
+                cx.notify();
+            },
+        ));
+    let bounds_panel = {
+        let mut panel = div()
+            .v_flex()
+            .gap_2()
+            .w_full()
+            .p_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.group_box)
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_base().font_semibold().child("性能边界"))
+                    .child(bounds_toggle),
+            );
+        if perf.software_advanced_expanded {
+            let make_column = |title: &'static str,
+                               min_knob: KnobId,
+                               min_entity: &gpui::Entity<gpui_component::slider::SliderState>,
+                               min_observed: &ObservedValue<u8>,
+                               max_knob: KnobId,
+                               max_entity: &gpui::Entity<gpui_component::slider::SliderState>,
+                               max_observed: &ObservedValue<u8>| {
+                div()
+                    .v_flex()
+                    .gap_1()
+                    .flex_1()
+                    .p_2()
+                    .rounded_md()
+                    .bg(theme.background)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(title),
+                    )
+                    .child(compact_slider(
+                        "最低性能",
+                        min_knob,
+                        min_entity,
+                        format!(
+                            "设 {}% · {}",
+                            epp_val(min_entity),
+                            observed_u8(min_observed)
+                        ),
+                    ))
+                    .child(compact_slider(
+                        "最高性能",
+                        max_knob,
+                        max_entity,
+                        format!(
+                            "设 {}% · {}",
+                            epp_val(max_entity),
+                            observed_u8(max_observed)
+                        ),
+                    ))
+            };
+            panel = panel.child(
+                div()
+                    .h_flex()
+                    .gap_2()
+                    .w_full()
+                    .child(make_column(
+                        "交流电源",
+                        KnobId::MinPerfAc,
+                        &perf.min_perf_ac,
+                        &state.observed.min_performance_ac,
+                        KnobId::MaxPerfAc,
+                        &perf.max_perf_ac,
+                        &state.observed.max_performance_ac,
+                    ))
+                    .child(make_column(
+                        "电池电源",
+                        KnobId::MinPerfDc,
+                        &perf.min_perf_dc,
+                        &state.observed.min_performance_dc,
+                        KnobId::MaxPerfDc,
+                        &perf.max_perf_dc,
+                        &state.observed.max_performance_dc,
+                    )),
+            );
+        }
+        panel
+    };
+
     let page_header = {
         let profile = state.desired.profile.as_deref().unwrap_or("自定义");
         div()
@@ -260,7 +440,10 @@ pub fn render(
                 div()
                     .v_flex()
                     .gap_px()
-                    .child(div().text_xl().font_semibold().child("性能")),
+                    .child(div().text_xl().font_semibold().child("性能"))
+                    .child(div().text_xs().text_color(theme.muted_foreground).child(
+                        windows_policy_summary(state).unwrap_or_else(|| "Windows 软件策略".into()),
+                    )),
             )
             .child(
                 div().h_flex().gap_2().child(
@@ -300,6 +483,7 @@ pub fn render(
             .w_full()
             .child(page_header)
             .child(cpu_card)
+            .child(bounds_panel)
             .child(thermal_content)
             .when_some(drawer, |d, x| d.child(x))
             .when_some(banner, |d, b| d.child(b)),

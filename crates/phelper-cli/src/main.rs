@@ -1,5 +1,6 @@
 mod control;
 mod gpuload;
+mod os_policy;
 mod probe;
 mod telemetry;
 
@@ -25,8 +26,8 @@ enum Cmd {
     Probe(probe::ProbeArgs),
     /// Live telemetry view.
     Telemetry(telemetry::TelemetryArgs),
-    /// M2 control plane: EPP/max-freq/boost (Windows PPM) and thermal/fan
-    /// (HP WMI) with §56 before/command/after evidence.
+    /// Control plane: Windows PPM parameters and HP WMI thermal/fan controls
+    /// with §56 before/command/after evidence.
     Control(control::ControlArgs),
     /// DEV ONLY: burn the dGPU for N seconds (verification load generator).
     GpuLoad(gpuload::GpuLoadArgs),
@@ -40,6 +41,9 @@ enum Cmd {
         #[arg(long, default_value_t = 32)]
         threads: usize,
     },
+    /// Windows process/thread scheduling controls (CPU Sets, QoS, priority,
+    /// memory priority and graphics preference).
+    Os(os_policy::OsPolicyArgs),
     /// DEV ONLY (§57 Stage 1, M4-mini): READ-ONLY MCHBAR cross-check probe.
     /// Zero writes. Cross-validates the PL4 readback channel: MMIO 0x59A0
     /// vs MSR 0x610, then sweeps the SA power block for the factory PL4
@@ -151,6 +155,7 @@ fn main() -> Result<()> {
             println!("cpu-load done ({threads} threads × {seconds}s)");
             Ok(())
         }
+        Cmd::Os(args) => os_policy::run(args),
         Cmd::HpSpike { cpu, gpu } => {
             if cpu % 100 != 0 || gpu % 100 != 0 {
                 anyhow::bail!("fan targets must be multiples of 100 RPM (0x2E wire unit)");

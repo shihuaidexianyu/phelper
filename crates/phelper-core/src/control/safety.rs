@@ -98,6 +98,14 @@ impl SafetySupervisor {
         }
     }
 
+    /// Keep the thermal override latched when the release operation failed.
+    /// The coordinator calls this after a failed transition so the next
+    /// safety tick can retry the release only after the fans are safe again,
+    /// while a failed release itself never leaves the machine unprotected.
+    pub(crate) fn retain_override(&mut self, mode: FanMode) {
+        self.override_saved = Some(mode);
+    }
+
     /// Write-time validation. Runs BEFORE anything touches hardware; every
     /// rejection maps to a structured ControlError, never a raw code.
     pub fn validate(
@@ -105,7 +113,7 @@ impl SafetySupervisor {
         cmd: &ControlCommand,
         caps: &CapabilitySet,
         feed: &dyn ThermalFeed,
-        _observed: &ObservedState,
+        observed: &ObservedState,
     ) -> Result<(), ControlError> {
         match cmd {
             // Unreachable by construction: the coordinator EXPANDS a profile
@@ -226,7 +234,7 @@ impl SafetySupervisor {
                 Ok(())
             }
 
-            ControlCommand::SetCpuPolicy(p) => self.validate_cpu_policy(p, caps),
+            ControlCommand::SetCpuPolicy(p) => self.validate_cpu_policy(p, caps, observed),
 
             ControlCommand::SetThermalMode(_) => require_supported(caps.thermal_mode),
 
@@ -274,7 +282,12 @@ impl SafetySupervisor {
         }
     }
 
-    fn validate_cpu_policy(&self, p: &CpuPolicy, caps: &CapabilitySet) -> Result<(), ControlError> {
+    fn validate_cpu_policy(
+        &self,
+        p: &CpuPolicy,
+        caps: &CapabilitySet,
+        observed: &ObservedState,
+    ) -> Result<(), ControlError> {
         // R8: power limits in M2 poison the WHOLE command.
         if p.power_limits.is_some() {
             return Err(ControlError::Unsupported);
@@ -313,10 +326,69 @@ impl SafetySupervisor {
                 }
             }
         }
-        if p.boost_policy.is_some() {
+        if p.boost_policy.is_some() || p.boost_policy_ac.is_some() || p.boost_policy_dc.is_some() {
             // Boost values 5/6 may be firmware-rejected; readback
             // verification (AR-10) settles that at execute time, not here.
+            if caps.ppm.boost != Support::Supported {
+                return Err(ControlError::Unsupported);
+            }
             require_elevated(caps)?;
+        }
+
+        if p.min_performance_ac.is_some() || p.min_performance_dc.is_some() {
+            require_supported(caps.ppm.min_performance)?;
+            require_elevated(caps)?;
+            for v in [p.min_performance_ac, p.min_performance_dc]
+                .into_iter()
+                .flatten()
+            {
+                if v > 100 {
+                    return Err(ControlError::UnsafeRequest {
+                        reason: format!("minimum performance {v}% out of range 0..=100"),
+                    });
+                }
+            }
+        }
+        if p.max_performance_ac.is_some() || p.max_performance_dc.is_some() {
+            require_supported(caps.ppm.max_performance)?;
+            require_elevated(caps)?;
+            for v in [p.max_performance_ac, p.max_performance_dc]
+                .into_iter()
+                .flatten()
+            {
+                if v > 100 {
+                    return Err(ControlError::UnsafeRequest {
+                        reason: format!("maximum performance {v}% out of range 0..=100"),
+                    });
+                }
+            }
+        }
+
+        for (rail, requested_min, requested_max, current_min, current_max) in [
+            (
+                "AC",
+                p.min_performance_ac,
+                p.max_performance_ac,
+                observed.min_performance_ac.value().copied(),
+                observed.max_performance_ac.value().copied(),
+            ),
+            (
+                "DC",
+                p.min_performance_dc,
+                p.max_performance_dc,
+                observed.min_performance_dc.value().copied(),
+                observed.max_performance_dc.value().copied(),
+            ),
+        ] {
+            let min = requested_min.or(current_min);
+            let max = requested_max.or(current_max);
+            if let (Some(min), Some(max)) = (min, max)
+                && min > max
+            {
+                return Err(ControlError::UnsafeRequest {
+                    reason: format!("{rail} 最低性能 {min}% 不能高于最高性能 {max}%"),
+                });
+            }
         }
         Ok(())
     }
@@ -396,12 +468,27 @@ impl SafetySupervisor {
 
         // Hysteresis release.
         if let Some(saved) = self.override_saved {
+            // A release is a write to the fan controller too.  The 90 s
+            // watchdog window is intentionally much looser than this gate;
+            // handing control back to a curve with a stale temperature could
+            // immediately remove the only known thermal protection.
             if let Some((t, at)) = feed.pkg_temp_c()
-                && now.duration_since(at) <= SENSOR_STALE_AFTER
+                && now.duration_since(at) <= PREWRITE_TEMP_FRESH
                 && t <= RELEASE_MAX_FAN_AT_C
             {
                 self.override_saved = None;
                 return Some(SafetyAction::ReleaseTo(saved));
+            }
+
+            // A failed max-fan write must not be a one-shot event.  Keep
+            // retrying while the temperature is fresh and hot; the
+            // coordinator reports the failed write but remains fail-safe.
+            if let Some((t, at)) = feed.pkg_temp_c()
+                && now.duration_since(at) <= PREWRITE_TEMP_FRESH
+                && t >= FORCE_MAX_FAN_AT_C
+                && observed.max_fan.value() != Some(&true)
+            {
+                return Some(SafetyAction::ForceMaxFan);
             }
             return None;
         }
@@ -498,6 +585,9 @@ mod tests {
         c.ppm.epp = Support::Supported;
         c.ppm.epp1 = Support::Supported;
         c.ppm.max_freq = Support::Supported;
+        c.ppm.boost = Support::Supported;
+        c.ppm.min_performance = Support::Supported;
+        c.ppm.max_performance = Support::Supported;
         c.ppm.write_privileged = true;
         c.gpu_platform_policy = Support::Supported;
         c
@@ -954,6 +1044,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn performance_bounds_require_support_and_stay_ordered() {
+        let s = SafetySupervisor::new();
+        let mut caps = caps_full();
+        caps.ppm.min_performance = Support::Unsupported;
+        let min = CpuPolicy {
+            min_performance_ac: Some(20),
+            ..Default::default()
+        };
+        assert_eq!(
+            s.validate(
+                &ControlCommand::SetCpuPolicy(min),
+                &caps,
+                &FakeFeed::fresh(70.0),
+                &ObservedState::default(),
+            )
+            .unwrap_err(),
+            ControlError::Unsupported
+        );
+
+        let invalid = CpuPolicy {
+            min_performance_ac: Some(80),
+            max_performance_ac: Some(60),
+            ..Default::default()
+        };
+        assert!(matches!(
+            s.validate(
+                &ControlCommand::SetCpuPolicy(invalid),
+                &caps_full(),
+                &FakeFeed::fresh(70.0),
+                &ObservedState::default(),
+            ),
+            Err(ControlError::UnsafeRequest { .. })
+        ));
+    }
+
+    #[test]
+    fn performance_bounds_compare_against_verified_current_value() {
+        let s = SafetySupervisor::new();
+        let mut observed = ObservedState::default();
+        observed.min_performance_ac = phelper_domain::state::ObservedValue::Verified {
+            value: 80,
+            at: Instant::now(),
+            source: "test",
+        };
+        observed.max_performance_ac = phelper_domain::state::ObservedValue::Verified {
+            value: 90,
+            at: Instant::now(),
+            source: "test",
+        };
+        let invalid = CpuPolicy {
+            max_performance_ac: Some(70),
+            ..Default::default()
+        };
+        assert!(matches!(
+            s.validate(
+                &ControlCommand::SetCpuPolicy(invalid),
+                &caps_full(),
+                &FakeFeed::fresh(70.0),
+                &observed,
+            ),
+            Err(ControlError::UnsafeRequest { .. })
+        ));
+    }
+
     // ---- validate: fan ----
 
     #[test]
@@ -1154,6 +1309,37 @@ mod tests {
         assert_eq!(
             s.evaluate(&FakeFeed::fresh(85.0), &o, Instant::now()),
             Some(SafetyAction::ReleaseTo(FanMode::Max))
+        );
+    }
+
+    #[test]
+    fn hysteresis_release_requires_a_curve_fresh_temperature() {
+        let mut s = SafetySupervisor::new();
+        let o = observed_manual(FanLevels::new(20, 20));
+        let fresh = FakeFeed::fresh(90.0);
+        let now = Instant::now();
+        assert_eq!(s.evaluate(&fresh, &o, now), Some(SafetyAction::ForceMaxFan));
+
+        let old = now - PREWRITE_TEMP_FRESH - Duration::from_secs(1);
+        let feed = FakeFeed {
+            temp: Some((80.0, old)),
+            fans: Some((FanLevels::new(20, 20), old)),
+        };
+        assert_eq!(s.evaluate(&feed, &o, now), None);
+        assert!(s.override_active());
+    }
+
+    #[test]
+    fn failed_max_write_is_retried_while_hot() {
+        let mut s = SafetySupervisor::new();
+        let o = observed_manual(FanLevels::new(20, 20));
+        let fresh = FakeFeed::fresh(90.0);
+        let now = Instant::now();
+        assert_eq!(s.evaluate(&fresh, &o, now), Some(SafetyAction::ForceMaxFan));
+        let hotter = FakeFeed::fresh(91.0);
+        assert_eq!(
+            s.evaluate(&hotter, &o, Instant::now()),
+            Some(SafetyAction::ForceMaxFan)
         );
     }
 

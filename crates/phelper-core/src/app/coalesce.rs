@@ -115,6 +115,10 @@ impl Coalescer {
             | KnobId::Epp1Dc
             | KnobId::MaxFreqAc
             | KnobId::MaxFreqDc
+            | KnobId::MinPerfAc
+            | KnobId::MinPerfDc
+            | KnobId::MaxPerfAc
+            | KnobId::MaxPerfDc
             | KnobId::Boost => self.fast_interval,
             KnobId::ThermalMode
             | KnobId::FanMode

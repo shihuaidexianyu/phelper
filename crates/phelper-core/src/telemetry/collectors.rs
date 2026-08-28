@@ -13,9 +13,6 @@ use tracing::{debug, warn};
 
 use super::registry;
 use crate::platform::hp_wmi::actor::HpHandle;
-use crate::platform::presentmon::{
-    FrameEvent, FrameWindow, PresentMonSource, is_application_frame,
-};
 
 /// One scheduled data source. Object-safe; the coordinator boxes these.
 pub(crate) trait Collector: Send {
@@ -389,133 +386,6 @@ impl Collector for PdhCollector {
 }
 
 // ---------------------------------------------------------------------------
-// PresentMon frame telemetry (optional, read-only)
-// ---------------------------------------------------------------------------
-
-pub(crate) struct PresentMonCollector {
-    source: PresentMonSource,
-    frame_window: FrameWindow,
-    status: ProviderStatus,
-}
-
-impl PresentMonCollector {
-    pub(crate) fn open() -> Result<Self, phelper_domain::error::PlatformError> {
-        Ok(Self {
-            source: PresentMonSource::open()?,
-            frame_window: FrameWindow::default(),
-            status: ProviderStatus::Ok,
-        })
-    }
-}
-
-fn average_frame_field(
-    events: &[FrameEvent],
-    field: impl Fn(&FrameEvent) -> Option<f64>,
-) -> Option<f64> {
-    let mut count = 0usize;
-    let mut sum = 0.0;
-    for event in events
-        .iter()
-        .filter(|event| is_application_frame(event.frame_type))
-    {
-        let Some(value) = field(event) else { continue };
-        if value.is_finite() && value >= 0.0 {
-            count += 1;
-            sum += value;
-        }
-    }
-    (count > 0).then_some(sum / count as f64)
-}
-
-impl Collector for PresentMonCollector {
-    fn name(&self) -> &'static str {
-        "presentmon/frames"
-    }
-
-    fn cadence(&self) -> Duration {
-        registry::meta(ids::FRAME_DISPLAYED_FPS)
-            .expect("registry entry")
-            .cadence
-    }
-
-    fn collect(&mut self) -> Vec<MetricSample> {
-        let batch = match self.source.poll() {
-            Ok(batch) => batch,
-            Err(e) => {
-                debug!(%e, "PresentMon frame query failed");
-                self.status = ProviderStatus::Degraded(e.to_string());
-                return Vec::new();
-            }
-        };
-        self.status = ProviderStatus::Ok;
-        let now = Instant::now();
-        self.frame_window.push_batch(now, &batch.events);
-
-        let app_frames = batch
-            .events
-            .iter()
-            .filter(|event| is_application_frame(event.frame_type))
-            .count();
-        let mut out = Vec::with_capacity(6);
-        if app_frames > 0 {
-            let elapsed_s = batch.elapsed.as_secs_f64();
-            if elapsed_s > 0.0 {
-                out.push(fresh(
-                    ids::FRAME_DISPLAYED_FPS,
-                    (app_frames as f64 / elapsed_s).into(),
-                    MetricSource::PresentMon,
-                ));
-            }
-        }
-        if let Some(value) =
-            average_frame_field(&batch.events, |event| event.displayed_frame_time_ms)
-        {
-            out.push(fresh(
-                ids::FRAME_TIME_MS,
-                value.into(),
-                MetricSource::PresentMon,
-            ));
-        }
-        if let Some(value) = average_frame_field(&batch.events, |event| event.cpu_busy_ms) {
-            out.push(fresh(
-                ids::FRAME_CPU_BUSY_MS,
-                value.into(),
-                MetricSource::PresentMon,
-            ));
-        }
-        if let Some(value) = average_frame_field(&batch.events, |event| event.gpu_time_ms) {
-            out.push(fresh(
-                ids::FRAME_GPU_TIME_MS,
-                value.into(),
-                MetricSource::PresentMon,
-            ));
-        }
-        if let Some(value) = average_frame_field(&batch.events, |event| event.display_latency_ms) {
-            out.push(fresh(
-                ids::FRAME_DISPLAY_LATENCY_MS,
-                value.into(),
-                MetricSource::PresentMon,
-            ));
-        }
-        if let Some(value) = self.frame_window.one_percent_low_fps() {
-            out.push(
-                fresh(
-                    ids::FRAME_ONE_PERCENT_LOW_FPS,
-                    value.into(),
-                    MetricSource::PresentMon,
-                )
-                .with_quality(MetricQuality::Estimated),
-            );
-        }
-        out
-    }
-
-    fn status(&self) -> ProviderStatus {
-        self.status.clone()
-    }
-}
-
-// ---------------------------------------------------------------------------
 // AC / battery
 // ---------------------------------------------------------------------------
 
@@ -567,9 +437,9 @@ impl Collector for BatteryCollector {
 // Windows PPM readbacks (PowrProf; unconditional — reads work unelevated)
 // ---------------------------------------------------------------------------
 
-/// EPP + frequency-ceiling readback. These are the CURRENT values of the
-/// M2 write knobs — the telemetry half of the write-verification chain
-/// (AR-10: after a PPM write the metric must move within one cadence).
+/// Windows processor-policy readback. One PowrProf snapshot supplies all
+/// current AC/DC indexes; this avoids re-resolving the active scheme once per
+/// knob and keeps the telemetry path cheap enough for fast startup.
 pub(crate) struct PpmCollector {
     status: ProviderStatus,
 }
@@ -595,44 +465,87 @@ impl Collector for PpmCollector {
 
     fn collect(&mut self) -> Vec<MetricSample> {
         use phelper_domain::telemetry::MetricValue as V;
-        let mut out = Vec::with_capacity(4);
-        match crate::platform::windows_ppm::read_epp() {
-            Ok(epp) => {
-                out.push(fresh(
-                    ids::CPU_EPP_AC,
-                    V::U64(u64::from(epp.ac)),
-                    MetricSource::WindowsPpm,
-                ));
-                out.push(fresh(
-                    ids::CPU_EPP_DC,
-                    V::U64(u64::from(epp.dc)),
-                    MetricSource::WindowsPpm,
-                ));
+        let mut out = Vec::with_capacity(12);
+        let state = match crate::platform::windows_ppm::read_windows_ppm_state() {
+            Ok(state) => {
                 self.status = ProviderStatus::Ok;
+                state
             }
             Err(e) => {
-                debug!(%e, "EPP read failed");
-                self.status = ProviderStatus::Degraded(format!("EPP read: {e}"));
+                debug!(%e, "Windows PPM snapshot read failed");
+                self.status = ProviderStatus::Degraded(format!("PPM read: {e}"));
+                return out;
             }
-        }
-        match crate::platform::windows_ppm::read_epp1() {
-            Ok(epp1) => {
+        };
+        let push_u8 = |out: &mut Vec<MetricSample>, id, value: Option<u8>| {
+            if let Some(value) = value {
                 out.push(fresh(
-                    ids::CPU_EPP1_AC,
-                    V::U64(u64::from(epp1.ac)),
-                    MetricSource::WindowsPpm,
-                ));
-                out.push(fresh(
-                    ids::CPU_EPP1_DC,
-                    V::U64(u64::from(epp1.dc)),
+                    id,
+                    V::U64(u64::from(value)),
                     MetricSource::WindowsPpm,
                 ));
             }
-            Err(e) => {
-                // Class-1 EPP is absent on homogeneous CPUs; a failure here
-                // alone must not flap the provider status.
-                debug!(%e, "EPP1 read failed");
+        };
+        let push_u32 = |out: &mut Vec<MetricSample>, id, value: Option<u32>| {
+            if let Some(value) = value {
+                out.push(fresh(
+                    id,
+                    V::U64(u64::from(value)),
+                    MetricSource::WindowsPpm,
+                ));
             }
+        };
+        for (values, ac) in [(&state.ac, true), (&state.dc, false)] {
+            push_u8(
+                &mut out,
+                if ac { ids::CPU_EPP_AC } else { ids::CPU_EPP_DC },
+                values.epp,
+            );
+            push_u8(
+                &mut out,
+                if ac {
+                    ids::CPU_EPP1_AC
+                } else {
+                    ids::CPU_EPP1_DC
+                },
+                values.epp1,
+            );
+            push_u32(
+                &mut out,
+                if ac {
+                    ids::CPU_MAX_FREQ_AC
+                } else {
+                    ids::CPU_MAX_FREQ_DC
+                },
+                values.max_freq_mhz,
+            );
+            push_u8(
+                &mut out,
+                if ac {
+                    ids::CPU_MIN_PERF_AC
+                } else {
+                    ids::CPU_MIN_PERF_DC
+                },
+                values.min_performance,
+            );
+            push_u8(
+                &mut out,
+                if ac {
+                    ids::CPU_MAX_PERF_AC
+                } else {
+                    ids::CPU_MAX_PERF_DC
+                },
+                values.max_performance,
+            );
+            push_u8(
+                &mut out,
+                if ac {
+                    ids::CPU_BOOST_AC
+                } else {
+                    ids::CPU_BOOST_DC
+                },
+                values.boost_policy.map(u8::from),
+            );
         }
         out
     }

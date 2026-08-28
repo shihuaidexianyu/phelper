@@ -69,7 +69,6 @@ pub fn source_zh(s: MetricSource) -> &'static str {
         MetricSource::WindowsPower => "Windows 电源",
         MetricSource::WindowsPpm => "Windows PPM",
         MetricSource::HpWmi => "HP WMI",
-        MetricSource::PresentMon => "PresentMon",
     }
 }
 
@@ -134,8 +133,26 @@ pub fn command_summary_zh(cmd: &phelper_domain::command::ControlCommand) -> Stri
             if let Some(v) = p.max_freq_mhz_dc {
                 parts.push(format!("DC={v}MHz"));
             }
+            if let Some(v) = p.min_performance_ac {
+                parts.push(format!("最低AC={v}%"));
+            }
+            if let Some(v) = p.min_performance_dc {
+                parts.push(format!("最低DC={v}%"));
+            }
+            if let Some(v) = p.max_performance_ac {
+                parts.push(format!("最高AC={v}%"));
+            }
+            if let Some(v) = p.max_performance_dc {
+                parts.push(format!("最高DC={v}%"));
+            }
             if let Some(b) = p.boost_policy {
                 parts.push(format!("睿频={}", boost_zh(b)));
+            }
+            if let Some(b) = p.boost_policy_ac {
+                parts.push(format!("睿频AC={}", boost_zh(b)));
+            }
+            if let Some(b) = p.boost_policy_dc {
+                parts.push(format!("睿频DC={}", boost_zh(b)));
             }
             if p.power_limits.is_some() {
                 parts.push("功耗墙(!)".to_string());
@@ -234,6 +251,10 @@ pub fn knob_zh(k: KnobId) -> &'static str {
         KnobId::Epp1Dc => "E 核能效偏好（电池）",
         KnobId::MaxFreqAc => "频率上限（交流）",
         KnobId::MaxFreqDc => "频率上限（电池）",
+        KnobId::MinPerfAc => "最低性能（交流）",
+        KnobId::MinPerfDc => "最低性能（电池）",
+        KnobId::MaxPerfAc => "最高性能（交流）",
+        KnobId::MaxPerfDc => "最高性能（电池）",
         KnobId::Boost => "睿频策略",
         KnobId::ThermalMode => "散热模式",
         KnobId::FanMode => "风扇模式",

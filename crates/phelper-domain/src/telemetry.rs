@@ -43,6 +43,18 @@ pub mod ids {
     /// PERFEPP1 — processor class 1 (E-core) EPP on the 13900HX.
     pub const CPU_EPP1_AC: MetricId = MetricId("cpu.epp1_ac");
     pub const CPU_EPP1_DC: MetricId = MetricId("cpu.epp1_dc");
+    /// PPM hard frequency ceiling (0 = unlimited), AC/DC.
+    pub const CPU_MAX_FREQ_AC: MetricId = MetricId("cpu.max_freq_ac");
+    pub const CPU_MAX_FREQ_DC: MetricId = MetricId("cpu.max_freq_dc");
+    /// PPM minimum/maximum performance bounds, AC/DC.
+    pub const CPU_MIN_PERF_AC: MetricId = MetricId("cpu.min_perf_ac");
+    pub const CPU_MIN_PERF_DC: MetricId = MetricId("cpu.min_perf_dc");
+    pub const CPU_MAX_PERF_AC: MetricId = MetricId("cpu.max_perf_ac");
+    pub const CPU_MAX_PERF_DC: MetricId = MetricId("cpu.max_perf_dc");
+    /// PERFBOOSTMODE wire values, AC/DC. The human label belongs at the UI
+    /// boundary; keeping the numeric value preserves the exact readback.
+    pub const CPU_BOOST_AC: MetricId = MetricId("cpu.boost_ac");
+    pub const CPU_BOOST_DC: MetricId = MetricId("cpu.boost_dc");
 
     // CPU/system (Windows)
     pub const CPU_UTIL_PERCENT: MetricId = MetricId("cpu.util_percent");
@@ -81,15 +93,6 @@ pub mod ids {
     // Power source
     pub const POWER_AC_ONLINE: MetricId = MetricId("power.ac_online");
     pub const POWER_BATTERY_PERCENT: MetricId = MetricId("power.battery_percent");
-
-    // Gaming frame telemetry (PresentMon; only available when an explicit
-    // target PID is configured and the PresentMon service/API is present).
-    pub const FRAME_DISPLAYED_FPS: MetricId = MetricId("frame.displayed_fps");
-    pub const FRAME_ONE_PERCENT_LOW_FPS: MetricId = MetricId("frame.1p_low_fps");
-    pub const FRAME_TIME_MS: MetricId = MetricId("frame.time_ms");
-    pub const FRAME_CPU_BUSY_MS: MetricId = MetricId("frame.cpu_busy_ms");
-    pub const FRAME_GPU_TIME_MS: MetricId = MetricId("frame.gpu_time_ms");
-    pub const FRAME_DISPLAY_LATENCY_MS: MetricId = MetricId("frame.display_latency_ms");
 }
 
 /// Where a sample came from. Part of the canonical model so the UI can show
@@ -105,7 +108,6 @@ pub enum MetricSource {
     WindowsPower,
     WindowsPpm,
     HpWmi,
-    PresentMon,
 }
 
 /// Which backend produced a GPU power reading (§12 ownership + declared

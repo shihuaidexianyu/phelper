@@ -52,6 +52,7 @@ impl ShellView {
         s.evidence.back().map(|r| r.at_epoch_ms).hash(&mut h);
         format!("{:?}", s.caps).hash(&mut h);
         format!("{:?}", s.observed).hash(&mut h);
+        format!("{:?}", s.windows_ppm).hash(&mut h);
         format!("{:?}", s.last_saved_fan_curve).hash(&mut h);
         format!("{:?}", s.experimental).hash(&mut h);
 
@@ -83,8 +84,6 @@ impl ShellView {
                     ids::GPU_UTIL_PERCENT,
                     ids::FAN_CPU_RPM,
                     ids::FAN_GPU_RPM,
-                    ids::FRAME_DISPLAYED_FPS,
-                    ids::FRAME_ONE_PERCENT_LOW_FPS,
                 ] {
                     snap.and_then(|x| x.samples.get(&id))
                         .map(|x| format!("{:?}-{:?}", x.quality, x.source))
@@ -142,7 +141,18 @@ impl ShellView {
                 }
                 bucket.hash(&mut h); // values + stale state
             }
-            PageId::Settings => {}
+            PageId::Settings => {
+                format!("{:?}", s.resident).hash(&mut h);
+            }
+            PageId::Applications => {
+                format!("{:?}", s.os_policy).hash(&mut h);
+                format!("{:?}", s.automatic).hash(&mut h);
+                s.os_policy_error.hash(&mut h);
+                // The pump swaps the Arc only after an explicit refresh; the
+                // pointer is a cheap revision marker and avoids hashing a
+                // potentially large process list every 50 ms.
+                (std::sync::Arc::as_ptr(&s.os_processes) as usize).hash(&mut h);
+            }
         }
         h.finish()
     }

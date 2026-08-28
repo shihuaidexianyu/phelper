@@ -6,11 +6,15 @@
 //! plain mpsc so the GPUI-side poll task can drain commands with the rest
 //! of the shell's 250 ms tick — no foreign thread ever touches GPUI state.
 //!
-//! Menu: 显示主窗口 / 退出. 退出 drives the SAME graceful shutdown path as
+//! Menu: 显示主窗口 / 显示悬浮窗 / 退出. 退出 drives the SAME graceful shutdown path as
 //! the window close button (AR-12) — the caller maps TrayCmd::Quit onto
 //! `AppHandle::shutdown` + `cx.quit()`. The tray never writes hardware.
 
-use std::sync::mpsc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::time::Duration;
 
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
@@ -20,6 +24,8 @@ use tray_icon::{MouseButton, TrayIconBuilder, TrayIconEvent};
 pub enum TrayCmd {
     /// Restore the (possibly minimized-to-tray) main window.
     Show,
+    /// Toggle the compact read-only overlay.
+    ToggleOverlay,
     /// Graceful quit — same path as the window close button (AR-12).
     Quit,
 }
@@ -27,15 +33,19 @@ pub enum TrayCmd {
 /// Install the tray icon + menu. Returns the command receiver the shell
 /// polls. The TrayIcon itself is moved into the forwarder thread and lives
 /// for the rest of the process (the shell removes it at exit).
-pub fn install() -> mpsc::Receiver<TrayCmd> {
+pub fn install() -> (mpsc::Receiver<TrayCmd>, Arc<AtomicBool>) {
     let (tx, rx) = mpsc::channel::<TrayCmd>();
+    let running = Arc::new(AtomicBool::new(true));
 
     let menu = Menu::new();
     let show_item = MenuItem::new("显示主窗口", true, None);
+    let overlay_item = MenuItem::new("显示/隐藏悬浮窗", true, None);
     let quit_item = MenuItem::new("退出", true, None);
     let _ = menu.append(&show_item);
+    let _ = menu.append(&overlay_item);
     let _ = menu.append(&quit_item);
     let show_id = show_item.id().clone();
+    let overlay_id = overlay_item.id().clone();
     let quit_id = quit_item.id().clone();
 
     let icon = TrayIconBuilder::new()
@@ -50,20 +60,27 @@ pub fn install() -> mpsc::Receiver<TrayCmd> {
     // shell removes dead tray icons on hover after exit.
     let _icon: &'static _ = Box::leak(Box::new(icon));
 
+    let forward_running = Arc::clone(&running);
     std::thread::Builder::new()
         .name("tray-forward".into())
         .spawn(move || {
             // Only the 'static global event channels are touched here —
             // never the TrayIcon itself.
-            loop {
+            while forward_running.load(Ordering::Acquire) {
                 for ev in MenuEvent::receiver().try_iter() {
-                    let _ = tx.send(if *ev.id() == quit_id {
+                    let command = if *ev.id() == quit_id {
                         TrayCmd::Quit
                     } else if *ev.id() == show_id {
                         TrayCmd::Show
+                    } else if *ev.id() == overlay_id {
+                        TrayCmd::ToggleOverlay
                     } else {
                         continue;
-                    });
+                    };
+                    if tx.send(command).is_err() {
+                        forward_running.store(false, Ordering::Release);
+                        return;
+                    }
                 }
                 for ev in TrayIconEvent::receiver().try_iter() {
                     if let TrayIconEvent::DoubleClick {
@@ -71,7 +88,10 @@ pub fn install() -> mpsc::Receiver<TrayCmd> {
                         ..
                     } = ev
                     {
-                        let _ = tx.send(TrayCmd::Show);
+                        if tx.send(TrayCmd::Show).is_err() {
+                            forward_running.store(false, Ordering::Release);
+                            return;
+                        }
                     }
                 }
                 std::thread::sleep(Duration::from_millis(100));
@@ -79,20 +99,19 @@ pub fn install() -> mpsc::Receiver<TrayCmd> {
         })
         .expect("tray forwarder");
 
-    rx
+    (rx, running)
 }
 
-/// 32×32 RGBA placeholder icon, drawn at runtime: rounded blue square with
-/// three white "dashboard bars". A real .ico asset is deferred (v0.1 note —
-/// the runtime draw avoids adding a binary asset to the build).
+/// 32×32 RGBA app mark, drawn at runtime so the tray has no external asset
+/// dependency. The source-of-truth vector is `assets/phelper-icon.svg`.
 fn make_icon() -> tray_icon::Icon {
     const N: usize = 32;
     let mut rgba = vec![0u8; N * N * 4];
     for y in 0..N {
         for x in 0..N {
             let i = (y * N + x) * 4;
-            // Rounded-corner square (radius 6), transparent outside.
-            let r = 6.0f32;
+            // Rounded-corner square (radius 7), transparent outside.
+            let r = 7.0f32;
             let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
             let inside = {
                 let cx = fx.clamp(r, N as f32 - r);
@@ -102,9 +121,32 @@ fn make_icon() -> tray_icon::Icon {
             if !inside {
                 continue;
             }
-            // White bars at y ∈ [9..12, 15..18, 21..24], x ∈ 9..23.
-            let bar = (9..24).contains(&x) && matches!(y, 9..=11 | 15..=17 | 21..=23);
-            let (rr, gg, bb) = if bar { (255, 255, 255) } else { (79, 140, 255) };
+            // Keep a one-pixel outline around the dark mark.
+            let edge = {
+                let ex = fx.clamp(r, N as f32 - r);
+                let ey = fy.clamp(r, N as f32 - r);
+                ((fx - ex).powi(2) + (fy - ey).powi(2) - (r - 1.0).powi(2)).abs() < 2.0
+                    || x == 1
+                    || y == 1
+                    || x == N - 2
+                    || y == N - 2
+            };
+            let stem = (7..=10).contains(&x) && (8..=25).contains(&y);
+            let bowl = (7..=21).contains(&x) && (7..=11).contains(&y)
+                || (18..=23).contains(&x) && (9..=21).contains(&y)
+                || (7..=21).contains(&x) && (19..=22).contains(&y);
+            let control_point = (20..=24).contains(&x) && (6..=10).contains(&y);
+            let (rr, gg, bb) = if control_point {
+                (255, 180, 84)
+            } else if stem {
+                (102, 230, 245)
+            } else if bowl {
+                (242, 246, 247)
+            } else if edge {
+                (46, 57, 68)
+            } else {
+                (16, 21, 27)
+            };
             rgba[i] = rr;
             rgba[i + 1] = gg;
             rgba[i + 2] = bb;

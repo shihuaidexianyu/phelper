@@ -1,7 +1,7 @@
 # 可行性调研报告 — HP OMEN Gaming Laptop 16-wf0032TX
 
 > 日期：2026-08-25
-> 调研方式：6 路并行一手资料核查（Linux hp-wmi 主线源码、OmenMon/OmenMon-Reborn/OmenHwCtl 源码与文档、OmenSuperHub/OmenCore 源码与 issue、PawnIO/PresentMon/NVAPI 官方资料、GPUI/Windows Rust 生态、HP 官方规格与社区实测记录）
+> 调研方式：多路并行一手资料核查（Linux hp-wmi 主线源码、OmenMon/OmenMon-Reborn/OmenHwCtl 源码与文档、OmenSuperHub/OmenCore 源码与 issue、PawnIO/NVAPI 官方资料、GPUI/Windows Rust 生态、HP 官方规格与社区实测记录）
 > 原则：所有结论只针对 **OMEN Gaming Laptop 16-wf0032TX（SKU 81L09PA）**；不为其他型号做泛化。每条结论标注证据等级。
 
 ---
@@ -55,11 +55,10 @@ Linux 内核、OmenMon、OmenHwCtl、OmenSuperHub 完全一致：
 | CPU 封装功率 | RAPL 0x606+0x611 差分 | ✅ 可行 | 同上；OmenCore 用同一组 MSR |
 | Effective clock | APERF/MPERF（0xE8/0xE7） | ✅ 可行 | 同上 |
 | CPU/内存/磁盘/网络利用率 | Windows PDH/PerfLib | ✅ 可行 | windows-rs 覆盖；无需提权 |
-| GPU 温度/利用率/频率 | NVAPI 公开 surface（NVML 备选） | ✅ 可行 | PresentMon NVAPI provider 用同一组调用 |
+| GPU 温度/利用率/频率 | NVAPI 公开 surface（NVML 备选） | ✅ 可行 | 使用原生驱动调用 |
 | **GPU 功率** | **NVAPI `ClientPowerTopologyGetStatus`（未公开 surface）** | ⚠️ 可行但有保留 | **NVML `nvmlDeviceGetPowerUsage` 在 AD107 返回 NOT_SUPPORTED（NVIDIA 官方论坛确认）**；ClientPower* 被 HWiNFO/LHM/OmenSuperHub 长期使用，在同平台实测有瓦数；空闲时读数可能不稳（0W/卡在 ~47.5W），负载下可靠。`nvapi-sys` 已有绑定 |
 | GPU 降频原因 | `NvAPI_GPU_GetPerfDecreaseInfo` | ⚠️ 基本可行 | AD107 mobile 上逐 bit 覆盖未验证；NVML event reasons 作辅助 |
 | 风扇 RPM | WMI 0x2D | ✅ 可行 | 内核在 8BAB 实测"fan RPMs are readable"；V1 机型返回值为 100-RPM 粒度（level×100） |
-| 帧数据（FPS/frametime/latency） | PresentMon 服务（MIT） | ⚠️ 可行，有集成成本 | 需装 Windows 服务（管理员）+ 运行时动态加载 PresentMonAPI2.dll（named-pipe IPC）；**无 Rust binding**（扁平 C API，自包一层）；**其 GPU power 指标走 NVML，本机不可用**。备选：`ferrisetw` 自收 DXGI ETW，省服务但需自建事件关联 |
 
 ### 控制（Write）
 
@@ -106,9 +105,9 @@ Linux 内核、OmenMon、OmenHwCtl、OmenSuperHub 完全一致：
 
 **R7 — GPUI 生态维护税** — 生态靠 pin git commit 运转（crates.io 版停滞 10 个月；gpui-component 每日提交、6 个月未打 tag、有破坏性变更先例）；GPUI **无系统托盘**（配 `tray-icon`）；**无软件渲染回退**（GPU 驱动异常时 app 起不来的风险要在本机早期验证）；Windows 渲染后端仍在变动（DX11→Vulkan/wgpu）。
 
-**R8 — PresentMon 集成成本** — 服务安装（管理员）+ 无 Rust binding；其价值集中在帧数据（FPS/1% low/latency），GPU 硬件遥测在本机由我们自己的 NVAPI 路径覆盖更可靠。可以把 PresentMon 集成为 Phase 5 的可插拔 provider，失败降级为"无帧数据"而非硬依赖。
+**R8 — 游戏帧遥测不纳入产品范围** — 不实现游戏进程识别、帧率/帧时间采集或 benchmark 链路；性能判断只使用硬件和 Windows 系统指标。
 
-**R9 — 提权模型** — EPP 写入、PawnIO、PresentMon 服务、WMI 写都需要/最好有管理员权限。建议 app manifest `requireAdministrator`（单进程架构下最简方案），只读遥测子集未来可拆非提权模式。
+**R9 — 提权模型** — EPP 写入、PawnIO、WMI 写都需要/最好有管理员权限。建议 app manifest `requireAdministrator`（单进程架构下最简方案），只读遥测子集未来可拆非提权模式。
 
 ---
 
@@ -117,7 +116,7 @@ Linux 内核、OmenMon、OmenHwCtl、OmenSuperHub 完全一致：
 | # | 位置 | 现状 | 修正 |
 |---|---|---|---|
 | 1 | §2.2 reference platform | "HP OMEN 9 / i9-13900HX / RTX 4060" | 内容正确，但应写明完整 SKU：**OMEN Gaming Laptop 16-wf0032TX（81L09PA），预期 board ID 8BAB**（Phase 0 实机复核）；明确"只支持这一台" |
-| 2 | §12 metric ownership | GPU power：NVML primary / PresentMon fallback | **改为 NVAPI（ClientPowerTopology）primary，无 fallback**；NVML 在本机不支持功率读数；PresentMon 的 GPU power 走 NVML 同样不可用 |
+| 2 | §12 metric ownership | GPU power：NVML primary / NVAPI ClientPowerTopology fallback | **改为 NVML primary、NVAPI ClientPowerTopology fallback**；两者均只负责 GPU 硬件功率，不引入工作负载帧数据 |
 | 3 | §22 命令表 | 0x26 Max Fan Get "Very High" | **降级**：内核标记不可靠（Victus S 固件误报）并已不再调用；max-fan 状态应由应用自追踪 |
 | 4 | §23 thermal | V0/V1 映射 + 0x28 byte3 探测 | 映射确认；但 8BAB 静态 V1，无需运行时探测；**补充决策：ObservedState 的 thermal mode 回读只能走 EC 0x59（只读）或"信任写入+keep-alive"**——建议后者为主、EC 只读诊断为辅 |
 | 5 | §24 SDD | 只有 byte 3 | 补充社区已交叉使用的字节：byte 4 bit0 = 软件风扇控制支持（OSH）；byte 5 = 默认 PL4（OmenMon）；byte 7 = MUX 能力位（内核）。其余字节维持"未验证不升级"原则 |
@@ -164,7 +163,6 @@ Linux 内核、OmenMon、OmenHwCtl、OmenSuperHub 完全一致：
 | OmenMon-Reborn | board DB 思路、EC 黑名单（8BAB max-fan-freeze）、只读探测流程 | GPLv3 | 设计模式参考 |
 | OmenCore | **MIT，可直接参考代码**；安全网设计（90°C 迟滞、传感器冻结看门狗）；PawnIO MSR 用法；V1/V2 尺度警示 | MIT | 可重度参考 |
 | OmenHwCtl | 协议考古老前辈；0x29 单字节写法的第二种实现 | **无 LICENSE** | 只参考协议行为，不复制任何代码 |
-| PresentMon | 帧数据基础设施（Phase 5） | MIT | 服务 + 自包 C API |
 | PawnIO | MSR 只读遥测 | GPL+例外 | ioctl 使用，无污染 |
 
 ---
@@ -176,9 +174,8 @@ Linux 内核、OmenMon、OmenHwCtl、OmenSuperHub 完全一致：
 3. 0x2F 风扇表 4 字节输入的语义（内核发全零）。
 4. GPU 功率读数在本机 MUX/Optimus 状态下的稳定性（空闲 0W 问题的实际表现）。
 5. 本 SKU 的 RTX 4060 TGP 实测值（推断 ~120W）。
-6. PresentMon 服务对 Intel CPU 功率/温度的采集路径（若它自己能读 RAPL，可省一部分 PawnIO 依赖——未验证）。
-7. BIOS "76.44" 版本串与 F.xx 家族的关系。
-8. GPUI 渲染后端在本机（RTX 4060 + 可能的老驱动）上的表现。
+6. BIOS "76.44" 版本串与 F.xx 家族的关系。
+7. GPUI 渲染后端在本机（RTX 4060 + 可能的老驱动）上的表现。
 
 ---
 
@@ -192,7 +189,6 @@ Linux 内核、OmenMon、OmenHwCtl、OmenSuperHub 完全一致：
 - github.com/breadeding/OmenSuperHub（OmenHardware.cs、Program.cs、README、issues #86/#8/#42）
 - github.com/theantipopau/omencore（HpWmiBios.cs、ModelCapabilityDatabase.cs、PowerLimitController.cs、QuietSafetyMonitor.cs、HardwareWatchdogService.cs；v4.2.0）
 - github.com/namazso/PawnIO + PawnIO.Modules/IntelMSR.p；github.com/ylws702/cpu-temp；LibreHardwareMonitor IntelCpu.cs/NvidiaGpu.cs
-- github.com/GameTechDev/PresentMon（PresentMonAPI.h、Nvapi/NvmlTelemetryProvider.cpp、README-Service.md）
 - NVIDIA 论坛 AD107 功率线程（forums.developer.nvidia.com/t/280270）、nvidia-smi N/A 线程（t/177240）
 - zed.dev/blog/zed-for-windows-is-here；github.com/longbridge/gpui-component（examples/system_monitor）；crates.io（wmi、nvapi-sys、nvml-wrapper、tray-icon 等）
 - MS Learn：PERFENERGYPREFERENCE、PowrProf API；bitsum power GUID 表

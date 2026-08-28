@@ -11,7 +11,7 @@ use gpui_component::{ActiveTheme, StyledExt};
 use phelper_core::app::fmt;
 use phelper_core::app::state::{KnobStatus, OutcomeRecord};
 use phelper_domain::command::ControlCommand;
-use phelper_domain::command::ControlStatus;
+use phelper_domain::command::{ControlStatus, Verification};
 use phelper_domain::error::ControlError;
 use phelper_domain::policy::FanMode;
 
@@ -57,7 +57,13 @@ pub fn status_badge(cx: &App, status: &KnobStatus) -> Option<Div> {
         KnobStatus::Pending | KnobStatus::InFlight(_) => return None,
         // The page-level outcome banner already confirms success. Repeating
         // "已应用" beside every control adds noise without a new decision.
-        KnobStatus::Applied { .. } => return None,
+        KnobStatus::Applied { verification, .. } => {
+            if matches!(verification, Verification::Failed { .. }) {
+                ("未验证", theme.warning)
+            } else {
+                return None;
+            }
+        }
         KnobStatus::Partial { .. } => ("未完全应用", theme.warning),
         KnobStatus::Failed { .. } => ("失败", theme.danger),
     };
@@ -190,7 +196,13 @@ pub fn outcome_banner<V: 'static>(
 ) -> Option<impl IntoElement> {
     let theme = cx.theme();
     let rec = record?;
-    if matches!(rec.outcome.status, ControlStatus::Applied { .. }) {
+    let unverified = matches!(
+        &rec.outcome.status,
+        ControlStatus::Applied {
+            verification: Verification::Failed { .. }
+        }
+    );
+    if matches!(&rec.outcome.status, ControlStatus::Applied { .. }) && !unverified {
         // A successful write is reflected by the control's current value.
         // Keeping a second confirmation block only consumes vertical space;
         // actionable rejected/partial outcomes remain visible.
@@ -199,7 +211,7 @@ pub fn outcome_banner<V: 'static>(
     let now = phelper_core::app::now_epoch_ms();
 
     let (status_text, color) = match &rec.outcome.status {
-        ControlStatus::Applied { .. } => return None,
+        ControlStatus::Applied { .. } => ("已写入 · 未验证".into(), theme.warning),
         ControlStatus::Rejected { error } => {
             (format!("未应用 · {}", error_label(error)), theme.danger)
         }

@@ -18,11 +18,16 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock, mpsc};
 use std::time::{Duration, Instant};
 
+use phelper_domain::automatic::AutomaticMode;
 use phelper_domain::command::{ControlCommand, ControlOutcome};
 use phelper_domain::error::ControlError;
+use phelper_domain::os_policy::{OsPolicyTarget, OsSchedulingPolicy};
+use phelper_domain::resident::ResidentSnapshot;
 use phelper_domain::telemetry::{MetricId, MetricSample, WindowStats};
 
 use crate::Engine;
+use crate::automatic_scheduler::AutomaticSchedulerHandle;
+use crate::os_policy::OsPolicyHandle;
 use crate::telemetry::TelemetryHandle;
 
 use super::coalesce::{BusyVerdict, Coalescer};
@@ -33,6 +38,16 @@ use super::{now_epoch_ms, validate};
 enum PumpMsg {
     Dispatch(KnobId, ControlCommand),
     RefreshProfiles,
+    RefreshOsData,
+    ApplyOsPolicy {
+        target: OsPolicyTarget,
+        policy: OsSchedulingPolicy,
+    },
+    RestoreOsPolicy(OsPolicyTarget),
+    SetAutomaticMode(AutomaticMode),
+    RefreshAutomatic,
+    SetResident(ResidentSnapshot),
+    SetOverlayVisible(bool),
     Shutdown(mpsc::Sender<()>),
 }
 
@@ -87,6 +102,46 @@ impl AppHandle {
 
     pub fn refresh_profiles(&self) {
         let _ = self.to_pump.send(PumpMsg::RefreshProfiles);
+    }
+
+    /// Refresh the process picker and the lazy CPU topology query.  It is
+    /// explicit so process enumeration never slows the first screen.
+    pub fn refresh_os_data(&self) {
+        let _ = self.to_pump.send(PumpMsg::RefreshOsData);
+    }
+
+    /// Apply a Windows process/thread policy through the engine-owned core
+    /// service.  The UI never opens a Windows handle itself.
+    pub fn apply_os_policy(&self, target: OsPolicyTarget, policy: OsSchedulingPolicy) {
+        let _ = self.to_pump.send(PumpMsg::ApplyOsPolicy { target, policy });
+    }
+
+    pub fn restore_os_policy(&self, target: OsPolicyTarget) {
+        let _ = self.to_pump.send(PumpMsg::RestoreOsPolicy(target));
+    }
+
+    /// Select the power-aware automatic scheduling mode.  The core worker is
+    /// idle until this explicit intent is sent.
+    pub fn set_automatic_mode(&self, mode: AutomaticMode) {
+        let _ = self.to_pump.send(PumpMsg::SetAutomaticMode(mode));
+    }
+
+    pub fn refresh_automatic(&self) {
+        let _ = self.to_pump.send(PumpMsg::RefreshAutomatic);
+    }
+
+    /// Publish resident integration state through the same app-pump read
+    /// model used by the UI. The platform work itself remains off the UI
+    /// thread.
+    pub fn set_resident_snapshot(&self, resident: ResidentSnapshot) {
+        let _ = self.to_pump.send(PumpMsg::SetResident(resident));
+    }
+
+    /// Update only the read-model visibility bit.  Overlay show/hide itself
+    /// belongs to the desktop shell; this keeps the resident worker from
+    /// racing a stale full snapshot over the user's current visibility.
+    pub fn set_overlay_visible(&self, visible: bool) {
+        let _ = self.to_pump.send(PumpMsg::SetOverlayVisible(visible));
     }
 
     /// §39 passthrough for charts (never a hardware call — the store).
@@ -149,6 +204,8 @@ fn pump_main(
         return;
     };
     let control = engine.control().cloned();
+    let os_policy = engine.os_policy().clone();
+    let automatic = engine.automatic_scheduler().clone();
     *telemetry_slot.write().expect("telemetry slot poisoned") = Some(engine.telemetry().clone());
     let mut registry = crate::profiles::ProfileRegistry::load_default();
 
@@ -156,12 +213,15 @@ fn pump_main(
         let mut s = state.write().expect("appstate poisoned");
         s.identity = Some(engine.identity().clone());
         s.ogh_findings = engine.ogh_findings().to_vec();
+        s.os_policy = os_policy.snapshot();
+        s.automatic = automatic.snapshot();
         if let Some(c) = &control {
             let caps = c.capabilities().clone();
             s.experimental = ExperimentalUi::compute(Some(&caps));
             s.caps = Some(caps);
             s.desired = c.desired();
             s.observed = c.observed();
+            s.windows_ppm = c.windows_ppm_state();
             s.last_saved_fan_curve = c.last_saved_fan_curve();
             s.engine = EngineStatus::Running;
         } else {
@@ -254,7 +314,9 @@ fn pump_main(
                     &state,
                     &mut registry,
                     &mut coalescer,
-                    control.is_some(),
+                    control.as_ref(),
+                    &os_policy,
+                    &automatic,
                 );
                 if shutdown_ack.is_none() {
                     while let Ok(msg) = rx.try_recv() {
@@ -263,7 +325,9 @@ fn pump_main(
                             &state,
                             &mut registry,
                             &mut coalescer,
-                            control.is_some(),
+                            control.as_ref(),
+                            &os_policy,
+                            &automatic,
                         );
                         if shutdown_ack.is_some() {
                             break;
@@ -290,6 +354,14 @@ fn pump_main(
             );
             let _ = ack.send(());
             return;
+        }
+        {
+            let mut s = state.write().expect("appstate poisoned");
+            // The automatic worker and manual UI share one OS-policy ledger.
+            // Snapshot both read models together so owner changes made by
+            // the worker cannot leave the app/API with a stale active list.
+            s.os_policy = os_policy.snapshot();
+            s.automatic = automatic.snapshot();
         }
         stages[1] = t.elapsed();
         let t = Instant::now();
@@ -384,6 +456,7 @@ fn pump_main(
             if let Some(c) = &control {
                 s.desired = c.desired();
                 s.observed = c.observed();
+                s.windows_ppm = c.windows_ppm_state();
                 s.last_saved_fan_curve = c.last_saved_fan_curve();
             }
         }
@@ -397,6 +470,7 @@ fn pump_main(
                 let mut s = state.write().expect("appstate poisoned");
                 s.desired = c.desired();
                 s.observed = c.observed();
+                s.windows_ppm = c.windows_ppm_state();
                 s.last_saved_fan_curve = c.last_saved_fan_curve();
             }
         }
@@ -451,11 +525,13 @@ fn handle_pump_msg(
     state: &Arc<RwLock<AppState>>,
     registry: &mut crate::profiles::ProfileRegistry,
     coalescer: &mut Coalescer,
-    has_control: bool,
+    control: Option<&crate::control::ControlHandle>,
+    os_policy: &OsPolicyHandle,
+    automatic: &AutomaticSchedulerHandle,
 ) -> Option<mpsc::Sender<()>> {
     match msg {
         PumpMsg::Dispatch(knob, cmd) => {
-            let fail = dispatch_gate(&cmd, registry, state, has_control);
+            let fail = dispatch_gate(&cmd, registry, state, control.is_some());
             if let Some(err) = fail {
                 state.write().expect("appstate poisoned").set_knob(
                     knob,
@@ -476,14 +552,87 @@ fn handle_pump_msg(
         }
         PumpMsg::RefreshProfiles => {
             *registry = crate::profiles::ProfileRegistry::load_default();
-            // The display registry refreshes; the COORDINATOR's registry was
-            // loaded at engine start and does NOT hot-reload (known M6
-            // limitation — a mid-session TOML edit can make apply answer
-            // UnknownProfile; surfaced as-is).
+            if let Some(control) = control {
+                control.replace_profiles(registry.clone());
+            }
             state
                 .write()
                 .expect("appstate poisoned")
                 .set_profiles(registry);
+            None
+        }
+        PumpMsg::RefreshOsData => {
+            let topology = os_policy.topology();
+            let processes = os_policy.list_processes();
+            let mut s = state.write().expect("appstate poisoned");
+            match topology {
+                Ok(topology) => s.os_policy.topology = Some(topology),
+                Err(error) => s.os_policy_error = Some(error.to_string()),
+            }
+            match processes {
+                Ok(processes) => {
+                    s.os_processes = Arc::new(processes);
+                    if s.os_policy_error.is_some() && s.os_policy.topology.is_some() {
+                        s.os_policy_error = None;
+                    }
+                }
+                Err(error) => s.os_policy_error = Some(error.to_string()),
+            }
+            None
+        }
+        PumpMsg::ApplyOsPolicy { target, policy } => {
+            match os_policy.apply(target, policy) {
+                Ok(_) => {
+                    let mut s = state.write().expect("appstate poisoned");
+                    s.os_policy = os_policy.snapshot();
+                    s.os_policy_error = None;
+                }
+                Err(error) => {
+                    state.write().expect("appstate poisoned").os_policy_error =
+                        Some(error.to_string());
+                }
+            }
+            None
+        }
+        PumpMsg::RestoreOsPolicy(target) => {
+            match os_policy.restore(target) {
+                Ok(_) => {
+                    let mut s = state.write().expect("appstate poisoned");
+                    s.os_policy = os_policy.snapshot();
+                    s.os_policy_error = None;
+                }
+                Err(error) => {
+                    state.write().expect("appstate poisoned").os_policy_error =
+                        Some(error.to_string());
+                }
+            }
+            None
+        }
+        PumpMsg::SetAutomaticMode(mode) => {
+            automatic.set_mode(mode);
+            state.write().expect("appstate poisoned").automatic = automatic.snapshot();
+            None
+        }
+        PumpMsg::RefreshAutomatic => {
+            automatic.refresh();
+            state.write().expect("appstate poisoned").automatic = automatic.snapshot();
+            None
+        }
+        PumpMsg::SetResident(mut resident) => {
+            let mut app_state = state.write().expect("appstate poisoned");
+            // The resident worker publishes capability/autostart changes in
+            // the background. Preserve the shell-owned overlay bit when a
+            // full worker snapshot crosses the pump at the same time as a
+            // tray/OMEN visibility action.
+            resident.overlay_visible = app_state.resident.overlay_visible;
+            app_state.set_resident(resident);
+            None
+        }
+        PumpMsg::SetOverlayVisible(visible) => {
+            state
+                .write()
+                .expect("appstate poisoned")
+                .set_overlay_visible(visible);
             None
         }
         PumpMsg::Shutdown(ack) => Some(ack),

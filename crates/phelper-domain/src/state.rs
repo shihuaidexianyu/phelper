@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use crate::policy::{CpuPolicy, FanMode, GpuPlatformPolicy, MuxMode, ThermalMode};
+use crate::policy::{BoostPolicy, CpuPolicy, FanMode, GpuPlatformPolicy, MuxMode, ThermalMode};
 
 /// What the user wants the machine to be. All fields optional — unset means
 /// "no intent recorded", not "firmware default".
@@ -78,5 +78,13 @@ pub struct ObservedState {
     pub epp_dc: ObservedValue<u8>,
     pub epp1_ac: ObservedValue<u8>,
     pub epp1_dc: ObservedValue<u8>,
+    pub max_freq_ac: ObservedValue<u32>,
+    pub max_freq_dc: ObservedValue<u32>,
+    pub boost_ac: ObservedValue<BoostPolicy>,
+    pub boost_dc: ObservedValue<BoostPolicy>,
+    pub min_performance_ac: ObservedValue<u8>,
+    pub min_performance_dc: ObservedValue<u8>,
+    pub max_performance_ac: ObservedValue<u8>,
+    pub max_performance_dc: ObservedValue<u8>,
     pub power_limits: ObservedValue<crate::policy::CpuPowerLimits>,
 }

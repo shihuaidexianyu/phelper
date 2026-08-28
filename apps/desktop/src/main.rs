@@ -8,11 +8,17 @@
 //! the shell bootstrap; pages live in `pages/`, widgets in `widgets/`.
 
 mod fingerprint;
+mod overlay;
 mod pages;
+mod resident;
 mod shell;
 mod tray;
 mod widgets;
 
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use gpui::*;
@@ -20,7 +26,28 @@ use gpui_component::*;
 
 use phelper_core::app::runtime::AppHandle;
 
+use overlay::OverlayController;
+use resident::ResidentRuntime;
 use shell::ShellView;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchMode {
+    Normal,
+    Background,
+    SignalOmenKey,
+}
+
+fn launch_mode() -> LaunchMode {
+    let mut mode = LaunchMode::Normal;
+    for argument in std::env::args().skip(1) {
+        match argument.as_str() {
+            "--signal-omen-key" => return LaunchMode::SignalOmenKey,
+            "--background" => mode = LaunchMode::Background,
+            _ => {}
+        }
+    }
+    mode
+}
 
 /// GUI process has no console: tracing goes to
 /// `%LOCALAPPDATA%\phelper\logs\phelper-desktop.log` (§60.14).
@@ -84,7 +111,7 @@ fn message_box(title: &str, body: &str) {
 /// (keepalive cross-re-assertion). Fail closed (AR-11): the second process
 /// tells the user where the first one lives and exits.
 #[cfg(target_os = "windows")]
-fn single_instance_guard() -> Option<windows::Win32::Foundation::HANDLE> {
+fn single_instance_guard(background: bool) -> Option<windows::Win32::Foundation::HANDLE> {
     use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
     use windows::Win32::System::Threading::CreateMutexW;
     use windows::core::PCWSTR;
@@ -94,20 +121,55 @@ fn single_instance_guard() -> Option<windows::Win32::Foundation::HANDLE> {
         .collect();
     let h = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }.ok()?;
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        message_box(
-            "phelper 已在运行",
-            "已有一个 phelper 实例在运行（可能最小化在系统托盘）。本实例将退出。",
-        );
+        if !background {
+            message_box(
+                "phelper 已在运行",
+                "已有一个 phelper 实例在运行（可能最小化在系统托盘）。本实例将退出。",
+            );
+        }
         return None;
     }
     Some(h)
 }
 
+fn shutdown_app(
+    cx: &mut App,
+    app: &AppHandle,
+    overlay: &OverlayController,
+    resident: &Arc<Mutex<ResidentRuntime>>,
+    tray_running: &AtomicBool,
+    shutting_down: &AtomicBool,
+    reason: &'static str,
+) {
+    if shutting_down.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    overlay.shutdown();
+    app.set_overlay_visible(false);
+    tray_running.store(false, Ordering::Release);
+    if let Ok(mut runtime) = resident.lock() {
+        runtime.stop();
+    }
+    let t = std::time::Instant::now();
+    tracing::info!(%reason, "ui shutdown begin");
+    app.shutdown(Duration::from_secs(40));
+    tracing::info!(elapsed_ms = t.elapsed().as_millis(), %reason, "ui shutdown end");
+    cx.quit();
+}
+
 fn main() {
+    let mode = launch_mode();
+    if mode == LaunchMode::SignalOmenKey {
+        // The WMI consumer launches this tiny mode.  It must not initialize
+        // GPUI, elevate, create a second engine, or touch hardware.
+        let _ = phelper_core::resident::signal_omen_key();
+        return;
+    }
     if !ensure_elevated() {
         return;
     }
-    let _single_instance = match single_instance_guard() {
+    let background = mode == LaunchMode::Background;
+    let _single_instance = match single_instance_guard(background) {
         Some(h) => h,
         None => return,
     };
@@ -115,96 +177,173 @@ fn main() {
     tracing::info!("phelper-desktop starting");
 
     let app = AppHandle::start_fast();
+    let (ui_settings, warn) = phelper_core::app::settings::UiSettings::load();
+    if let Some(w) = warn {
+        tracing::warn!("{w}");
+    }
+    let executable = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::error!(%error, "cannot resolve phelper executable path");
+            return;
+        }
+    };
+    let (resident_runtime, resident_rx) =
+        match ResidentRuntime::start(app.clone(), ui_settings.resident.clone(), executable) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::error!(%error, "resident runtime unavailable");
+                return;
+            }
+        };
+    let resident_owner = Arc::new(Mutex::new(resident_runtime));
+    let resident_handle = resident_owner
+        .lock()
+        .expect("resident runtime poisoned")
+        .handle();
+    let overlay_controller = OverlayController::new(ui_settings.resident.overlay.position);
+    let shutting_down = Arc::new(AtomicBool::new(false));
 
     gpui_platform::application().run(move |cx| {
         gpui_component::init(cx);
         // Startup theme from the persisted pref (Settings page edits both
         // the TOML and the live theme; broken/missing file → Dark default).
-        let (ui_settings, warn) = phelper_core::app::settings::UiSettings::load();
-        if let Some(w) = warn {
-            tracing::warn!("{w}");
-        }
         let theme = ui_settings.theme;
+        let resident_settings = ui_settings.resident.clone();
+        let ui_settings_for_view = ui_settings.clone();
         pages::settings::apply_pref(theme, cx);
 
+        // Install the tray on the GPUI thread; tray-icon's Windows backend
+        // owns a message window on the calling thread.
+        let (tray_rx, tray_running) = tray::install();
+        let tray_running_for_window = Arc::clone(&tray_running);
         let app_w = app.clone();
+        let overlay_for_shell = overlay_controller.clone();
         let bounds = WindowBounds::Windowed(Bounds {
             origin: point(px(180.), px(90.)),
             size: size(px(900.), px(600.)),
         });
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(bounds),
-                ..Default::default()
-            },
-            |window, cx| {
-                // Tray (D12): install on THIS thread — tray-icon's
-                // Windows impl rides the calling thread's message pump,
-                // which is GPUI's main loop here. The poll task drains
-                // TrayCmd and owns minimize-to-tray hiding.
-                let hwnd = {
-                    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-                    match HasWindowHandle::window_handle(window).map(|h| h.as_raw()) {
-                        Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
-                        _ => 0,
-                    }
-                };
-                let tray_rx = tray::install();
-                let app_t = app_w.clone();
-                cx.spawn(async move |cx| {
-                    loop {
-                        cx.background_executor()
-                            .timer(Duration::from_millis(250))
-                            .await;
-                        let mut quit = false;
-                        while let Ok(cmd) = tray_rx.try_recv() {
-                            match cmd {
-                                tray::TrayCmd::Show => tray::show_window(hwnd),
-                                tray::TrayCmd::Quit => quit = true,
+        let main_window = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(bounds),
+                    focus: !background,
+                    show: !background,
+                    ..Default::default()
+                },
+                |window, cx| {
+                    // The poll task drains TrayCmd and owns minimize-to-tray
+                    // hiding; the tray itself was installed above on this
+                    // GPUI thread.
+                    let hwnd = {
+                        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                        match HasWindowHandle::window_handle(window).map(|h| h.as_raw()) {
+                            Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
+                            _ => 0,
+                        }
+                    };
+                    let app_t = app_w.clone();
+                    let overlay_t = overlay_controller.clone();
+                    let resident_t = Arc::clone(&resident_owner);
+                    let resident_events = resident_rx;
+                    let tray_running_t = tray_running_for_window;
+                    let shutting_t = Arc::clone(&shutting_down);
+                    cx.spawn(async move |cx| {
+                        loop {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(250))
+                                .await;
+                            let mut quit = false;
+                            while let Ok(cmd) = tray_rx.try_recv() {
+                                match cmd {
+                                    tray::TrayCmd::Show => tray::show_window(hwnd),
+                                    tray::TrayCmd::ToggleOverlay => {
+                                        let visible = overlay_t.toggle();
+                                        app_t.set_overlay_visible(visible);
+                                    }
+                                    tray::TrayCmd::Quit => quit = true,
+                                }
+                            }
+                            while let Ok(event) = resident_events.try_recv() {
+                                match event {
+                                    resident::ResidentUiEvent::ToggleOverlay => {
+                                        let visible = overlay_t.toggle();
+                                        app_t.set_overlay_visible(visible);
+                                    }
+                                }
+                            }
+                            if hwnd != 0 {
+                                tray::hide_if_minimized(hwnd);
+                            }
+                            if quit {
+                                cx.update(|cx| {
+                                    shutdown_app(
+                                        cx,
+                                        &app_t,
+                                        &overlay_t,
+                                        &resident_t,
+                                        &tray_running_t,
+                                        &shutting_t,
+                                        "tray quit",
+                                    );
+                                });
+                                break;
                             }
                         }
-                        if hwnd != 0 {
-                            tray::hide_if_minimized(hwnd);
-                        }
-                        if quit {
-                            // Same graceful path as the window close
-                            // button (AR-12): engine restore, then quit.
-                            cx.update(|cx| {
-                                let t = std::time::Instant::now();
-                                tracing::info!("ui shutdown begin (tray quit)");
-                                app_t.shutdown(Duration::from_secs(40));
-                                tracing::info!(
-                                    elapsed_ms = t.elapsed().as_millis(),
-                                    "ui shutdown end (tray quit)"
-                                );
-                                cx.quit();
-                            });
-                            break;
-                        }
-                    }
-                })
-                .detach();
-                let view = cx.new(|cx| ShellView::new(app_w, theme, window, cx));
-                cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
-            },
-        )
-        .expect("open window");
+                    })
+                    .detach();
+                    let view = cx.new(|cx| {
+                        ShellView::new(
+                            app_w,
+                            ui_settings_for_view,
+                            resident_handle,
+                            overlay_for_shell,
+                            window,
+                            cx,
+                        )
+                    });
+                    cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
+                },
+            )
+            .expect("open window");
+
+        let overlay_app = app.clone();
+        let overlay_controller_for_view = overlay_controller.clone();
+        let overlay_handle = cx
+            .open_window(overlay::options(), move |window, cx| {
+                let view = cx.new(|cx| {
+                    overlay::OverlayView::new(overlay_app, overlay_controller_for_view, window, cx)
+                });
+                cx.new(|cx| Root::new(view, window, cx))
+            })
+            .expect("open overlay window");
+        let _overlay_window_id = overlay_handle.window_id();
+        if resident_settings.overlay.visible_on_start {
+            overlay_controller.set_visible(true);
+            app.set_overlay_visible(true);
+        }
 
         // AR-12: closing the last window drives the full graceful engine
         // shutdown (firmware-auto restore) BEFORE process exit. Timed
         // (v0.2-e): the M6 HIL's one ~38 s close now has a begin/end
         // bracket on the UI side to pair with the pump's stage logs.
+        let main_window_id = main_window.window_id();
         let app_c = app.clone();
-        cx.on_window_closed(move |cx, _| {
-            if cx.windows().is_empty() {
-                let t = std::time::Instant::now();
-                tracing::info!("ui shutdown begin (window closed)");
-                app_c.shutdown(Duration::from_secs(40));
-                tracing::info!(
-                    elapsed_ms = t.elapsed().as_millis(),
-                    "ui shutdown end (window closed)"
+        let overlay_c = overlay_controller.clone();
+        let resident_c = Arc::clone(&resident_owner);
+        let tray_running_c = Arc::clone(&tray_running);
+        let shutting_c = Arc::clone(&shutting_down);
+        cx.on_window_closed(move |cx, closed_window_id| {
+            if closed_window_id == main_window_id {
+                shutdown_app(
+                    cx,
+                    &app_c,
+                    &overlay_c,
+                    &resident_c,
+                    &tray_running_c,
+                    &shutting_c,
+                    "window closed",
                 );
-                cx.quit();
             }
         })
         .detach();

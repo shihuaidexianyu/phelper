@@ -3,6 +3,7 @@
 //! state lives in the shell's ViewState, never here. Fan controls are rendered
 //! as part of the combined Performance page.
 
+pub mod applications;
 pub mod dashboard;
 pub mod monitor;
 pub mod performance;
@@ -30,15 +31,17 @@ pub enum PageId {
     Profiles,
     Monitor,
     Settings,
+    Applications,
 }
 
 impl PageId {
-    pub const ALL: [PageId; 5] = [
+    pub const ALL: [PageId; 6] = [
         PageId::Dashboard,
         PageId::Performance,
         PageId::Profiles,
         PageId::Monitor,
         PageId::Settings,
+        PageId::Applications,
     ];
 
     pub fn label(self) -> &'static str {
@@ -48,6 +51,7 @@ impl PageId {
             PageId::Profiles => "配置档",
             PageId::Monitor => "监视器",
             PageId::Settings => "设置",
+            PageId::Applications => "应用",
         }
     }
 
@@ -58,6 +62,7 @@ impl PageId {
             PageId::Profiles => IconName::Star,
             PageId::Monitor => IconName::ChartPie,
             PageId::Settings => IconName::Settings,
+            PageId::Applications => IconName::Cpu,
         }
     }
 }

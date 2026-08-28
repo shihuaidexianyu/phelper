@@ -69,6 +69,12 @@ pub struct PpmCapabilities {
     pub epp1: Support,
     /// PROCFREQMAX read/write via PowrProf.
     pub max_freq: Support,
+    /// PERFBOOSTMODE read/write via PowrProf.
+    pub boost: Support,
+    /// PROCTHROTTLEMIN read/write via PowrProf.
+    pub min_performance: Support,
+    /// PROCTHROTTLEMAX read/write via PowrProf.
+    pub max_performance: Support,
     /// Process token is elevated — PowrProf writes will succeed.
     pub write_privileged: bool,
 }
@@ -79,6 +85,9 @@ impl PpmCapabilities {
             epp: Support::NotProbed,
             epp1: Support::NotProbed,
             max_freq: Support::NotProbed,
+            boost: Support::NotProbed,
+            min_performance: Support::NotProbed,
+            max_performance: Support::NotProbed,
             write_privileged: false,
         }
     }

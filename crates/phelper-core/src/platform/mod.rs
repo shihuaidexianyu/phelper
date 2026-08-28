@@ -14,8 +14,10 @@ pub(crate) mod nvidia;
 pub mod ogh_watch;
 #[cfg(feature = "pawnio")]
 pub(crate) mod pawnio;
-pub(crate) mod presentmon;
+pub(crate) mod windows_os_policy;
 pub(crate) mod windows_pdh;
 pub(crate) mod windows_power;
 pub(crate) mod windows_ppm;
+#[cfg(windows)]
+pub mod windows_resident;
 pub(crate) mod wmi_util;

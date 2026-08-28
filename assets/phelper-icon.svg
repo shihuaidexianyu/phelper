@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  phelper app mark
+  - The lowercase p is the product monogram.
+  - Cyan stem = efficient/system scheduling.
+  - Amber bowl = explicit performance control.
+  Keep the mark free of text so it remains legible at tray size.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" fill="none">
+  <rect x="12" y="12" width="232" height="232" rx="58" fill="#10151B"/>
+  <rect x="13.5" y="13.5" width="229" height="229" rx="56.5" stroke="#2E3944" stroke-width="3"/>
+
+  <!-- monogram: a single geometric lowercase p -->
+  <path d="M78 202V72" stroke="#66E6F5" stroke-width="24" stroke-linecap="round"/>
+  <path d="M78 75H139C169 75 188 93 188 119C188 146 169 163 139 163H78"
+        stroke="#F2F6F7" stroke-width="24" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- one small control point; it is part of the mark, not a status light -->
+  <circle cx="188" cy="75" r="12" fill="#FFB454"/>
+</svg>

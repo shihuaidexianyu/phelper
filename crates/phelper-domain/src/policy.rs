@@ -10,6 +10,33 @@ pub enum ThermalMode {
     Performance,
 }
 
+/// Windows 11's user-selected power-mode overlay. This is deliberately a
+/// read-only observation in phelper for now: it is a policy vote, not the
+/// effective processor policy, and writing it behind the user's back would
+/// compete with Windows Settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsConfiguredPowerMode {
+    BestEfficiency,
+    Balanced,
+    BestPerformance,
+}
+
+/// Effective Windows power mode reported by PowrProf's notification API.
+/// It can differ from the user-configured overlay when another Windows
+/// policy signal wins (battery saver, game mode, Modern Standby, and so on).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsEffectivePowerMode {
+    BatterySaver,
+    BetterBattery,
+    Balanced,
+    HighPerformance,
+    MaxPerformance,
+    GameMode,
+    MixedReality,
+}
+
 /// Display MUX mode. Switching requires a reboot — never auto-applied by
 /// profiles (architecture.md section on MUX; feasibility §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,6 +273,37 @@ pub enum BoostPolicy {
     EfficientAggressiveGuaranteed,
 }
 
+/// Readback of the Windows processor-power-management settings for one
+/// power-source rail. `None` means that this setting is absent or could not
+/// be read on the current Windows/CPU combination.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowsPpmValues {
+    pub epp: Option<u8>,
+    pub epp1: Option<u8>,
+    pub boost_policy: Option<BoostPolicy>,
+    /// 0 = unlimited; otherwise MHz.
+    pub max_freq_mhz: Option<u32>,
+    /// PPM minimum performance percentage, 0..=100.
+    pub min_performance: Option<u8>,
+    /// PPM maximum performance percentage, 0..=100.
+    pub max_performance: Option<u8>,
+}
+
+/// Read-only Windows software-policy snapshot. The active scheme is the
+/// PowrProf scheme whose AC/DC indexes phelper writes; configured/effective
+/// modes are kept alongside it so the UI can expose policy conflicts without
+/// pretending that a high-level mode is the same thing as these parameters.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowsPpmState {
+    pub active_scheme_guid: String,
+    pub active_scheme_name: String,
+    pub configured_ac_mode: Option<WindowsConfiguredPowerMode>,
+    pub configured_dc_mode: Option<WindowsConfiguredPowerMode>,
+    pub effective_mode: Option<WindowsEffectivePowerMode>,
+    pub ac: WindowsPpmValues,
+    pub dc: WindowsPpmValues,
+}
+
 impl From<BoostPolicy> for u8 {
     fn from(p: BoostPolicy) -> u8 {
         match p {
@@ -290,7 +348,27 @@ pub struct CpuPolicy {
     pub epp1_dc: Option<u8>,
     pub max_freq_mhz_ac: Option<u32>,
     pub max_freq_mhz_dc: Option<u32>,
+    /// Legacy shorthand: apply the same boost policy to AC and DC. Kept for
+    /// existing profiles; the rail-specific fields below take precedence.
     pub boost_policy: Option<BoostPolicy>,
+    /// Independent AC/DC boost policy. Windows stores these as two indexes,
+    /// so a profile or command can now change one rail without touching the
+    /// other.
+    #[serde(alias = "boost_ac")]
+    pub boost_policy_ac: Option<BoostPolicy>,
+    #[serde(alias = "boost_dc")]
+    pub boost_policy_dc: Option<BoostPolicy>,
+    /// PPM performance floor/ceiling, independently for AC/DC. These are
+    /// percentages, not MHz: 0..=100. They are intentionally separate from
+    /// EPP, which is a preference rather than a hard bound.
+    #[serde(alias = "min_perf_ac")]
+    pub min_performance_ac: Option<u8>,
+    #[serde(alias = "min_perf_dc")]
+    pub min_performance_dc: Option<u8>,
+    #[serde(alias = "max_perf_ac")]
+    pub max_performance_ac: Option<u8>,
+    #[serde(alias = "max_perf_dc")]
+    pub max_performance_dc: Option<u8>,
     pub power_limits: Option<CpuPowerLimits>,
 }
 

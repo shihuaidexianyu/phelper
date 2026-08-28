@@ -99,13 +99,6 @@ pub fn render(state: &AppState, app: &AppHandle, dash: &DashState, cx: &App) -> 
         ("GPU 功率", ids::GPU_POWER_W, 1, "W"),
         ("GPU 利用率", ids::GPU_UTIL_PERCENT, 0, "%"),
     ];
-    let frame_cards = [
-        ("游戏 FPS", ids::FRAME_DISPLAYED_FPS, 0, "FPS"),
-        ("1% Low", ids::FRAME_ONE_PERCENT_LOW_FPS, 0, "FPS"),
-    ]
-    .into_iter()
-    .filter(|(_, id, _, _)| sample(*id).and_then(|s| s.value.as_f64()).is_some())
-    .collect::<Vec<_>>();
     let card_row = |row: &[(&str, phelper_domain::telemetry::MetricId, usize, &str)]| {
         div()
             .h_flex()
@@ -143,7 +136,6 @@ pub fn render(state: &AppState, app: &AppHandle, dash: &DashState, cx: &App) -> 
         ids::GPU_POWER_W,
         cx.background_executor().clone(),
     );
-    let frame_row = (!frame_cards.is_empty()).then(|| card_row(&frame_cards));
     let has_temp_trend = !temp_pts.is_empty();
     let has_power_trend = !power_pts.is_empty();
     let temp_chart = if has_temp_trend {
@@ -225,7 +217,6 @@ pub fn render(state: &AppState, app: &AppHandle, dash: &DashState, cx: &App) -> 
             )
             .child(card_row(&cards[0..3]))
             .child(card_row(&cards[3..6]))
-            .when_some(frame_row, |d, row| d.child(row))
             .child(div().h_flex().w_full().gap_3().child(fan_card))
             .when_some(trend_row, |d, row| d.child(row)),
     )

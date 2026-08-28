@@ -10,8 +10,8 @@
 //! `--hold 0` = fire-and-exit WITHOUT restore: the write stands and the
 //! firmware clawback (~120 s, heartbeat stops with the process) is the
 //! safety net — that path is exactly what HIL step 10 proves with taskkill.
-//! PPM commands (epp / max-freq / boost) are Windows-native settings: they
-//! persist across process exit and need no hold.
+//! PPM commands (epp / epp1 / max-freq / min-perf / max-perf / boost) are
+//! Windows-native settings: they persist across process exit and need no hold.
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -67,10 +67,31 @@ enum ControlCmd {
         #[arg(long)]
         dc: Option<u32>,
     },
+    /// Set PPM minimum processor performance percentage (0..=100).
+    MinPerf {
+        #[arg(long)]
+        ac: Option<u8>,
+        #[arg(long)]
+        dc: Option<u8>,
+    },
+    /// Set PPM maximum processor performance percentage (0..=100).
+    MaxPerf {
+        #[arg(long)]
+        ac: Option<u8>,
+        #[arg(long)]
+        dc: Option<u8>,
+    },
     /// Set Windows turbo boost policy (PERFBOOSTMODE).
     Boost {
-        #[arg(value_enum)]
-        mode: BoostArg,
+        /// Legacy shorthand: set both AC and DC to this value.
+        #[arg(value_enum, required_unless_present_any = ["ac", "dc"])]
+        mode: Option<BoostArg>,
+        /// AC-only boost policy.
+        #[arg(long, value_enum)]
+        ac: Option<BoostArg>,
+        /// Battery-only boost policy.
+        #[arg(long, value_enum)]
+        dc: Option<BoostArg>,
     },
     /// Set HP thermal mode (0x1A). Hold keeps the heartbeat alive.
     Thermal {
@@ -306,10 +327,38 @@ fn plan(args: &ControlArgs) -> Result<Plan> {
                 ..CpuPolicy::default()
             }))
         }
-        ControlCmd::Boost { mode } => Plan::Change(ControlCommand::SetCpuPolicy(CpuPolicy {
-            boost_policy: Some((*mode).into()),
-            ..CpuPolicy::default()
-        })),
+        ControlCmd::MinPerf { ac, dc } => {
+            if ac.is_none() && dc.is_none() {
+                bail!("nothing to do: pass --ac and/or --dc");
+            }
+            Plan::Change(ControlCommand::SetCpuPolicy(CpuPolicy {
+                min_performance_ac: *ac,
+                min_performance_dc: *dc,
+                ..CpuPolicy::default()
+            }))
+        }
+        ControlCmd::MaxPerf { ac, dc } => {
+            if ac.is_none() && dc.is_none() {
+                bail!("nothing to do: pass --ac and/or --dc");
+            }
+            Plan::Change(ControlCommand::SetCpuPolicy(CpuPolicy {
+                max_performance_ac: *ac,
+                max_performance_dc: *dc,
+                ..CpuPolicy::default()
+            }))
+        }
+        ControlCmd::Boost { mode, ac, dc } => {
+            if mode.is_none() && ac.is_none() && dc.is_none() {
+                bail!("nothing to do: pass MODE and/or --ac/--dc");
+            }
+            let legacy = mode.map(Into::into);
+            Plan::Change(ControlCommand::SetCpuPolicy(CpuPolicy {
+                boost_policy: legacy,
+                boost_policy_ac: ac.map(Into::into),
+                boost_policy_dc: dc.map(Into::into),
+                ..CpuPolicy::default()
+            }))
+        }
         ControlCmd::Thermal { mode, hold } => {
             Plan::HpState(ControlCommand::SetThermalMode((*mode).into()), *hold)
         }
@@ -428,6 +477,12 @@ fn plan(args: &ControlArgs) -> Result<Plan> {
                          (double gate: feature + Experimental caps)"
                     );
                 }
+                if profile.os_policy.is_some() {
+                    bail!(
+                        "profile '{name}' carries os_policy; hardware `profile apply` does not \
+                         guess a process target — use `os apply --profile {name} --pid <PID>`"
+                    );
+                }
                 Plan::ProfileApply {
                     name: name.clone(),
                     hold: *hold,
@@ -522,6 +577,9 @@ fn profile_list() -> Result<()> {
         }
         if p.fan.is_some() {
             touches.push("fan");
+        }
+        if p.os_policy.is_some() {
+            touches.push("os");
         }
         println!(
             "  {name:<12} [{tag}] {:<24} {}",
@@ -640,6 +698,8 @@ fn status(engine: &Engine) -> Result<()> {
             println!("{:?}", control.desired());
             println!("\n--- observed state ---");
             print_observed(&control.observed());
+            println!("\n--- windows software policy ---");
+            print_windows_ppm(control.windows_ppm_state().as_ref());
         }
         None => println!("\ncontrol: UNAVAILABLE (telemetry-only engine — see startup warnings)"),
     }
@@ -672,6 +732,9 @@ fn print_capabilities(caps: &CapabilitySet) {
     row("ppm.epp", caps.ppm.epp);
     row("ppm.epp1", caps.ppm.epp1);
     row("ppm.max_freq", caps.ppm.max_freq);
+    row("ppm.boost", caps.ppm.boost);
+    row("ppm.min_performance", caps.ppm.min_performance);
+    row("ppm.max_performance", caps.ppm.max_performance);
     println!("  ppm.write_privileged   {}", caps.ppm.write_privileged);
     println!(
         "  fan: count={} scale={:?} clamp={:?}..={:?} sw_declared={}",
@@ -694,9 +757,34 @@ fn print_observed(obs: &ObservedState) {
     println!("  epp_dc:       {}", fmt_obs(&obs.epp_dc));
     println!("  epp1_ac:      {}", fmt_obs(&obs.epp1_ac));
     println!("  epp1_dc:      {}", fmt_obs(&obs.epp1_dc));
+    println!("  max_freq_ac:  {}", fmt_obs(&obs.max_freq_ac));
+    println!("  max_freq_dc:  {}", fmt_obs(&obs.max_freq_dc));
+    println!("  boost_ac:     {}", fmt_obs(&obs.boost_ac));
+    println!("  boost_dc:     {}", fmt_obs(&obs.boost_dc));
+    println!("  min_perf_ac:  {}", fmt_obs(&obs.min_performance_ac));
+    println!("  min_perf_dc:  {}", fmt_obs(&obs.min_performance_dc));
+    println!("  max_perf_ac:  {}", fmt_obs(&obs.max_performance_ac));
+    println!("  max_perf_dc:  {}", fmt_obs(&obs.max_performance_dc));
     println!("  gpu_policy:   {}", fmt_obs(&obs.gpu_platform_policy));
     println!("  mux:          {}", fmt_obs(&obs.mux));
     println!("  power_limits: {}", fmt_obs(&obs.power_limits));
+}
+
+fn print_windows_ppm(state: Option<&phelper_core::domain::policy::WindowsPpmState>) {
+    let Some(state) = state else {
+        println!("  unavailable");
+        return;
+    };
+    println!(
+        "  scheme: {} ({})",
+        state.active_scheme_name, state.active_scheme_guid
+    );
+    println!(
+        "  configured: ac={:?} dc={:?} effective={:?}",
+        state.configured_ac_mode, state.configured_dc_mode, state.effective_mode
+    );
+    println!("  ac: {:?}", state.ac);
+    println!("  dc: {:?}", state.dc);
 }
 
 fn fmt_obs<T: std::fmt::Debug>(v: &phelper_core::domain::state::ObservedValue<T>) -> String {

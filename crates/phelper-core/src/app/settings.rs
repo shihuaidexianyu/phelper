@@ -1,11 +1,12 @@
 //! UI settings persistence: `UiSettings` TOML at
-//! `%LOCALAPPDATA%\phelper\settings.toml`. Deliberately tiny — M6 carries
-//! exactly one user preference (theme). Missing file = defaults silently;
-//! broken file = defaults + a warning string the Settings page can show
-//! (never panic, same discipline as the profile loader).
+//! `%LOCALAPPDATA%\phelper\settings.toml`. Keep this document small and
+//! user-facing: theme plus the resident desktop switches. Missing file =
+//! defaults silently; broken file = defaults + a warning string the Settings
+//! page can show (never panic, same discipline as the profile loader).
 
 use std::path::{Path, PathBuf};
 
+use phelper_domain::resident::ResidentSettings;
 use serde::{Deserialize, Serialize};
 
 use crate::persistence;
@@ -23,6 +24,7 @@ pub enum ThemePref {
 #[serde(default, deny_unknown_fields)]
 pub struct UiSettings {
     pub theme: ThemePref,
+    pub resident: ResidentSettings,
 }
 
 impl UiSettings {
@@ -102,6 +104,7 @@ mod tests {
         let _ = std::fs::remove_file(&p);
         let s = UiSettings {
             theme: ThemePref::Light,
+            ..UiSettings::default()
         };
         s.save_to(&p).unwrap();
         let (back, warn) = UiSettings::load_from(&p);
@@ -133,5 +136,32 @@ mod tests {
     fn system_variant_roundtrips() {
         let s: UiSettings = toml::from_str("theme = \"system\"\n").unwrap();
         assert_eq!(s.theme, ThemePref::System);
+    }
+
+    #[test]
+    fn resident_settings_roundtrip() {
+        let text = r#"
+theme = "dark"
+
+[resident]
+autostart = true
+
+[resident.omen_key]
+action = "toggle_overlay"
+shortcut = ""
+profile_cycle = ["balanced", "gaming"]
+
+[resident.overlay]
+visible_on_start = true
+position = "top_right"
+screen = "primary"
+"#;
+        let settings: UiSettings = toml::from_str(text).unwrap();
+        assert!(settings.resident.autostart);
+        assert_eq!(
+            settings.resident.omen_key.action,
+            phelper_domain::resident::OmenKeyAction::ToggleOverlay
+        );
+        assert!(settings.resident.overlay.visible_on_start);
     }
 }

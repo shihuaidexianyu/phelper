@@ -167,8 +167,9 @@ pub(crate) fn decode_sdd(buf: &[u8]) -> Result<SystemDesignData, HpWmiError> {
     })
 }
 
-/// 0x2F → fan table: {num_fans, unknown} + 3-byte entries
-/// {cpu, gpu, noise_db} (hp-wmi.c victus fan table).
+/// 0x2F → discrete fan level/noise table: {num_fans, unknown} + 3-byte
+/// entries {cpu, gpu, noise_db} (hp-wmi.c victus fan table). It does not
+/// contain firmware temperature thresholds or a temperature-to-speed curve.
 pub(crate) fn decode_fan_table(buf: &[u8]) -> Result<FanTable, HpWmiError> {
     need(buf, 2, "fan table needs >= 2 bytes")?;
     let num_fans = buf[0];

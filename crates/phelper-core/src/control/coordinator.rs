@@ -21,6 +21,7 @@ use phelper_domain::error::{ControlError, EngineError, HpWmiError, PlatformError
 use phelper_domain::identity::DeviceIdentity;
 use phelper_domain::policy::{
     CpuPolicy, CpuPowerLimits, FanCurve, FanLevels, FanMode, GpuPlatformPolicy, ThermalMode,
+    WindowsPpmState,
 };
 use phelper_domain::ports::{CpuPolicyBackend, HpBackend};
 use phelper_domain::profile::GpuPolicyPatch;
@@ -63,6 +64,10 @@ enum ControlRequest {
     /// coordinator simply re-reads and re-stamps ObservedState so a
     /// startup stamp never poses as live truth for the whole session.
     RefreshObserved,
+    /// Replace the profile registry without restarting the coordinator.
+    /// Profile files are user-editable state and the UI can refresh them
+    /// while the engine is already running.
+    ReplaceProfiles(crate::profiles::ProfileRegistry),
     Shutdown(mpsc::Sender<()>),
 }
 
@@ -73,6 +78,9 @@ pub(crate) struct ControlConfig<H, P, F> {
     pub identity: DeviceIdentity,
     pub hp: Option<H>,
     pub ppm: P,
+    /// Snapshot already collected by the capability probe. Reusing it keeps
+    /// startup from walking PowrProf twice before the first usable UI state.
+    pub windows_ppm: Option<WindowsPpmState>,
     pub feed: F,
     pub journal_path: std::path::PathBuf,
     /// Optional path for the last explicitly applied software fan curve.
@@ -102,6 +110,7 @@ impl<H, P, F> ControlConfig<H, P, F> {
             identity,
             hp,
             ppm,
+            windows_ppm: None,
             feed,
             journal_path,
             fan_curve_path: None,
@@ -122,6 +131,7 @@ pub struct ControlHandle {
     caps: Arc<CapabilitySet>,
     desired: Arc<RwLock<DesiredState>>,
     observed: Arc<RwLock<ObservedState>>,
+    windows_ppm: Arc<RwLock<Option<WindowsPpmState>>>,
     last_saved_fan_curve: Arc<RwLock<Option<FanCurve>>>,
 }
 
@@ -133,6 +143,7 @@ impl Clone for ControlHandle {
             caps: Arc::clone(&self.caps),
             desired: Arc::clone(&self.desired),
             observed: Arc::clone(&self.observed),
+            windows_ppm: Arc::clone(&self.windows_ppm),
             last_saved_fan_curve: Arc::clone(&self.last_saved_fan_curve),
         }
     }
@@ -189,6 +200,16 @@ impl ControlHandle {
         self.observed.read().expect("observed poisoned").clone()
     }
 
+    /// Current Windows software-policy snapshot. It is read-only state: the
+    /// active scheme may change outside phelper, so the coordinator refreshes
+    /// this cache periodically and after a successful PPM write.
+    pub fn windows_ppm_state(&self) -> Option<WindowsPpmState> {
+        self.windows_ppm
+            .read()
+            .expect("windows ppm state poisoned")
+            .clone()
+    }
+
     /// The last curve successfully applied by phelper, if one was saved.
     /// This is an editing source only; it does not claim that the firmware
     /// is still running the curve after the process has exited.
@@ -208,6 +229,15 @@ impl ControlHandle {
     /// and their 250 ms live truth is already on the telemetry feed.)
     pub fn refresh_observed(&self) {
         let _ = self.tx.try_send(ControlRequest::RefreshObserved);
+    }
+
+    /// Replace the coordinator's profile registry after a profile-file
+    /// refresh.  A profile refresh is part of the ordering contract for the
+    /// next ApplyProfile, so do not silently drop it when the bounded queue
+    /// is temporarily full.  The coordinator is the only owner of the
+    /// mutable registry; this send only waits for queue capacity.
+    pub fn replace_profiles(&self, profiles: crate::profiles::ProfileRegistry) {
+        let _ = self.tx.send(ControlRequest::ReplaceProfiles(profiles));
     }
 
     /// Stop the coordinator; it restores firmware automatic state first
@@ -237,6 +267,7 @@ pub(crate) struct ControlCoordinator<H, P, F> {
     safety_tick: Duration,
     desired: Arc<RwLock<DesiredState>>,
     observed: Arc<RwLock<ObservedState>>,
+    windows_ppm: Arc<RwLock<Option<WindowsPpmState>>>,
     /// 0x21 readback captured at engine start — the restore point for
     /// shutdown (only written back when this session changed the policy).
     gpu_policy_startup: Option<GpuPlatformPolicy>,
@@ -263,7 +294,7 @@ pub(crate) struct ControlCoordinator<H, P, F> {
 impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Send + 'static>
     ControlCoordinator<H, P, F>
 {
-    pub(crate) fn start(cfg: ControlConfig<H, P, F>) -> Result<ControlHandle, EngineError> {
+    pub(crate) fn start(mut cfg: ControlConfig<H, P, F>) -> Result<ControlHandle, EngineError> {
         let journal = ControlJournal::open(
             &cfg.journal_path,
             &cfg.identity.board_id,
@@ -274,10 +305,16 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         // 0x21 readback at start: populates ObservedState (Verified, AR-10)
         // AND is the shutdown restore point if this session writes 0x22.
         let gpu_policy_startup = cfg.hp.as_ref().and_then(|hp| hp.gpu_platform_policy().ok());
+        let windows_ppm_startup = cfg
+            .windows_ppm
+            .take()
+            .or_else(|| cfg.ppm.read_windows_ppm_state().ok().flatten());
         let observed = Arc::new(RwLock::new(Self::initial_observed(
             &cfg.ppm,
             gpu_policy_startup,
+            windows_ppm_startup.as_ref(),
         )));
+        let windows_ppm = Arc::new(RwLock::new(windows_ppm_startup));
         let last_saved_fan_curve = Arc::new(RwLock::new(match cfg.fan_curve_path.as_deref() {
             Some(path) => match crate::persistence::load_fan_curve(path) {
                 Ok(curve) => curve,
@@ -295,6 +332,7 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             caps: Arc::clone(&caps),
             desired: Arc::clone(&desired),
             observed: Arc::clone(&observed),
+            windows_ppm: Arc::clone(&windows_ppm),
             last_saved_fan_curve: Arc::clone(&last_saved_fan_curve),
         };
         let coord = Self {
@@ -313,6 +351,7 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             safety_tick: cfg.safety_tick,
             desired,
             observed,
+            windows_ppm,
             gpu_policy_startup,
             gpu_policy_dirty: false,
             power_limits_baseline: None,
@@ -329,34 +368,91 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         Ok(handle)
     }
 
-    /// EPP/EPP1 (and the GPU platform policy when the HP backend is up) are
-    /// read back at start (Verified); everything else is Unknown until
-    /// written or proven (AR-10: we don't claim states we never saw).
-    fn initial_observed(ppm: &P, gpu_policy: Option<GpuPlatformPolicy>) -> ObservedState {
+    /// The complete PPM snapshot (and the GPU platform policy when the HP
+    /// backend is up) is read back at start (Verified); if a backend cannot
+    /// provide the aggregate snapshot, fall back to its individual PPM
+    /// methods so optional Windows mode APIs never hide usable readbacks.
+    fn initial_observed(
+        ppm: &P,
+        gpu_policy: Option<GpuPlatformPolicy>,
+        windows_ppm: Option<&WindowsPpmState>,
+    ) -> ObservedState {
         let mut o = ObservedState::default();
-        if let Ok((ac, dc)) = ppm.read_epp() {
-            o.epp_ac = ObservedValue::Verified {
-                value: ac,
-                at: Instant::now(),
-                source: "powrprof PERFEPP",
-            };
-            o.epp_dc = ObservedValue::Verified {
-                value: dc,
-                at: Instant::now(),
-                source: "powrprof PERFEPP",
-            };
-        }
-        if let Ok((ac, dc)) = ppm.read_epp1() {
-            o.epp1_ac = ObservedValue::Verified {
-                value: ac,
-                at: Instant::now(),
-                source: "powrprof PERFEPP1",
-            };
-            o.epp1_dc = ObservedValue::Verified {
-                value: dc,
-                at: Instant::now(),
-                source: "powrprof PERFEPP1",
-            };
+        if let Some(state) = windows_ppm {
+            Self::stamp_windows_ppm(&mut o, state);
+        } else {
+            if let Ok((ac, dc)) = ppm.read_epp() {
+                o.epp_ac = ObservedValue::Verified {
+                    value: ac,
+                    at: Instant::now(),
+                    source: "powrprof PERFEPP",
+                };
+                o.epp_dc = ObservedValue::Verified {
+                    value: dc,
+                    at: Instant::now(),
+                    source: "powrprof PERFEPP",
+                };
+            }
+            if let Ok((ac, dc)) = ppm.read_epp1() {
+                o.epp1_ac = ObservedValue::Verified {
+                    value: ac,
+                    at: Instant::now(),
+                    source: "powrprof PERFEPP1",
+                };
+                o.epp1_dc = ObservedValue::Verified {
+                    value: dc,
+                    at: Instant::now(),
+                    source: "powrprof PERFEPP1",
+                };
+            }
+            if let Ok((ac, dc)) = ppm.read_max_freq_mhz() {
+                o.max_freq_ac = ObservedValue::Verified {
+                    value: ac,
+                    at: Instant::now(),
+                    source: "powrprof PROCFREQMAX",
+                };
+                o.max_freq_dc = ObservedValue::Verified {
+                    value: dc,
+                    at: Instant::now(),
+                    source: "powrprof PROCFREQMAX",
+                };
+            }
+            if let Ok((ac, dc)) = ppm.read_boost_policy() {
+                o.boost_ac = ObservedValue::Verified {
+                    value: ac,
+                    at: Instant::now(),
+                    source: "powrprof PERFBOOSTMODE",
+                };
+                o.boost_dc = ObservedValue::Verified {
+                    value: dc,
+                    at: Instant::now(),
+                    source: "powrprof PERFBOOSTMODE",
+                };
+            }
+            if let Ok((ac, dc)) = ppm.read_min_performance() {
+                o.min_performance_ac = ObservedValue::Verified {
+                    value: ac,
+                    at: Instant::now(),
+                    source: "powrprof PROCTHROTTLEMIN",
+                };
+                o.min_performance_dc = ObservedValue::Verified {
+                    value: dc,
+                    at: Instant::now(),
+                    source: "powrprof PROCTHROTTLEMIN",
+                };
+            }
+            if let Ok((ac, dc)) = ppm.read_max_performance() {
+                o.max_performance_ac = ObservedValue::Verified {
+                    value: ac,
+                    at: Instant::now(),
+                    source: "powrprof PROCTHROTTLEMAX",
+                };
+                o.max_performance_dc = ObservedValue::Verified {
+                    value: dc,
+                    at: Instant::now(),
+                    source: "powrprof PROCTHROTTLEMAX",
+                };
+            }
         }
         if let Some(p) = gpu_policy {
             o.gpu_platform_policy = ObservedValue::Verified {
@@ -368,6 +464,68 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         o
     }
 
+    fn stamp_windows_ppm(observed: &mut ObservedState, state: &WindowsPpmState) {
+        let now = Instant::now();
+        let stamp_u8 = |value: Option<u8>, source: &'static str| {
+            value.map(|value| ObservedValue::Verified {
+                value,
+                at: now,
+                source,
+            })
+        };
+        let stamp_u32 = |value: Option<u32>, source: &'static str| {
+            value.map(|value| ObservedValue::Verified {
+                value,
+                at: now,
+                source,
+            })
+        };
+        if let Some(value) = stamp_u8(state.ac.epp, "powrprof PERFEPP") {
+            observed.epp_ac = value;
+        }
+        if let Some(value) = stamp_u8(state.dc.epp, "powrprof PERFEPP") {
+            observed.epp_dc = value;
+        }
+        if let Some(value) = stamp_u8(state.ac.epp1, "powrprof PERFEPP1") {
+            observed.epp1_ac = value;
+        }
+        if let Some(value) = stamp_u8(state.dc.epp1, "powrprof PERFEPP1") {
+            observed.epp1_dc = value;
+        }
+        if let Some(value) = stamp_u32(state.ac.max_freq_mhz, "powrprof PROCFREQMAX") {
+            observed.max_freq_ac = value;
+        }
+        if let Some(value) = stamp_u32(state.dc.max_freq_mhz, "powrprof PROCFREQMAX") {
+            observed.max_freq_dc = value;
+        }
+        if let Some(value) = state.ac.boost_policy {
+            observed.boost_ac = ObservedValue::Verified {
+                value,
+                at: now,
+                source: "powrprof PERFBOOSTMODE",
+            };
+        }
+        if let Some(value) = state.dc.boost_policy {
+            observed.boost_dc = ObservedValue::Verified {
+                value,
+                at: now,
+                source: "powrprof PERFBOOSTMODE",
+            };
+        }
+        if let Some(value) = stamp_u8(state.ac.min_performance, "powrprof PROCTHROTTLEMIN") {
+            observed.min_performance_ac = value;
+        }
+        if let Some(value) = stamp_u8(state.dc.min_performance, "powrprof PROCTHROTTLEMIN") {
+            observed.min_performance_dc = value;
+        }
+        if let Some(value) = stamp_u8(state.ac.max_performance, "powrprof PROCTHROTTLEMAX") {
+            observed.max_performance_ac = value;
+        }
+        if let Some(value) = stamp_u8(state.dc.max_performance, "powrprof PROCTHROTTLEMAX") {
+            observed.max_performance_dc = value;
+        }
+    }
+
     /// Read-only re-probe behind `ControlRequest::RefreshObserved` (M6 —
     /// keeps the UI's observed stamps from going minutes stale between
     /// writes). Every source fails independently: a failed
@@ -375,6 +533,16 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
     /// age honest — refresh never ERASES knowledge.
     fn refresh_observed(&mut self) {
         debug!("re-probing observed readbacks");
+        if let Ok(Some(state)) = self.ppm.read_windows_ppm_state() {
+            Self::stamp_windows_ppm(
+                &mut self.observed.write().expect("observed poisoned"),
+                &state,
+            );
+            *self
+                .windows_ppm
+                .write()
+                .expect("windows ppm state poisoned") = Some(state);
+        }
         if let Ok((ac, dc)) = self.ppm.read_epp() {
             self.set_observed(|o| {
                 o.epp_ac = ObservedValue::Verified {
@@ -436,6 +604,9 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                     return;
                 }
                 Ok(ControlRequest::RefreshObserved) => self.refresh_observed(),
+                Ok(ControlRequest::ReplaceProfiles(profiles)) => {
+                    self.profiles = profiles;
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => self.tick(),
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     // All handles dropped without shutdown(): still restore.
@@ -722,11 +893,33 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         );
         match mode {
             FanMode::FirmwareAuto => {
-                // §27 restore sequence: manual → 0x2E{0,0}; max → 0x27 off;
-                // unknown → both (fail closed toward auto).
+                // §27 restore sequence.  Release 0x27 first when max fan is
+                // active, then hand the underlying target to firmware with
+                // 0x2E{0,0}.  Reversing these writes creates a visible
+                // fan-stop/ramp-up dip on 8BAB (Max → Auto).
                 let mut ok = true;
                 let mut wrote_any = false;
-                if !matches!(current.fan_mode.value(), Some(FanMode::FirmwareAuto)) {
+                let max_needs_release = !matches!(current.max_fan.value(), Some(false));
+                if max_needs_release {
+                    let wrote = Self::fan_write(
+                        steps,
+                        "max-fan off (0x27 0)",
+                        "hp-wmi 0x27",
+                        &before,
+                        || hp.set_max_fan(false),
+                    );
+                    ok &= wrote;
+                    wrote_any |= wrote;
+                    if wrote {
+                        self.set_observed(|o| {
+                            o.max_fan = ObservedValue::TrustedWrite {
+                                value: false,
+                                at: Instant::now(),
+                            };
+                        });
+                    }
+                }
+                if ok && !matches!(current.fan_mode.value(), Some(FanMode::FirmwareAuto)) {
                     let wrote = Self::fan_write(
                         steps,
                         "fan->auto (0x2E {0,0})",
@@ -737,27 +930,18 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                     ok &= wrote;
                     wrote_any |= wrote;
                 }
-                if !matches!(current.max_fan.value(), Some(false)) {
-                    let wrote = Self::fan_write(
-                        steps,
-                        "max-fan off (0x27 0)",
-                        "hp-wmi 0x27",
-                        &before,
-                        || hp.set_max_fan(false),
-                    );
-                    ok &= wrote;
-                    wrote_any |= wrote;
-                }
                 if ok {
                     self.set_observed(|o| {
                         o.fan_mode = ObservedValue::TrustedWrite {
                             value: FanMode::FirmwareAuto,
                             at: Instant::now(),
                         };
-                        o.max_fan = ObservedValue::TrustedWrite {
-                            value: false,
-                            at: Instant::now(),
-                        };
+                        if max_needs_release {
+                            o.max_fan = ObservedValue::TrustedWrite {
+                                value: false,
+                                at: Instant::now(),
+                            };
+                        }
                     });
                     self.fan_curve.clear();
                     self.fan_control_dirty = false;
@@ -1051,6 +1235,10 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         };
         match hp.set_gpu_platform_policy(p) {
             Ok(()) => {
+                // A successful write must enter the shutdown ledger even if
+                // the readback channel later fails.  Verification describes
+                // what we know; it must not decide whether a write happened.
+                self.gpu_policy_dirty = true;
                 let verification = self.verify_gpu_policy(hp, p);
                 let ok = matches!(verification, Verification::Verified);
                 self.set_observed(|o| {
@@ -1069,11 +1257,6 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                         }
                     };
                 });
-                if ok {
-                    // Only a proven write counts as "this session changed
-                    // the policy" for the shutdown restore.
-                    self.gpu_policy_dirty = true;
-                }
                 steps.push(StepOutcome {
                     step: "verify gpu policy (0x21)".into(),
                     backend: "hp-wmi 0x21".into(),
@@ -1217,6 +1400,11 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         let written_at = Instant::now();
         match hp.set_power_limits(l) {
             Ok(()) => {
+                // The HP writer has accepted the request.  Keep a restore
+                // obligation regardless of whether the telemetry readback
+                // converges; otherwise an unverified but real write would
+                // survive process shutdown.
+                self.power_limits_dirty = true;
                 let verification = self.verify_power_limits(l, written_at);
                 let ok = matches!(verification, Verification::Verified);
                 self.set_observed(|o| {
@@ -1235,9 +1423,6 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                         }
                     };
                 });
-                if ok {
-                    self.power_limits_dirty = true;
-                }
                 steps.push(StepOutcome {
                     step: if l.pl4_w != 0 {
                         "verify power limits (MSR 0x610 + MCHBAR 0x59B0)".into()
@@ -1320,7 +1505,7 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
 
     // ------------------------------------------------------------ CPU policy
 
-    /// §32 order: EPP → EPP1 → max-freq → boost. Steps are independent
+    /// §32 order: EPP → EPP1 → max-freq → performance bounds → boost. Steps are independent
     /// settings — a later failure leaves earlier steps applied (Partial; no
     /// M2 rollback, journal carries the evidence).
     fn exec_cpu_policy(&mut self, p: &CpuPolicy, steps: &mut Vec<StepOutcome>) -> ControlStatus {
@@ -1469,6 +1654,18 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                             let ac_ok = p.max_freq_mhz_ac.is_none_or(|v| v == ac);
                             let dc_ok = p.max_freq_mhz_dc.is_none_or(|v| v == dc);
                             if ac_ok && dc_ok {
+                                self.set_observed(|o| {
+                                    o.max_freq_ac = ObservedValue::Verified {
+                                        value: ac,
+                                        at: Instant::now(),
+                                        source: "powrprof PROCFREQMAX",
+                                    };
+                                    o.max_freq_dc = ObservedValue::Verified {
+                                        value: dc,
+                                        at: Instant::now(),
+                                        source: "powrprof PROCFREQMAX",
+                                    };
+                                });
                                 Verification::Verified
                             } else {
                                 Verification::Failed {
@@ -1513,22 +1710,189 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             }
         }
 
-        if let Some(mode) = p.boost_policy {
+        if p.min_performance_ac.is_some() || p.min_performance_dc.is_some() {
+            let before = self
+                .ppm
+                .read_min_performance()
+                .map(|(ac, dc)| format!("min-performance ac={ac}% dc={dc}%"))
+                .unwrap_or_else(|e| format!("min-performance unreadable: {e}"));
+            match self
+                .ppm
+                .write_min_performance(p.min_performance_ac, p.min_performance_dc)
+            {
+                Ok(()) => {
+                    let verification = match self.ppm.read_min_performance() {
+                        Ok((ac, dc)) => {
+                            let ac_ok = p.min_performance_ac.is_none_or(|v| v == ac);
+                            let dc_ok = p.min_performance_dc.is_none_or(|v| v == dc);
+                            if ac_ok && dc_ok {
+                                self.set_observed(|o| {
+                                    o.min_performance_ac = ObservedValue::Verified {
+                                        value: ac,
+                                        at: Instant::now(),
+                                        source: "powrprof PROCTHROTTLEMIN",
+                                    };
+                                    o.min_performance_dc = ObservedValue::Verified {
+                                        value: dc,
+                                        at: Instant::now(),
+                                        source: "powrprof PROCTHROTTLEMIN",
+                                    };
+                                });
+                                Verification::Verified
+                            } else {
+                                Verification::Failed {
+                                    expected: format!(
+                                        "ac={:?} dc={:?}",
+                                        p.min_performance_ac, p.min_performance_dc
+                                    ),
+                                    actual: format!("ac={ac} dc={dc}"),
+                                }
+                            }
+                        }
+                        Err(e) => Verification::Failed {
+                            expected: format!(
+                                "ac={:?} dc={:?}",
+                                p.min_performance_ac, p.min_performance_dc
+                            ),
+                            actual: format!("readback error: {e}"),
+                        },
+                    };
+                    if !matches!(verification, Verification::Verified) {
+                        failed = true;
+                    }
+                    steps.push(StepOutcome {
+                        step: "write minimum performance".into(),
+                        backend: "powrprof PROCTHROTTLEMIN".into(),
+                        firmware_return: Some("ok".into()),
+                        before: Some(before),
+                        after: Some(format!("{verification:?}")),
+                        verification,
+                    });
+                    applied = true;
+                }
+                Err(e) => {
+                    failed = true;
+                    steps.push(platform_failed_step(
+                        "write minimum performance",
+                        "powrprof PROCTHROTTLEMIN",
+                        &e,
+                        before,
+                    ));
+                }
+            }
+        }
+
+        if p.max_performance_ac.is_some() || p.max_performance_dc.is_some() {
+            let before = self
+                .ppm
+                .read_max_performance()
+                .map(|(ac, dc)| format!("max-performance ac={ac}% dc={dc}%"))
+                .unwrap_or_else(|e| format!("max-performance unreadable: {e}"));
+            match self
+                .ppm
+                .write_max_performance(p.max_performance_ac, p.max_performance_dc)
+            {
+                Ok(()) => {
+                    let verification = match self.ppm.read_max_performance() {
+                        Ok((ac, dc)) => {
+                            let ac_ok = p.max_performance_ac.is_none_or(|v| v == ac);
+                            let dc_ok = p.max_performance_dc.is_none_or(|v| v == dc);
+                            if ac_ok && dc_ok {
+                                self.set_observed(|o| {
+                                    o.max_performance_ac = ObservedValue::Verified {
+                                        value: ac,
+                                        at: Instant::now(),
+                                        source: "powrprof PROCTHROTTLEMAX",
+                                    };
+                                    o.max_performance_dc = ObservedValue::Verified {
+                                        value: dc,
+                                        at: Instant::now(),
+                                        source: "powrprof PROCTHROTTLEMAX",
+                                    };
+                                });
+                                Verification::Verified
+                            } else {
+                                Verification::Failed {
+                                    expected: format!(
+                                        "ac={:?} dc={:?}",
+                                        p.max_performance_ac, p.max_performance_dc
+                                    ),
+                                    actual: format!("ac={ac} dc={dc}"),
+                                }
+                            }
+                        }
+                        Err(e) => Verification::Failed {
+                            expected: format!(
+                                "ac={:?} dc={:?}",
+                                p.max_performance_ac, p.max_performance_dc
+                            ),
+                            actual: format!("readback error: {e}"),
+                        },
+                    };
+                    if !matches!(verification, Verification::Verified) {
+                        failed = true;
+                    }
+                    steps.push(StepOutcome {
+                        step: "write maximum performance".into(),
+                        backend: "powrprof PROCTHROTTLEMAX".into(),
+                        firmware_return: Some("ok".into()),
+                        before: Some(before),
+                        after: Some(format!("{verification:?}")),
+                        verification,
+                    });
+                    applied = true;
+                }
+                Err(e) => {
+                    failed = true;
+                    steps.push(platform_failed_step(
+                        "write maximum performance",
+                        "powrprof PROCTHROTTLEMAX",
+                        &e,
+                        before,
+                    ));
+                }
+            }
+        }
+
+        let boost_ac = p.boost_policy_ac.or(p.boost_policy);
+        let boost_dc = p.boost_policy_dc.or(p.boost_policy);
+        if boost_ac.is_some() || boost_dc.is_some() {
             let before = self
                 .ppm
                 .read_boost_policy()
                 .map(|(ac, dc)| format!("boost ac={ac:?} dc={dc:?}"))
                 .unwrap_or_else(|e| format!("boost unreadable: {e}"));
-            match self.ppm.write_boost_policy(mode) {
+            match self.ppm.write_boost_policy(boost_ac, boost_dc) {
                 Ok(()) => {
                     let verification = match self.ppm.read_boost_policy() {
-                        Ok((ac, dc)) if ac == mode && dc == mode => Verification::Verified,
+                        Ok((ac, dc))
+                            if boost_ac.is_none_or(|expected| expected == ac)
+                                && boost_dc.is_none_or(|expected| expected == dc) =>
+                        {
+                            self.set_observed(|o| {
+                                if let Some(value) = boost_ac {
+                                    o.boost_ac = ObservedValue::Verified {
+                                        value,
+                                        at: Instant::now(),
+                                        source: "powrprof PERFBOOSTMODE",
+                                    };
+                                }
+                                if let Some(value) = boost_dc {
+                                    o.boost_dc = ObservedValue::Verified {
+                                        value,
+                                        at: Instant::now(),
+                                        source: "powrprof PERFBOOSTMODE",
+                                    };
+                                }
+                            });
+                            Verification::Verified
+                        }
                         Ok((ac, dc)) => Verification::Failed {
-                            expected: format!("{mode:?}"),
+                            expected: format!("ac={boost_ac:?} dc={boost_dc:?}"),
                             actual: format!("ac={ac:?} dc={dc:?}"),
                         },
                         Err(e) => Verification::Failed {
-                            expected: format!("{mode:?}"),
+                            expected: format!("ac={boost_ac:?} dc={boost_dc:?}"),
                             actual: format!("readback error: {e}"),
                         },
                     };
@@ -1555,6 +1919,17 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                     ));
                 }
             }
+        }
+
+        // Refresh the aggregate snapshot once after the batch. Besides
+        // keeping the UI's scheme/mode line current, this catches an external
+        // plan switch that happened while a command was being assembled.
+        if let Ok(Some(state)) = self.ppm.read_windows_ppm_state() {
+            self.set_observed(|o| Self::stamp_windows_ppm(o, &state));
+            *self
+                .windows_ppm
+                .write()
+                .expect("windows ppm state poisoned") = Some(state);
         }
 
         match (applied, failed) {
@@ -1650,66 +2025,112 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         let mut steps = Vec::new();
         match action {
             SafetyAction::ForceMaxFan => {
-                if let Some(hp) = &self.hp {
-                    let ok = Self::fan_write(
-                        &mut steps,
-                        "SAFETY max-fan on",
-                        "hp-wmi 0x27",
-                        "thermal override",
-                        || hp.set_max_fan(true),
-                    );
-                    if ok {
-                        self.fan_control_dirty = true;
-                        self.set_observed(|o| {
-                            o.max_fan = ObservedValue::TrustedWrite {
-                                value: true,
-                                at: Instant::now(),
-                            };
-                        });
+                let status = match &self.hp {
+                    Some(hp) => {
+                        let ok = Self::fan_write(
+                            &mut steps,
+                            "SAFETY max-fan on",
+                            "hp-wmi 0x27",
+                            "thermal override",
+                            || hp.set_max_fan(true),
+                        );
+                        if ok {
+                            self.fan_control_dirty = true;
+                            self.set_observed(|o| {
+                                o.max_fan = ObservedValue::TrustedWrite {
+                                    value: true,
+                                    at: Instant::now(),
+                                };
+                            });
+                            ControlStatus::Applied {
+                                verification: Verification::TrustedNoReadback,
+                            }
+                        } else {
+                            // Do not claim that the safety action was
+                            // applied when the 0x27 write failed.  The
+                            // supervisor remains latched and retries on the
+                            // next fresh hot sample.
+                            ControlStatus::Partial
+                        }
                     }
-                }
+                    None => ControlStatus::Rejected {
+                        error: ControlError::BackendUnavailable {
+                            what: "HP platform".into(),
+                        },
+                    },
+                };
                 self.journal(
                     JournalOrigin::Safety,
                     &ControlOutcome {
                         receipt: ControlReceipt(0),
                         command: ControlCommand::SetFanMode(FanMode::Max),
-                        status: ControlStatus::Applied {
-                            verification: Verification::TrustedNoReadback,
-                        },
+                        status,
                         steps,
                         duration: started.elapsed(),
                     },
                 );
             }
             SafetyAction::ReleaseTo(mode) => {
-                // Max fan is still ON here (ForceMaxFan engaged it). 0x27
-                // must be released explicitly BEFORE re-applying the saved
-                // mode. HIL-13 evidence: without this, the 0x2E write races
-                // the max-fan ramp-down (verify read 3500/3900 RPM against a
-                // 2000 target and honestly Failed), and — worse — observed
-                // kept a stale max_fan=TrustedWrite(true) that the keepalive
-                // would have re-asserted at the next 60 s tick, re-engaging
-                // max fan the hysteresis had just released.
-                if matches!(
-                    self.observed().max_fan,
-                    ObservedValue::TrustedWrite { value: true, .. }
-                ) && let Some(hp) = &self.hp
-                {
-                    let _ = Self::fan_write(
+                // A thermal override is an overlay.  Release it only when
+                // the saved mode is not Max; Max is already the desired
+                // safety state and must not take an off → on detour.
+                let release_max =
+                    self.observed().max_fan.value() == Some(&true) && !matches!(mode, FanMode::Max);
+                let max_release_ok = if !release_max {
+                    true
+                } else if let Some(hp) = &self.hp {
+                    let ok = Self::fan_write(
                         &mut steps,
                         "SAFETY max-fan off",
                         "hp-wmi 0x27",
                         "release override",
                         || hp.set_max_fan(false),
                     );
-                    self.set_observed(|o| {
-                        o.max_fan = ObservedValue::TrustedWrite {
-                            value: false,
-                            at: Instant::now(),
-                        };
-                    });
+                    if ok {
+                        self.set_observed(|o| {
+                            o.max_fan = ObservedValue::TrustedWrite {
+                                value: false,
+                                at: Instant::now(),
+                            };
+                        });
+                    }
+                    ok
+                } else {
+                    false
+                };
+
+                let status = if max_release_ok {
+                    self.exec_fan_mode(mode, &mut steps)
+                } else {
+                    ControlStatus::Partial
+                };
+
+                // Any failed release must immediately re-arm max fan.  This
+                // prevents a transient 0x27/0x2E failure from leaving the
+                // machine in a user curve with no firmware thermal curve.
+                if !max_release_ok || !Self::control_status_succeeded(&status) {
+                    self.safety.retain_override(mode);
+                    if self.observed().max_fan.value() != Some(&true)
+                        && let Some(hp) = &self.hp
+                    {
+                        let rearmed = Self::fan_write(
+                            &mut steps,
+                            "SAFETY re-arm max-fan",
+                            "hp-wmi 0x27",
+                            "failed release fallback",
+                            || hp.set_max_fan(true),
+                        );
+                        if rearmed {
+                            self.fan_control_dirty = true;
+                            self.set_observed(|o| {
+                                o.max_fan = ObservedValue::TrustedWrite {
+                                    value: true,
+                                    at: Instant::now(),
+                                };
+                            });
+                        }
+                    }
                 }
-                let status = self.exec_fan_mode(mode, &mut steps);
                 self.journal(
                     JournalOrigin::Safety,
                     &ControlOutcome {
@@ -1822,7 +2243,8 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
     /// Every requested step is best-effort and attempted even if an earlier
     /// step fails; the firmware clawback (~120 s) remains the ultimate
     /// backstop for a process that disappears without a graceful shutdown.
-    /// EPP/max-freq/boost are deliberately NOT restored: they are
+    /// EPP/EPP1/max-freq/min-max performance/boost are deliberately NOT
+    /// restored: they are
     /// Windows-native settings with no firmware-session semantics.
     fn restore_firmware_auto(&mut self, origin: JournalOrigin) {
         let restore_fan = self.fan_control_dirty;
@@ -1836,27 +2258,65 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         let started = Instant::now();
         let mut steps = Vec::new();
         let mut fan_auto_ok = !restore_fan;
-        let mut max_fan_off_ok = !restore_fan;
+        let mut max_fan_off_ok =
+            !restore_fan || matches!(self.observed().max_fan.value(), Some(false));
         let mut thermal_ok = !restore_thermal;
         let mut gpu_ok = !restore_gpu;
         let mut power_ok = !restore_power;
 
         if let Some(hp) = &self.hp {
             if restore_fan {
-                fan_auto_ok = Self::fan_write(
-                    &mut steps,
-                    "restore fan auto",
-                    "hp-wmi 0x2E",
-                    "restore",
-                    || hp.set_fan_levels(FanLevels::AUTO),
-                );
-                max_fan_off_ok = Self::fan_write(
-                    &mut steps,
-                    "restore max-fan off",
-                    "hp-wmi 0x27",
-                    "restore",
-                    || hp.set_max_fan(false),
-                );
+                // Match the live transition rule: release the max overlay
+                // before handing the underlying target to firmware.  If the
+                // observed state already says max is off, avoid an
+                // unnecessary 0x27 write during shutdown.
+                if !max_fan_off_ok {
+                    max_fan_off_ok = Self::fan_write(
+                        &mut steps,
+                        "restore max-fan off",
+                        "hp-wmi 0x27",
+                        "restore",
+                        || hp.set_max_fan(false),
+                    );
+                    if max_fan_off_ok {
+                        self.set_observed(|o| {
+                            o.max_fan = ObservedValue::TrustedWrite {
+                                value: false,
+                                at: Instant::now(),
+                            };
+                        });
+                    }
+                }
+                if max_fan_off_ok {
+                    fan_auto_ok = Self::fan_write(
+                        &mut steps,
+                        "restore fan auto",
+                        "hp-wmi 0x2E",
+                        "restore",
+                        || hp.set_fan_levels(FanLevels::AUTO),
+                    );
+                }
+                if !fan_auto_ok {
+                    // We may already have released 0x27 before 0x2E failed.
+                    // Re-arm max fan so a shutdown/ watchdog failure never
+                    // leaves a user-controlled target running unprotected.
+                    let rearmed = Self::fan_write(
+                        &mut steps,
+                        "restore fallback max-fan on",
+                        "hp-wmi 0x27",
+                        "failed firmware-auto restore",
+                        || hp.set_max_fan(true),
+                    );
+                    if rearmed {
+                        max_fan_off_ok = false;
+                        self.set_observed(|o| {
+                            o.max_fan = ObservedValue::TrustedWrite {
+                                value: true,
+                                at: Instant::now(),
+                            };
+                        });
+                    }
+                }
             }
             if restore_gpu && let Some(startup) = self.gpu_policy_startup {
                 match hp.set_gpu_platform_policy(startup) {
@@ -2025,6 +2485,15 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
     }
 
     // ------------------------------------------------------------ helpers
+
+    fn control_status_succeeded(status: &ControlStatus) -> bool {
+        match status {
+            ControlStatus::Applied { verification } => {
+                !matches!(verification, Verification::Failed { .. })
+            }
+            ControlStatus::Rejected { .. } | ControlStatus::Partial => false,
+        }
+    }
 
     fn observed(&self) -> ObservedState {
         self.observed.read().expect("observed poisoned").clone()
@@ -2331,52 +2800,149 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct MockPpmState {
+        epp_ac: u8,
+        epp_dc: u8,
+        epp1_ac: u8,
+        epp1_dc: u8,
+        max_freq_ac: u32,
+        max_freq_dc: u32,
+        boost_ac: BoostPolicy,
+        boost_dc: BoostPolicy,
+        min_perf_ac: u8,
+        min_perf_dc: u8,
+        max_perf_ac: u8,
+        max_perf_dc: u8,
+    }
+
+    impl Default for MockPpmState {
+        fn default() -> Self {
+            Self {
+                epp_ac: 50,
+                epp_dc: 50,
+                epp1_ac: 50,
+                epp1_dc: 50,
+                max_freq_ac: 0,
+                max_freq_dc: 0,
+                boost_ac: BoostPolicy::Aggressive,
+                boost_dc: BoostPolicy::Aggressive,
+                min_perf_ac: 0,
+                min_perf_dc: 0,
+                max_perf_ac: 100,
+                max_perf_dc: 100,
+            }
+        }
+    }
+
     #[derive(Clone, Default)]
-    struct MockPpm(std::sync::Arc<Mutex<(u8, u8, u8, u8)>>);
+    struct MockPpm(std::sync::Arc<Mutex<MockPpmState>>);
+
+    impl MockPpm {
+        fn new() -> Self {
+            Self::default()
+        }
+    }
 
     impl CpuPolicyBackend for MockPpm {
         fn read_epp(&self) -> Result<(u8, u8), PlatformError> {
             let g = self.0.lock().unwrap();
-            Ok((g.0, g.1))
+            Ok((g.epp_ac, g.epp_dc))
         }
         fn read_epp1(&self) -> Result<(u8, u8), PlatformError> {
             let g = self.0.lock().unwrap();
-            Ok((g.2, g.3))
+            Ok((g.epp1_ac, g.epp1_dc))
         }
         fn read_max_freq_mhz(&self) -> Result<(u32, u32), PlatformError> {
-            Ok((0, 0))
+            let g = self.0.lock().unwrap();
+            Ok((g.max_freq_ac, g.max_freq_dc))
         }
         fn read_boost_policy(&self) -> Result<(BoostPolicy, BoostPolicy), PlatformError> {
-            Ok((BoostPolicy::Aggressive, BoostPolicy::Aggressive))
+            let g = self.0.lock().unwrap();
+            Ok((g.boost_ac, g.boost_dc))
+        }
+        fn read_min_performance(&self) -> Result<(u8, u8), PlatformError> {
+            let g = self.0.lock().unwrap();
+            Ok((g.min_perf_ac, g.min_perf_dc))
+        }
+        fn read_max_performance(&self) -> Result<(u8, u8), PlatformError> {
+            let g = self.0.lock().unwrap();
+            Ok((g.max_perf_ac, g.max_perf_dc))
         }
         fn write_epp(&self, ac: Option<u8>, dc: Option<u8>) -> Result<(), PlatformError> {
             let mut g = self.0.lock().unwrap();
             if let Some(v) = ac {
-                g.0 = v;
+                g.epp_ac = v;
             }
             if let Some(v) = dc {
-                g.1 = v;
+                g.epp_dc = v;
             }
             Ok(())
         }
         fn write_epp1(&self, ac: Option<u8>, dc: Option<u8>) -> Result<(), PlatformError> {
             let mut g = self.0.lock().unwrap();
             if let Some(v) = ac {
-                g.2 = v;
+                g.epp1_ac = v;
             }
             if let Some(v) = dc {
-                g.3 = v;
+                g.epp1_dc = v;
             }
             Ok(())
         }
         fn write_max_freq_mhz(
             &self,
-            _ac: Option<u32>,
-            _dc: Option<u32>,
+            ac: Option<u32>,
+            dc: Option<u32>,
         ) -> Result<(), PlatformError> {
+            let mut g = self.0.lock().unwrap();
+            if let Some(v) = ac {
+                g.max_freq_ac = v;
+            }
+            if let Some(v) = dc {
+                g.max_freq_dc = v;
+            }
             Ok(())
         }
-        fn write_boost_policy(&self, _mode: BoostPolicy) -> Result<(), PlatformError> {
+        fn write_boost_policy(
+            &self,
+            ac: Option<BoostPolicy>,
+            dc: Option<BoostPolicy>,
+        ) -> Result<(), PlatformError> {
+            let mut g = self.0.lock().unwrap();
+            if let Some(v) = ac {
+                g.boost_ac = v;
+            }
+            if let Some(v) = dc {
+                g.boost_dc = v;
+            }
+            Ok(())
+        }
+        fn write_min_performance(
+            &self,
+            ac: Option<u8>,
+            dc: Option<u8>,
+        ) -> Result<(), PlatformError> {
+            let mut g = self.0.lock().unwrap();
+            if let Some(v) = ac {
+                g.min_perf_ac = v;
+            }
+            if let Some(v) = dc {
+                g.min_perf_dc = v;
+            }
+            Ok(())
+        }
+        fn write_max_performance(
+            &self,
+            ac: Option<u8>,
+            dc: Option<u8>,
+        ) -> Result<(), PlatformError> {
+            let mut g = self.0.lock().unwrap();
+            if let Some(v) = ac {
+                g.max_perf_ac = v;
+            }
+            if let Some(v) = dc {
+                g.max_perf_dc = v;
+            }
             Ok(())
         }
     }
@@ -2422,6 +2988,9 @@ mod tests {
         c.ppm.epp = Support::Supported;
         c.ppm.epp1 = Support::Supported;
         c.ppm.max_freq = Support::Supported;
+        c.ppm.boost = Support::Supported;
+        c.ppm.min_performance = Support::Supported;
+        c.ppm.max_performance = Support::Supported;
         c.ppm.write_privileged = true;
         c.gpu_platform_policy = Support::Supported;
         c.power_limits = Support::Experimental;
@@ -2448,7 +3017,7 @@ mod tests {
                 .join(format!("phelper-coord-test-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             let journal_path = dir.join("journal.jsonl");
-            let ppm = MockPpm(std::sync::Arc::new(Mutex::new((50, 50, 50, 50))));
+            let ppm = MockPpm::new();
             let mut cfg = ControlConfig::new(
                 caps_full(),
                 test_identity(tag),
@@ -2806,6 +3375,37 @@ mod tests {
     }
 
     #[test]
+    fn cpu_policy_bounds_and_boost_keep_ac_dc_independent() {
+        let rig = TestRig::start("ppm-fine");
+        let o = block(
+            &rig.handle,
+            ControlCommand::SetCpuPolicy(CpuPolicy {
+                min_performance_ac: Some(20),
+                max_performance_dc: Some(80),
+                boost_policy_ac: Some(BoostPolicy::EfficientAggressive),
+                ..Default::default()
+            }),
+        );
+        assert!(matches!(
+            o.status,
+            ControlStatus::Applied {
+                verification: Verification::Verified
+            }
+        ));
+        let observed = rig.handle.observed();
+        assert_eq!(observed.min_performance_ac.value(), Some(&20));
+        assert_eq!(observed.min_performance_dc.value(), Some(&0));
+        assert_eq!(observed.max_performance_ac.value(), Some(&100));
+        assert_eq!(observed.max_performance_dc.value(), Some(&80));
+        assert_eq!(
+            observed.boost_ac.value(),
+            Some(&BoostPolicy::EfficientAggressive)
+        );
+        assert_eq!(observed.boost_dc.value(), Some(&BoostPolicy::Aggressive));
+        rig.handle.shutdown();
+    }
+
+    #[test]
     fn gpu_policy_write_readback_verified() {
         let rig = TestRig::start("gpu-policy");
         let target = GpuPlatformPolicy {
@@ -3073,8 +3673,10 @@ mod tests {
         assert_eq!(observed.power_limits.value(), Some(&pl(45, 90)));
         assert!(!observed.power_limits.is_verified());
         handle.shutdown();
-        // Not dirty → shutdown does NOT write a power-limits restore.
-        assert_eq!(hp.state().power_limits_writes.len(), 1);
+        // The writer accepted the request even though readback did not
+        // converge, so shutdown still restores the captured baseline.
+        assert_eq!(hp.state().power_limits_writes.len(), 2);
+        assert_eq!(hp.state().power_limits_writes[1], pl4(55, 130, 200));
     }
 
     #[cfg(feature = "experimental-hp-power-limits")]
@@ -3164,8 +3766,10 @@ mod tests {
         ));
         assert!(!handle.observed().power_limits.is_verified());
         handle.shutdown();
-        // Not dirty → no restore write.
-        assert_eq!(hp.state().power_limits_writes.len(), 1);
+        // The PL4 readback is unavailable, but the write still happened and
+        // PL1/PL2 have a captured baseline. Restore all known fields.
+        assert_eq!(hp.state().power_limits_writes.len(), 2);
+        assert_eq!(hp.state().power_limits_writes[1], pl(55, 130));
     }
 
     #[cfg(feature = "experimental-hp-power-limits")]
@@ -3190,9 +3794,9 @@ mod tests {
     }
 
     /// HIL-13 regression: after the hysteresis release, observed.max_fan
-    /// must not stay TrustedWrite(true) — the keepalive would re-assert max
-    /// fan at the next tick. The release sequence must write 0x27-off
-    /// BEFORE re-applying the saved manual mode.
+    /// must not stay TrustedWrite(true) after a manual release — the
+    /// keepalive would re-assert max fan at the next tick. A saved Max mode is
+    /// already the desired safety state and must not take an off → on dip.
     #[test]
     fn hysteresis_release_clears_max_fan_first() {
         struct MutableFeed(std::sync::Arc<Mutex<f64>>);
@@ -3214,7 +3818,7 @@ mod tests {
         let journal_path = dir.join("journal.jsonl");
         let temp = std::sync::Arc::new(Mutex::new(70.0_f64));
         let hp = MockHp::default();
-        let ppm = MockPpm(std::sync::Arc::new(Mutex::new((50, 50, 50, 50))));
+        let ppm = MockPpm::new();
         let mut cfg = ControlConfig::new(
             caps_full(),
             test_identity("hyst"),
@@ -3286,7 +3890,7 @@ mod tests {
         let journal_path = dir.join("journal.jsonl");
         let temp = std::sync::Arc::new(Mutex::new(70.0_f64));
         let hp = MockHp::default();
-        let ppm = MockPpm(std::sync::Arc::new(Mutex::new((50, 50, 50, 50))));
+        let ppm = MockPpm::new();
         let mut cfg = ControlConfig::new(
             caps_full(),
             test_identity("hyst-max"),
@@ -3312,15 +3916,9 @@ mod tests {
         let s = hp.state();
         let writes = &s.max_fan_writes;
         let first_on = writes.iter().position(|w| *w).expect("0x27-on missing");
-        let off = writes
-            .iter()
-            .enumerate()
-            .skip(first_on + 1)
-            .find_map(|(index, on)| (!*on).then_some(index))
-            .expect("release never wrote 0x27-off");
         assert!(
-            writes.iter().skip(off + 1).any(|on| *on),
-            "release did not restore max fan after clearing the override: {writes:?}"
+            writes.iter().skip(first_on + 1).all(|on| *on),
+            "saved Max mode took an unsafe off → on detour: {writes:?}"
         );
         drop(s);
         let observed = handle.observed();
@@ -3553,7 +4151,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         let journal_path = dir.join("journal.jsonl");
-        let ppm = MockPpm(std::sync::Arc::new(Mutex::new((50, 50, 50, 50))));
+        let ppm = MockPpm::new();
         let mut cfg = ControlConfig::new(
             caps_full(),
             test_identity("prof-exp"),

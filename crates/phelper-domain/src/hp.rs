@@ -25,7 +25,8 @@ pub struct SystemDesignData {
 }
 
 /// One 0x2F fan-table entry. Levels are in the board's scale unit
-/// (V1: 100-RPM units); noise in dB as reported by firmware.
+/// (V1: 100-RPM units); noise in dB as reported by firmware. This is a
+/// discrete level/noise table, not a firmware temperature-to-speed curve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FanTableEntry {
     pub cpu: u8,
@@ -42,7 +43,8 @@ pub struct FanTable {
 }
 
 impl FanTable {
-    /// Clamp range for manual fan levels, derived from the table.
+    /// Clamp range for software-controlled fan levels, derived from the
+    /// discrete table. The table contains no temperature thresholds.
     /// Returns None when the table looks implausible (caller falls back to
     /// the BoardProfile clamp — fail closed).
     pub fn clamp_range(&self) -> Option<(u16, u16)> {

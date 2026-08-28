@@ -6,12 +6,15 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
+use phelper_domain::automatic::AutomaticSchedulerSnapshot;
 use phelper_domain::capability::{CapabilitySet, Support};
 use phelper_domain::command::{ControlOutcome, ControlReceipt, ControlStatus, Verification};
 use phelper_domain::error::ControlError;
 use phelper_domain::identity::DeviceIdentity;
-use phelper_domain::policy::{FanCurve, FanMode};
+use phelper_domain::os_policy::{OsPolicySnapshot, ProcessInfo};
+use phelper_domain::policy::{FanCurve, FanMode, WindowsPpmState};
 use phelper_domain::profile::PerformanceProfile;
+use phelper_domain::resident::ResidentSnapshot;
 use phelper_domain::state::{DesiredState, ObservedState};
 use phelper_domain::telemetry::TelemetrySnapshot;
 
@@ -49,6 +52,10 @@ pub enum KnobId {
     Epp1Dc,
     MaxFreqAc,
     MaxFreqDc,
+    MinPerfAc,
+    MinPerfDc,
+    MaxPerfAc,
+    MaxPerfDc,
     Boost,
     ThermalMode,
     FanMode,
@@ -58,13 +65,17 @@ pub enum KnobId {
 }
 
 impl KnobId {
-    pub const ALL: [KnobId; 12] = [
+    pub const ALL: [KnobId; 16] = [
         KnobId::EppAc,
         KnobId::EppDc,
         KnobId::Epp1Ac,
         KnobId::Epp1Dc,
         KnobId::MaxFreqAc,
         KnobId::MaxFreqDc,
+        KnobId::MinPerfAc,
+        KnobId::MinPerfDc,
+        KnobId::MaxPerfAc,
+        KnobId::MaxPerfDc,
         KnobId::Boost,
         KnobId::ThermalMode,
         KnobId::FanMode,
@@ -151,9 +162,29 @@ pub struct AppState {
     pub caps: Option<CapabilitySet>,
     pub desired: DesiredState,
     pub observed: ObservedState,
+    /// Current Windows software policy and plan/mode context. This is a
+    /// readback snapshot, not a claim that phelper owns Windows' high-level
+    /// mode selector.
+    pub windows_ppm: Option<WindowsPpmState>,
     /// Last software curve successfully applied by phelper. This is a
     /// recoverable editing source, not an active-control assertion.
     pub last_saved_fan_curve: Option<FanCurve>,
+    /// Windows process/thread scheduling state.  This stays separate from
+    /// hardware desired/observed state because it targets arbitrary apps.
+    pub os_policy: OsPolicySnapshot,
+    /// Process picker rows are refreshed only when the scheduling page asks
+    /// for them; they are not collected on every 50 ms app-state tick.
+    pub os_processes: Arc<Vec<ProcessInfo>>,
+    /// Errors are shown only when an OS-policy action fails; successful
+    /// actions are represented by `os_policy.active` and need no banner.
+    pub os_policy_error: Option<String>,
+    /// Read-only state for the resident desktop integrations. It contains no
+    /// handles and no platform objects; the desktop adapter updates it via
+    /// the app pump after asynchronous reconciliation.
+    pub resident: ResidentSnapshot,
+    /// Power-aware automatic scheduling state.  This is a read model only;
+    /// the worker and OS-policy ledger remain in core.
+    pub automatic: AutomaticSchedulerSnapshot,
     pub profiles: Vec<ProfileSummary>,
     pub profile_warnings: Vec<String>,
     pub ogh_findings: Vec<OghFinding>,
@@ -190,6 +221,14 @@ impl AppState {
 
     pub fn set_knob(&mut self, knob: KnobId, status: KnobStatus) {
         self.knobs.insert(knob, status);
+    }
+
+    pub fn set_resident(&mut self, resident: ResidentSnapshot) {
+        self.resident = resident;
+    }
+
+    pub fn set_overlay_visible(&mut self, visible: bool) {
+        self.resident.overlay_visible = visible;
     }
 
     /// Record a finished command: knob status from its outcome + evidence
@@ -265,7 +304,13 @@ fn touches_of(p: &PerformanceProfile) -> Vec<&'static str> {
         || c.epp1_dc.is_some()
         || c.max_freq_mhz_ac.is_some()
         || c.max_freq_mhz_dc.is_some()
+        || c.min_performance_ac.is_some()
+        || c.min_performance_dc.is_some()
+        || c.max_performance_ac.is_some()
+        || c.max_performance_dc.is_some()
         || c.boost_policy.is_some()
+        || c.boost_policy_ac.is_some()
+        || c.boost_policy_dc.is_some()
     {
         t.push("ppm");
     }
@@ -280,6 +325,9 @@ fn touches_of(p: &PerformanceProfile) -> Vec<&'static str> {
     }
     if p.fan.is_some() {
         t.push("fan");
+    }
+    if p.os_policy.is_some() {
+        t.push("os");
     }
     t
 }
@@ -303,6 +351,12 @@ pub fn knob_enabled(
             "epp" if c.ppm.epp != Support::Supported => Err("当前设备不支持此控制"),
             "epp1" if c.ppm.epp1 != Support::Supported => Err("当前设备不支持此控制"),
             "max_freq" if c.ppm.max_freq != Support::Supported => Err("当前设备不支持此控制"),
+            "min_performance" if c.ppm.min_performance != Support::Supported => {
+                Err("当前设备不支持此控制")
+            }
+            "max_performance" if c.ppm.max_performance != Support::Supported => {
+                Err("当前设备不支持此控制")
+            }
             _ => Ok(()),
         }
     };
@@ -310,8 +364,12 @@ pub fn knob_enabled(
         KnobId::EppAc | KnobId::EppDc => ppm_priv("epp"),
         KnobId::Epp1Ac | KnobId::Epp1Dc => ppm_priv("epp1"),
         KnobId::MaxFreqAc | KnobId::MaxFreqDc => ppm_priv("max_freq"),
+        KnobId::MinPerfAc | KnobId::MinPerfDc => ppm_priv("min_performance"),
+        KnobId::MaxPerfAc | KnobId::MaxPerfDc => ppm_priv("max_performance"),
         KnobId::Boost => {
-            if c.ppm.write_privileged {
+            if c.ppm.boost != Support::Supported {
+                Err("当前设备不支持此控制")
+            } else if c.ppm.write_privileged {
                 Ok(())
             } else {
                 Err("需要管理员权限")
@@ -466,6 +524,9 @@ mod tests {
         caps.ppm.epp = Support::Supported;
         caps.ppm.epp1 = Support::Supported;
         caps.ppm.max_freq = Support::Supported;
+        caps.ppm.boost = Support::Supported;
+        caps.ppm.min_performance = Support::Supported;
+        caps.ppm.max_performance = Support::Supported;
         caps.ppm.write_privileged = true;
         caps.thermal_mode = Support::Supported;
         caps.fan_manual_level = Support::Supported;

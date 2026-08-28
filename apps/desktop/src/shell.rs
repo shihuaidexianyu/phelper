@@ -17,15 +17,21 @@ use phelper_core::app::AppState;
 use phelper_core::app::runtime::AppHandle;
 use phelper_core::app::state::KnobId;
 use phelper_domain::command::ControlCommand;
+use phelper_domain::os_policy::{
+    CpuPlacement, GpuPreference, MemoryPriority, ProcessPriority, QosLevel, ThreadPriority,
+};
 use phelper_domain::policy::{FAN_CURVE_POINT_COUNT, FanCurve, FanLevels, FanMode};
+use phelper_domain::resident::ResidentSettings;
 use phelper_domain::state::ObservedValue;
 use phelper_domain::telemetry::ids;
 
-use crate::pages::{PageId, dashboard, monitor, performance, profiles, settings};
+use crate::overlay::OverlayController;
+use crate::pages::{PageId, applications, dashboard, monitor, performance, profiles, settings};
+use crate::resident::ResidentRuntimeHandle;
 
-/// Performance page view-state: the six slider entities (local intent —
-/// seeded once from observed values; never stomped mid-drag), plus the
-/// outcome banner expansion toggle.
+/// Performance page view-state: local slider intent is seeded from observed
+/// values once and is never stomped mid-drag. The PPM bounds stay behind a
+/// small advanced disclosure so the normal page remains compact.
 pub struct PerfState {
     pub epp_ac: Entity<SliderState>,
     pub epp_dc: Entity<SliderState>,
@@ -33,9 +39,15 @@ pub struct PerfState {
     pub epp1_dc: Entity<SliderState>,
     pub freq_ac: Entity<SliderState>,
     pub freq_dc: Entity<SliderState>,
+    pub min_perf_ac: Entity<SliderState>,
+    pub min_perf_dc: Entity<SliderState>,
+    pub max_perf_ac: Entity<SliderState>,
+    pub max_perf_dc: Entity<SliderState>,
     pub seeded: bool,
+    pub bounds_seeded: bool,
     pub banner_expanded: bool,
     pub advanced_expanded: bool,
+    pub software_advanced_expanded: bool,
 }
 
 /// Fan view-state. Fan sliders are created LAZILY once the fan
@@ -86,9 +98,12 @@ pub struct MonitorState {
     pub filter: Entity<InputState>,
 }
 
-/// Settings page view-state: loaded theme pref + transient save note.
+/// Settings page view-state: persisted resident intent + transient save note.
 pub struct SettingsState {
     pub theme: phelper_core::app::settings::ThemePref,
+    pub resident: ResidentSettings,
+    pub shortcut: Entity<InputState>,
+    pub profile_cycle: Entity<InputState>,
     pub note: Option<(String, bool)>,
 }
 
@@ -100,6 +115,33 @@ pub struct ExpState {
     pub pl2: Entity<InputState>,
     pub pl4: Entity<InputState>,
     pub seeded: bool,
+    pub note: Option<(String, bool)>,
+}
+
+/// Application scheduling page state.  The inputs are deliberately local to
+/// the page; the pump owns all Windows handles and publishes active policies
+/// through AppState.
+pub struct OsPolicyState {
+    pub pid: Entity<InputState>,
+    pub tid: Entity<InputState>,
+    pub cpu_sets: Entity<InputState>,
+    pub affinity_group: Entity<InputState>,
+    pub affinity_mask: Entity<InputState>,
+    pub ideal_group: Entity<InputState>,
+    pub ideal_number: Entity<InputState>,
+    pub placement: CpuPlacement,
+    pub qos: QosLevel,
+    pub process_priority: ProcessPriority,
+    pub thread_priority: ThreadPriority,
+    pub memory_priority: MemoryPriority,
+    pub gpu_preference: GpuPreference,
+    pub placement_touched: bool,
+    pub qos_touched: bool,
+    pub process_priority_touched: bool,
+    pub thread_priority_touched: bool,
+    pub memory_priority_touched: bool,
+    pub gpu_touched: bool,
+    pub advanced: bool,
     pub note: Option<(String, bool)>,
 }
 
@@ -118,7 +160,10 @@ pub struct ShellView {
     pub prof: ProfileState,
     pub mon: Option<MonitorState>,
     pub settings: SettingsState,
+    pub resident_runtime: ResidentRuntimeHandle,
+    pub overlay: OverlayController,
     pub exp: Option<ExpState>,
+    pub os: Option<OsPolicyState>,
     _appearance_sub: gpui::Subscription,
     _tick: Task<()>,
 }
@@ -272,9 +317,43 @@ impl ShellView {
                     KnobId::MaxFreqDc,
                     performance::freq_dc_cmd,
                 ),
+                min_perf_ac: knob_slider(
+                    cx,
+                    0.,
+                    100.,
+                    5.,
+                    KnobId::MinPerfAc,
+                    performance::min_perf_ac_cmd,
+                ),
+                min_perf_dc: knob_slider(
+                    cx,
+                    0.,
+                    100.,
+                    5.,
+                    KnobId::MinPerfDc,
+                    performance::min_perf_dc_cmd,
+                ),
+                max_perf_ac: knob_slider(
+                    cx,
+                    0.,
+                    100.,
+                    5.,
+                    KnobId::MaxPerfAc,
+                    performance::max_perf_ac_cmd,
+                ),
+                max_perf_dc: knob_slider(
+                    cx,
+                    0.,
+                    100.,
+                    5.,
+                    KnobId::MaxPerfDc,
+                    performance::max_perf_dc_cmd,
+                ),
                 seeded: false,
+                bounds_seeded: false,
                 banner_expanded: false,
                 advanced_expanded: false,
+                software_advanced_expanded: false,
             });
         }
 
@@ -325,33 +404,100 @@ impl ShellView {
         }
     }
 
+    fn ensure_os_policy_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.os.is_some() {
+            return;
+        }
+        let inputs = [
+            cx.new(|cx| InputState::new(window, cx).placeholder("PID")),
+            cx.new(|cx| InputState::new(window, cx).placeholder("TID")),
+            cx.new(|cx| InputState::new(window, cx).placeholder("CPU Set ID…")),
+            cx.new(|cx| InputState::new(window, cx).placeholder("组")),
+            cx.new(|cx| InputState::new(window, cx).placeholder("Affinity mask")),
+            cx.new(|cx| InputState::new(window, cx).placeholder("理想组")),
+            cx.new(|cx| InputState::new(window, cx).placeholder("理想核")),
+        ];
+        for input in &inputs {
+            cx.subscribe(input, |_this: &mut ShellView, _, ev: &InputEvent, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    cx.notify();
+                }
+            })
+            .detach();
+        }
+        self.os = Some(OsPolicyState {
+            pid: inputs[0].clone(),
+            tid: inputs[1].clone(),
+            cpu_sets: inputs[2].clone(),
+            affinity_group: inputs[3].clone(),
+            affinity_mask: inputs[4].clone(),
+            ideal_group: inputs[5].clone(),
+            ideal_number: inputs[6].clone(),
+            placement: CpuPlacement::All,
+            qos: QosLevel::System,
+            process_priority: ProcessPriority::Normal,
+            thread_priority: ThreadPriority::Normal,
+            memory_priority: MemoryPriority::Normal,
+            gpu_preference: GpuPreference::System,
+            placement_touched: false,
+            qos_touched: false,
+            process_priority_touched: false,
+            thread_priority_touched: false,
+            memory_priority_touched: false,
+            gpu_touched: false,
+            advanced: false,
+            note: None,
+        });
+        self.app.refresh_os_data();
+    }
+
     fn prepare_performance_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.ensure_performance_controls(window, cx);
 
-        // Seed the EPP sliders once from the first observed readback —
-        // sliders are local intent afterwards, never stomped mid-drag.
+        // Seed each slider independently from the first observed readback —
+        // one missing processor class must not blank the other class.
         if let Some(perf) = self.perf.as_mut()
             && !perf.seeded
         {
             let obs = &self.state.observed;
             let get = |v: &ObservedValue<u8>| v.value().copied();
-            if let (Some(ac), Some(dc), Some(a1), Some(d1)) = (
-                get(&obs.epp_ac),
-                get(&obs.epp_dc),
-                get(&obs.epp1_ac),
-                get(&obs.epp1_dc),
-            ) {
-                for (entity, v) in [
-                    (&perf.epp_ac, ac),
-                    (&perf.epp_dc, dc),
-                    (&perf.epp1_ac, a1),
-                    (&perf.epp1_dc, d1),
-                ] {
+            for (entity, value) in [
+                (&perf.epp_ac, get(&obs.epp_ac)),
+                (&perf.epp_dc, get(&obs.epp_dc)),
+                (&perf.epp1_ac, get(&obs.epp1_ac)),
+                (&perf.epp1_dc, get(&obs.epp1_dc)),
+            ] {
+                if let Some(value) = value {
                     let entity = entity.clone();
-                    entity.update(cx, |s, cx| s.set_value(v as f32, window, cx));
+                    entity.update(cx, |s, cx| s.set_value(value as f32, window, cx));
                 }
+            }
+            if self.state.windows_ppm.is_some() {
                 perf.seeded = true;
             }
+        }
+
+        // PPM hard bounds are optional on Windows/CPU combinations. Seed
+        // each available value independently, then stop retrying once the
+        // coordinator has produced one software-policy snapshot.
+        if let Some(perf) = self.perf.as_mut()
+            && !perf.bounds_seeded
+            && self.state.windows_ppm.is_some()
+        {
+            let obs = &self.state.observed;
+            let get = |v: &ObservedValue<u8>| v.value().copied();
+            for (entity, value) in [
+                (&perf.min_perf_ac, get(&obs.min_performance_ac)),
+                (&perf.min_perf_dc, get(&obs.min_performance_dc)),
+                (&perf.max_perf_ac, get(&obs.max_performance_ac)),
+                (&perf.max_perf_dc, get(&obs.max_performance_dc)),
+            ] {
+                if let Some(value) = value {
+                    let entity = entity.clone();
+                    entity.update(cx, |s, cx| s.set_value(value as f32, window, cx));
+                }
+            }
+            perf.bounds_seeded = true;
         }
 
         if self
@@ -469,7 +615,9 @@ impl ShellView {
 
     pub fn new(
         app: AppHandle,
-        theme: phelper_core::app::settings::ThemePref,
+        ui_settings: phelper_core::app::settings::UiSettings,
+        resident_runtime: ResidentRuntimeHandle,
+        overlay: OverlayController,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -506,6 +654,27 @@ impl ShellView {
             }
             cx.notify();
         });
+        let shortcut = cx.new(|cx| InputState::new(window, cx).placeholder("Ctrl+Shift+F10"));
+        let profile_cycle = cx.new(|cx| InputState::new(window, cx).placeholder("balanced,gaming"));
+        shortcut.update(cx, |input, cx| {
+            input.set_value(ui_settings.resident.omen_key.shortcut.clone(), window, cx)
+        });
+        profile_cycle.update(cx, |input, cx| {
+            input.set_value(
+                ui_settings.resident.omen_key.profile_cycle.join(","),
+                window,
+                cx,
+            )
+        });
+        for input in [&shortcut, &profile_cycle] {
+            cx.subscribe(input, |_this: &mut ShellView, _, ev: &InputEvent, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    cx.notify();
+                }
+            })
+            .detach();
+        }
+
         Self {
             app,
             state: AppState::default(),
@@ -522,8 +691,17 @@ impl ShellView {
                 note: None,
             },
             mon: None,
-            settings: SettingsState { theme, note: None },
+            settings: SettingsState {
+                theme: ui_settings.theme,
+                resident: ui_settings.resident,
+                shortcut,
+                profile_cycle,
+                note: None,
+            },
+            resident_runtime,
+            overlay,
             exp: None,
+            os: None,
             _appearance_sub: appearance_sub,
             _tick,
         }
@@ -536,6 +714,8 @@ impl Render for ShellView {
             self.prepare_performance_page(window, cx);
         } else if self.page == PageId::Monitor {
             self.ensure_monitor_filter(window, cx);
+        } else if self.page == PageId::Applications {
+            self.ensure_os_policy_page(window, cx);
         }
 
         // NOTE: build everything that needs `&mut cx` (listeners, page
@@ -576,7 +756,13 @@ impl Render for ShellView {
                 let mon = self.mon.as_ref().expect("monitor filter initialized");
                 monitor::render(&self.state, mon, cx).into_any_element()
             }
-            PageId::Settings => settings::render(&self.settings, cx).into_any_element(),
+            PageId::Settings => {
+                settings::render(&self.state, &self.settings, cx).into_any_element()
+            }
+            PageId::Applications => {
+                let os = self.os.as_ref().expect("OS policy controls initialized");
+                applications::render(&self.state, &self.app, os, cx).into_any_element()
+            }
         };
 
         let theme = cx.theme();

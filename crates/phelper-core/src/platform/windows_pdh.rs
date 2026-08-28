@@ -134,7 +134,9 @@ impl SystemCounters for WindowsPdh {
         unsafe {
             let status = PdhCollectQueryData(self.query);
             if status != 0 {
-                return Err(PlatformError::Os(format!("PdhCollectQueryData: {status}")));
+                let detail = format!("PdhCollectQueryData: {status}");
+                self.degraded = Some(detail.clone());
+                return Err(PlatformError::Os(detail));
             }
         }
         let was_primed = std::mem::replace(&mut self.primed, true);
@@ -142,13 +144,17 @@ impl SystemCounters for WindowsPdh {
         let mut mem = MEMORYSTATUSEX::default();
         mem.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
         let (mem_total, mem_used) = unsafe {
-            GlobalMemoryStatusEx(&mut mem)
-                .map_err(|e| PlatformError::Os(format!("GlobalMemoryStatusEx: {e}")))?;
+            if let Err(error) = GlobalMemoryStatusEx(&mut mem) {
+                let detail = format!("GlobalMemoryStatusEx: {error}");
+                self.degraded = Some(detail.clone());
+                return Err(PlatformError::Os(detail));
+            }
             let total = mem.ullTotalPhys;
             (Some(total), Some(total - mem.ullAvailPhys))
         };
 
         let rate = |v: Option<f64>| was_primed.then_some(v).flatten();
+        self.degraded = None;
         Ok(SystemSample {
             cpu_util_percent: rate(self.counter_f64(self.cpu)),
             mem_used_bytes: mem_used,

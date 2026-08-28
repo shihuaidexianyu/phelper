@@ -14,7 +14,7 @@ use phelper_domain::capability::{CapabilitySet, FanScale, Support};
 use phelper_domain::error::EngineError;
 use phelper_domain::hp::{FanTable, SystemDesignData};
 use phelper_domain::identity::DeviceIdentity;
-use phelper_domain::policy::{FanLevels, GpuPlatformPolicy, MuxMode};
+use phelper_domain::policy::{FanLevels, GpuPlatformPolicy, MuxMode, WindowsPpmState};
 use phelper_domain::ports::HpPlatform;
 use tracing::{info, warn};
 
@@ -75,6 +75,10 @@ pub struct ProbeReport {
     pub epp_dc: Option<u8>,
     /// Active scheme's frequency ceiling (MHz; 0 = unlimited).
     pub max_freq_mhz: Option<u32>,
+    /// One read of the complete Windows software-policy surface. Keeping
+    /// this beside the capability report makes the probe useful without
+    /// requiring a second PowrProf walk.
+    pub windows_ppm: Option<WindowsPpmState>,
     pub notes: Vec<String>,
 }
 
@@ -172,34 +176,56 @@ impl CapabilityService {
         let mut epp_ac = None;
         let mut epp_dc = None;
         let mut max_freq_mhz = None;
-        match windows_ppm::read_epp() {
-            Ok(epp) => {
-                caps.ppm.epp = Support::Supported;
-                epp_ac = Some(epp.ac);
-                epp_dc = Some(epp.dc);
+        let mut windows_ppm_out = None;
+        match windows_ppm::read_windows_ppm_state() {
+            Ok(state) => {
+                caps.ppm.epp = if state.ac.epp.is_some() && state.dc.epp.is_some() {
+                    Support::Supported
+                } else {
+                    Support::Unsupported
+                };
+                caps.ppm.epp1 = if state.ac.epp1.is_some() && state.dc.epp1.is_some() {
+                    Support::Supported
+                } else {
+                    Support::Unsupported
+                };
+                caps.ppm.max_freq =
+                    if state.ac.max_freq_mhz.is_some() && state.dc.max_freq_mhz.is_some() {
+                        Support::Supported
+                    } else {
+                        Support::Unsupported
+                    };
+                caps.ppm.boost =
+                    if state.ac.boost_policy.is_some() && state.dc.boost_policy.is_some() {
+                        Support::Supported
+                    } else {
+                        Support::Unsupported
+                    };
+                caps.ppm.min_performance =
+                    if state.ac.min_performance.is_some() && state.dc.min_performance.is_some() {
+                        Support::Supported
+                    } else {
+                        Support::Unsupported
+                    };
+                caps.ppm.max_performance =
+                    if state.ac.max_performance.is_some() && state.dc.max_performance.is_some() {
+                        Support::Supported
+                    } else {
+                        Support::Unsupported
+                    };
+                epp_ac = state.ac.epp;
+                epp_dc = state.dc.epp;
+                max_freq_mhz = state.ac.max_freq_mhz;
+                windows_ppm_out = Some(state);
             }
             Err(e) => {
                 caps.ppm.epp = Support::Unsupported;
-                notes.push(format!("EPP read failed: {e}"));
-            }
-        }
-        match windows_ppm::read_epp1() {
-            Ok(_) => {
-                caps.ppm.epp1 = Support::Supported;
-            }
-            Err(e) => {
                 caps.ppm.epp1 = Support::Unsupported;
-                notes.push(format!("EPP1 read failed: {e}"));
-            }
-        }
-        match windows_ppm::read_max_freq_mhz() {
-            Ok(mhz) => {
-                caps.ppm.max_freq = Support::Supported;
-                max_freq_mhz = Some(mhz);
-            }
-            Err(e) => {
                 caps.ppm.max_freq = Support::Unsupported;
-                notes.push(format!("max freq read failed: {e}"));
+                caps.ppm.boost = Support::Unsupported;
+                caps.ppm.min_performance = Support::Unsupported;
+                caps.ppm.max_performance = Support::Unsupported;
+                notes.push(format!("Windows PPM snapshot read failed: {e}"));
             }
         }
 
@@ -359,6 +385,7 @@ impl CapabilityService {
             epp_ac,
             epp_dc,
             max_freq_mhz,
+            windows_ppm: windows_ppm_out,
             notes,
         }
     }
