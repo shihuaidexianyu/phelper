@@ -1,9 +1,12 @@
 //! Dashboard: current status, CPU/GPU metric cards, fan card, and two
-//! 5-minute trend charts. Pure `&AppState` render.
+//! 5-minute trend charts. Phase 2 — the page is its own entity; the shell
+//! composes `Entity<DashboardPageState>` and renders through `Render`.
+
+use std::time::Duration;
 
 use gpui::{
-    App, Div, InteractiveElement, IntoElement, ParentElement, Styled, div, prelude::FluentBuilder,
-    px,
+    App, Context, Div, Entity, InteractiveElement, IntoElement, ParentElement, Render, Styled,
+    Subscription, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{ActiveTheme, StyledExt, scroll::ScrollableElement};
 use phelper_core::app::fmt;
@@ -15,6 +18,121 @@ use phelper_domain::telemetry::ids;
 
 use crate::widgets::metric_card::MetricCard;
 use crate::widgets::trend_chart;
+
+/// §Phase 2 page entity. Holds the two 1 Hz chart caches, the per-page
+/// fingerprint state, and the observer chain that decides when to repaint.
+pub struct DashboardPageState {
+    temp_chart: trend_chart::ChartCache,
+    power_chart: trend_chart::ChartCache,
+    /// Live `AppState` — read every render from `app_state`.
+    app_state: Entity<AppState>,
+    app: AppHandle,
+    /// Last-painted visual fingerprint; the observer's `cx.notify()` is
+    /// gated on this (5 s forced-refresh backstop).
+    last_fp: Option<u64>,
+    last_paint: std::time::Instant,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl DashboardPageState {
+    pub fn new(
+        app_state: Entity<AppState>,
+        app: AppHandle,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // §Phase 2: observer-driven repaint. The pump's `cx.notify()` on
+        // `app_state` fires this closure; we re-check the dashboard's
+        // structural fingerprint (noisy values are deliberately NOT hashed
+        // — the page paints the snapshot current at that moment and the
+        // 1 s time bucket is its display cadence).
+        let app_state_sub = cx.observe(&app_state, |this, app_state, cx| {
+            let fp = this.fingerprint(&app_state.read(cx));
+            if Some(fp) != this.last_fp
+                || this.last_paint.elapsed() >= Duration::from_secs(5)
+            {
+                this.last_fp = Some(fp);
+                this.last_paint = std::time::Instant::now();
+                cx.notify();
+            }
+        });
+        Self {
+            temp_chart: trend_chart::ChartCache::default(),
+            power_chart: trend_chart::ChartCache::default(),
+            app_state,
+            app,
+            last_fp: None,
+            last_paint: std::time::Instant::now(),
+            _subscriptions: vec![app_state_sub],
+        }
+    }
+
+    /// Structural fingerprint of the dashboard's current display. The 1 s
+    /// bucket is the page's effective repaint cadence — noisy telemetry
+    /// (RPM, MHz, temp) flips every sample but the dashboard only re-paints
+    /// once per bucket. Quality/source flips and structural changes
+    /// (charger events, observed state) repaint immediately.
+    fn fingerprint(&self, state: &AppState) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        format!("{:?}", state.engine).hash(&mut h);
+        state.desired.profile.hash(&mut h);
+        state
+            .observed
+            .fan_mode
+            .value()
+            .map(|m| format!("{:?}", m))
+            .hash(&mut h);
+        let snap = state.telemetry.as_deref();
+        for id in [
+            ids::CPU_PKG_TEMP_C,
+            ids::CPU_PKG_POWER_W,
+            ids::CPU_UTIL_PERCENT,
+            ids::GPU_TEMP_C,
+            ids::GPU_POWER_W,
+            ids::GPU_UTIL_PERCENT,
+            ids::FAN_CPU_RPM,
+            ids::FAN_GPU_RPM,
+        ] {
+            snap.and_then(|x| x.samples.get(&id))
+                .map(|x| format!("{:?}-{:?}", x.quality, x.source))
+                .hash(&mut h);
+        }
+        // AC + battery are slow-moving but the page treats them as live.
+        snap.and_then(|x| x.samples.get(&ids::POWER_AC_ONLINE))
+            .map(|x| x.value.as_f64().map(|v| v > 0.5))
+            .hash(&mut h);
+        snap.and_then(|x| x.samples.get(&ids::POWER_BATTERY_PERCENT))
+            .and_then(|x| x.value.as_f64())
+            .map(|v| (v * 1.0).round() as i64)
+            .hash(&mut h);
+        self.temp_chart.revision().hash(&mut h);
+        self.power_chart.revision().hash(&mut h);
+        phelper_core::app::now_epoch_ms() / 1000
+    }
+
+    /// Exposed for `cx.update` from `ShellView::render`.
+    pub fn render_into(
+        entity: &Entity<Self>,
+        window: &mut Window,
+        cx: &mut Context<crate::shell::ShellView>,
+    ) -> gpui::AnyElement {
+        entity.update(cx, |view, cx| view.render(window, cx).into_any_element())
+    }
+}
+
+impl Render for DashboardPageState {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let state = self.app_state.read_with(cx, |s, _| s.clone());
+        render_dashboard(
+            &state,
+            &self.app,
+            &self.temp_chart,
+            &self.power_chart,
+            cx,
+        )
+    }
+}
 
 fn cadence(id: phelper_domain::telemetry::MetricId) -> std::time::Duration {
     registry::meta(id)
@@ -52,19 +170,18 @@ fn profile_name(name: &str) -> &str {
     }
 }
 
-/// Per-page view state (§42): one 1 Hz cache for each same-unit chart.
-#[derive(Default)]
-pub struct DashState {
-    pub temp_chart: trend_chart::ChartCache,
-    pub power_chart: trend_chart::ChartCache,
-}
-
-pub fn render(state: &AppState, app: &AppHandle, dash: &DashState, cx: &App) -> impl IntoElement {
+fn render_dashboard(
+    state: &AppState,
+    app: &AppHandle,
+    temp_chart: &trend_chart::ChartCache,
+    power_chart: &trend_chart::ChartCache,
+    cx: &mut Context<DashboardPageState>,
+) -> gpui_component::scroll::Scrollable<gpui::Stateful<gpui::Div>> {
     let root = page_root("dashboard-scroll");
     if state.telemetry.is_none()
         && matches!(state.engine, EngineStatus::Starting | EngineStatus::Running)
     {
-        return root.child(skeleton_content(cx));
+        return root.child(skeleton_content(&*cx));
     }
 
     let theme = cx.theme();
@@ -124,13 +241,13 @@ pub fn render(state: &AppState, app: &AppHandle, dash: &DashState, cx: &App) -> 
     let fan_card = MetricCard::custom("风扇", fan_value, "RPM", fan_mode_label).render(cx);
 
     // ---- trend charts ----
-    let temp_pts = dash.temp_chart.points(
+    let temp_pts = temp_chart.points(
         app,
         ids::CPU_PKG_TEMP_C,
         ids::GPU_TEMP_C,
         cx.background_executor().clone(),
     );
-    let power_pts = dash.power_chart.points(
+    let power_pts = power_chart.points(
         app,
         ids::CPU_PKG_POWER_W,
         ids::GPU_POWER_W,
@@ -138,7 +255,7 @@ pub fn render(state: &AppState, app: &AppHandle, dash: &DashState, cx: &App) -> 
     );
     let has_temp_trend = !temp_pts.is_empty();
     let has_power_trend = !power_pts.is_empty();
-    let temp_chart = if has_temp_trend {
+    let temp_chart_el = if has_temp_trend {
         Some(
             trend_chart::render(
                 "温度（5 分钟）",
@@ -157,12 +274,12 @@ pub fn render(state: &AppState, app: &AppHandle, dash: &DashState, cx: &App) -> 
             )
             .into_any_element(),
         )
-    } else if !dash.temp_chart.is_ready() {
+    } else if !temp_chart.is_ready() {
         Some(trend_chart::skeleton("温度（5 分钟）", cx).into_any_element())
     } else {
         None
     };
-    let power_chart = if has_power_trend {
+    let power_chart_el = if has_power_trend {
         Some(
             trend_chart::render(
                 "功率（5 分钟）",
@@ -181,17 +298,17 @@ pub fn render(state: &AppState, app: &AppHandle, dash: &DashState, cx: &App) -> 
             )
             .into_any_element(),
         )
-    } else if !dash.power_chart.is_ready() {
+    } else if !power_chart.is_ready() {
         Some(trend_chart::skeleton("功率（5 分钟）", cx).into_any_element())
     } else {
         None
     };
-    let trend_row = if temp_chart.is_some() || power_chart.is_some() {
+    let trend_row = if temp_chart_el.is_some() || power_chart_el.is_some() {
         let mut row = div().h_flex().w_full().gap_3().h(px(230.));
-        if let Some(chart) = temp_chart {
+        if let Some(chart) = temp_chart_el {
             row = row.child(chart);
         }
-        if let Some(chart) = power_chart {
+        if let Some(chart) = power_chart_el {
             row = row.child(chart);
         }
         Some(row)
@@ -211,9 +328,9 @@ pub fn render(state: &AppState, app: &AppHandle, dash: &DashState, cx: &App) -> 
                     .h_flex()
                     .gap_2()
                     .flex_wrap()
-                    .child(badge(cx, profile_label))
-                    .child(badge(cx, thermal_label))
-                    .child(badge(cx, power_label)),
+                    .child(badge(&*cx, profile_label))
+                    .child(badge(&*cx, thermal_label))
+                    .child(badge(&*cx, power_label)),
             )
             .child(card_row(&cards[0..3]))
             .child(card_row(&cards[3..6]))
@@ -236,7 +353,7 @@ fn metric_skeleton(cx: &App) -> Div {
         .v_flex()
         .gap_2()
         .p_3()
-        .min_w_0()
+        .min_w(px(0.))
         .flex_1()
         .rounded_lg()
         .border_1()

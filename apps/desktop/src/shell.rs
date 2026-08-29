@@ -102,14 +102,9 @@ pub struct MonitorState {
     pub filter: Entity<InputState>,
 }
 
-/// Settings page view-state: persisted resident intent + transient save note.
-pub struct SettingsState {
-    pub theme: phelper_core::app::settings::ThemePref,
-    pub resident: ResidentSettings,
-    pub shortcut: Entity<InputState>,
-    pub profile_cycle: Entity<InputState>,
-    pub note: Option<(String, bool)>,
-}
+/// Settings page view-state now lives in `Entity<SettingsPageState>`
+/// (see `pages::settings`). The shell keeps a handle to read the current
+/// theme for the shell-level fingerprint.
 
 /// Experimental drawer view-state (Performance page bottom): 0x29 inputs
 /// (PL1/PL2 seeded from the observed readback; PL4 left empty = NO_CHANGE,
@@ -158,16 +153,18 @@ pub struct ShellView {
     /// `cx.notify()` is gated on this (5 s forced-refresh backstop).
     pub(crate) last_fp: Option<u64>,
     pub(crate) last_paint: std::time::Instant,
-    pub dash: dashboard::DashState,
     pub perf: Option<PerfState>,
     pub thermal: Option<ThermalState>,
     pub prof: ProfileState,
     pub mon: Option<MonitorState>,
-    pub settings: SettingsState,
+    pub settings_page: Entity<settings::SettingsPageState>,
     pub resident_runtime: ResidentRuntimeHandle,
     pub overlay: OverlayController,
     pub exp: Option<ExpState>,
     pub os: Option<OsPolicyState>,
+    /// §Phase 2: page entities own their chart caches / interactive state.
+    /// The shell composes them once in `new()` and renders via `Render`.
+    pub dash_page: Entity<dashboard::DashboardPageState>,
     /// Owned by the shell so the `Entity<AppState>` outlives the shell
     /// (the bridge closure on the main thread also keeps a clone; this
     /// field is the shell's "I am still watching" anchor).
@@ -637,7 +634,7 @@ impl ShellView {
         // backstop fails open toward painting).
         let app_state_sub = cx.observe(&app_state, |this, app_state, cx| {
             this.state = app_state.read(cx).clone();
-            let fp = this.fingerprint();
+            let fp = this.fingerprint(&*cx);
             if Some(fp) != this.last_fp
                 || this.last_paint.elapsed() >= Duration::from_secs(5)
             {
@@ -647,42 +644,36 @@ impl ShellView {
             }
         });
         // OS theme flipped while we run: re-resolve "跟随系统" live. The
-        // notify matters now: the v0.2-d tick skips unchanged frames, and
-        // a theme flip is not part of any page fingerprint.
-        let appearance_sub = cx.observe_window_appearance(window, |this, _window, cx| {
-            if this.settings.theme == phelper_core::app::settings::ThemePref::System {
-                settings::apply_pref(this.settings.theme, cx);
+        // settings page owns the pref now; we read it via entity.
+        let settings_entity = cx.new(|cx_settings| {
+            settings::SettingsPageState::new(
+                app_state.clone(),
+                ui_settings.clone(),
+                window,
+                resident_runtime.clone(),
+                overlay.clone(),
+                cx_settings,
+            )
+        });
+        let settings_for_appearance = settings_entity.clone();
+        let appearance_sub = cx.observe_window_appearance(window, move |_this, _window, cx| {
+            let pref = settings_for_appearance.read_with(cx, |s, _| s.theme());
+            if pref == phelper_core::app::settings::ThemePref::System {
+                settings::apply_pref(pref, cx);
             }
             cx.notify();
         });
-        let shortcut = cx.new(|cx| InputState::new(window, cx).placeholder("Ctrl+Shift+F10"));
-        let profile_cycle = cx.new(|cx| InputState::new(window, cx).placeholder("balanced,gaming"));
-        shortcut.update(cx, |input, cx| {
-            input.set_value(ui_settings.resident.omen_key.shortcut.clone(), window, cx)
-        });
-        profile_cycle.update(cx, |input, cx| {
-            input.set_value(
-                ui_settings.resident.omen_key.profile_cycle.join(","),
-                window,
-                cx,
-            )
-        });
-        for input in [&shortcut, &profile_cycle] {
-            cx.subscribe(input, |_this: &mut ShellView, _, ev: &InputEvent, cx| {
-                if matches!(ev, InputEvent::Change) {
-                    cx.notify();
-                }
-            })
-            .detach();
-        }
 
         Self {
-            app,
+            app: app.clone(),
             state: AppState::default(),
             page: PageId::Dashboard,
             last_fp: None,
             last_paint: std::time::Instant::now(),
-            dash: Default::default(),
+            dash_page: cx.new(|cx_dash| {
+                dashboard::DashboardPageState::new(app_state.clone(), app, cx_dash)
+            }),
+            settings_page: settings_entity,
             perf: None,
             thermal: None,
             prof: ProfileState {
@@ -692,13 +683,6 @@ impl ShellView {
                 note: None,
             },
             mon: None,
-            settings: SettingsState {
-                theme: ui_settings.theme,
-                resident: ui_settings.resident,
-                shortcut,
-                profile_cycle,
-                note: None,
-            },
             resident_runtime,
             overlay,
             exp: None,
@@ -736,7 +720,7 @@ impl Render for ShellView {
 
         let content: gpui::AnyElement = match self.page {
             PageId::Dashboard => {
-                dashboard::render(&self.state, &self.app, &self.dash, cx).into_any_element()
+                dashboard::DashboardPageState::render_into(&self.dash_page, window, cx)
             }
             PageId::Performance => {
                 let perf = self
@@ -759,7 +743,7 @@ impl Render for ShellView {
                 monitor::render(&self.state, mon, cx).into_any_element()
             }
             PageId::Settings => {
-                settings::render(&self.state, &self.settings, cx).into_any_element()
+                settings::SettingsPageState::render_into(&self.settings_page, window, cx)
             }
             PageId::Applications => {
                 let os = self.os.as_ref().expect("OS policy controls initialized");
