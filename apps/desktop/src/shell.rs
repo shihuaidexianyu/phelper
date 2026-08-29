@@ -153,15 +153,21 @@ pub struct ShellView {
     /// `cx.notify()` is gated on this (5 s forced-refresh backstop).
     pub(crate) last_fp: Option<u64>,
     pub(crate) last_paint: std::time::Instant,
-    pub perf: Option<PerfState>,
-    pub thermal: Option<ThermalState>,
+    /// §Phase 2: page state initialization runs ONCE in `new()`. The seed
+    /// pass needs `&mut Window` (slider.set_value ignores it but takes the
+    /// arg by reference) and observes the just-arrived `AppState`, so it
+    /// lives in render with a one-shot guard. After the first call the
+    /// in-page `seeded` flags stay set and the call becomes a no-op.
+    seeded_once: bool,
+    pub perf: PerfState,
+    pub thermal: ThermalState,
     pub prof: ProfileState,
-    pub mon: Option<MonitorState>,
+    pub mon: MonitorState,
     pub settings_page: Entity<settings::SettingsPageState>,
     pub resident_runtime: ResidentRuntimeHandle,
     pub overlay: OverlayController,
-    pub exp: Option<ExpState>,
-    pub os: Option<OsPolicyState>,
+    pub exp: ExpState,
+    pub os: OsPolicyState,
     /// §Phase 2: page entities own their chart caches / interactive state.
     /// The shell composes them once in `new()` and renders via `Render`.
     pub dash_page: Entity<dashboard::DashboardPageState>,
@@ -231,9 +237,8 @@ fn fan_sliders(
     });
     cx.subscribe(&cpu, |this: &mut ShellView, _, ev: &SliderEvent, cx| {
         if let SliderEvent::Change(SliderValue::Single(v)) = ev {
-            let thermal = this.thermal.as_mut().expect("thermal controls initialized");
-            thermal.cpu_rpm = (*v / 100.).round() as u16;
-            let levels = FanLevels::new(thermal.cpu_rpm, thermal.gpu_rpm);
+            this.thermal.cpu_rpm = (*v / 100.).round() as u16;
+            let levels = FanLevels::new(this.thermal.cpu_rpm, this.thermal.gpu_rpm);
             this.app.dispatch(
                 KnobId::FanMode,
                 ControlCommand::SetFanMode(FanMode::Manual(levels)),
@@ -244,9 +249,8 @@ fn fan_sliders(
     .detach();
     cx.subscribe(&gpu, |this: &mut ShellView, _, ev: &SliderEvent, cx| {
         if let SliderEvent::Change(SliderValue::Single(v)) = ev {
-            let thermal = this.thermal.as_mut().expect("thermal controls initialized");
-            thermal.gpu_rpm = (*v / 100.).round() as u16;
-            let levels = FanLevels::new(thermal.cpu_rpm, thermal.gpu_rpm);
+            this.thermal.gpu_rpm = (*v / 100.).round() as u16;
+            let levels = FanLevels::new(this.thermal.cpu_rpm, this.thermal.gpu_rpm);
             this.app.dispatch(
                 KnobId::FanMode,
                 ControlCommand::SetFanMode(FanMode::Manual(levels)),
@@ -291,129 +295,119 @@ impl ShellView {
             })
             .collect::<Vec<_>>();
         let inputs = {
-            let thermal = self.thermal.as_mut().expect("thermal controls initialized");
-            thermal.curve = curve;
-            thermal.curve_inputs.clone()
+            self.thermal.curve = curve;
+            self.thermal.curve_inputs.clone()
         };
         for (input, value) in inputs.iter().zip(values) {
             input.update(cx, |s, cx| s.set_value(value, window, cx));
         }
     }
 
-    fn ensure_performance_controls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.perf.is_none() {
-            self.perf = Some(PerfState {
-                epp_ac: knob_slider(cx, 0., 100., 5., KnobId::EppAc, performance::epp_ac_cmd),
-                epp_dc: knob_slider(cx, 0., 100., 5., KnobId::EppDc, performance::epp_dc_cmd),
-                epp1_ac: knob_slider(cx, 0., 100., 5., KnobId::Epp1Ac, performance::epp1_ac_cmd),
-                epp1_dc: knob_slider(cx, 0., 100., 5., KnobId::Epp1Dc, performance::epp1_dc_cmd),
-                freq_ac: knob_slider(
-                    cx,
-                    0.,
-                    6000.,
-                    100.,
-                    KnobId::MaxFreqAc,
-                    performance::freq_ac_cmd,
-                ),
-                freq_dc: knob_slider(
-                    cx,
-                    0.,
-                    6000.,
-                    100.,
-                    KnobId::MaxFreqDc,
-                    performance::freq_dc_cmd,
-                ),
-                min_perf_ac: knob_slider(
-                    cx,
-                    0.,
-                    100.,
-                    5.,
-                    KnobId::MinPerfAc,
-                    performance::min_perf_ac_cmd,
-                ),
-                min_perf_dc: knob_slider(
-                    cx,
-                    0.,
-                    100.,
-                    5.,
-                    KnobId::MinPerfDc,
-                    performance::min_perf_dc_cmd,
-                ),
-                max_perf_ac: knob_slider(
-                    cx,
-                    0.,
-                    100.,
-                    5.,
-                    KnobId::MaxPerfAc,
-                    performance::max_perf_ac_cmd,
-                ),
-                max_perf_dc: knob_slider(
-                    cx,
-                    0.,
-                    100.,
-                    5.,
-                    KnobId::MaxPerfDc,
-                    performance::max_perf_dc_cmd,
-                ),
-                seeded: false,
-                bounds_seeded: false,
-                banner_expanded: false,
-                advanced_expanded: false,
-                software_advanced_expanded: false,
-            });
-        }
-
-        if self.thermal.is_none() {
-            let curve_inputs = curve_inputs(cx, window);
-            for input in &curve_inputs {
-                cx.subscribe(input, |_this: &mut ShellView, _, ev: &InputEvent, cx| {
-                    if matches!(ev, InputEvent::Change) {
-                        cx.notify();
-                    }
-                })
-                .detach();
-            }
-            self.thermal = Some(ThermalState {
-                fan_sliders: None,
-                cpu_rpm: 0,
-                gpu_rpm: 0,
-                curve_inputs,
-                curve: FanCurve::balanced(),
-                curve_seeded: false,
-                curve_origin: None,
-                curve_expanded: false,
-                curve_note: None,
-            });
-        }
-
-        if self.exp.is_none() {
-            self.exp = Some(ExpState {
-                pl1: cx.new(|cx| InputState::new(window, cx).placeholder("PL1 W")),
-                pl2: cx.new(|cx| InputState::new(window, cx).placeholder("PL2 W")),
-                pl4: cx.new(|cx| InputState::new(window, cx).placeholder("PL4 W · 空=不改")),
-                seeded: false,
-                note: None,
-            });
-        }
-    }
-
-    fn ensure_monitor_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.mon.is_none() {
-            let filter = cx.new(|cx| InputState::new(window, cx).placeholder("搜索指标…"));
-            cx.subscribe(&filter, |_this: &mut ShellView, _, ev: &InputEvent, cx| {
+    fn create_performance_state(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (PerfState, ThermalState, ExpState) {
+        let perf = PerfState {
+            epp_ac: knob_slider(cx, 0., 100., 5., KnobId::EppAc, performance::epp_ac_cmd),
+            epp_dc: knob_slider(cx, 0., 100., 5., KnobId::EppDc, performance::epp_dc_cmd),
+            epp1_ac: knob_slider(cx, 0., 100., 5., KnobId::Epp1Ac, performance::epp1_ac_cmd),
+            epp1_dc: knob_slider(cx, 0., 100., 5., KnobId::Epp1Dc, performance::epp1_dc_cmd),
+            freq_ac: knob_slider(
+                cx,
+                0.,
+                6000.,
+                100.,
+                KnobId::MaxFreqAc,
+                performance::freq_ac_cmd,
+            ),
+            freq_dc: knob_slider(
+                cx,
+                0.,
+                6000.,
+                100.,
+                KnobId::MaxFreqDc,
+                performance::freq_dc_cmd,
+            ),
+            min_perf_ac: knob_slider(
+                cx,
+                0.,
+                100.,
+                5.,
+                KnobId::MinPerfAc,
+                performance::min_perf_ac_cmd,
+            ),
+            min_perf_dc: knob_slider(
+                cx,
+                0.,
+                100.,
+                5.,
+                KnobId::MinPerfDc,
+                performance::min_perf_dc_cmd,
+            ),
+            max_perf_ac: knob_slider(
+                cx,
+                0.,
+                100.,
+                5.,
+                KnobId::MaxPerfAc,
+                performance::max_perf_ac_cmd,
+            ),
+            max_perf_dc: knob_slider(
+                cx,
+                0.,
+                100.,
+                5.,
+                KnobId::MaxPerfDc,
+                performance::max_perf_dc_cmd,
+            ),
+            seeded: false,
+            bounds_seeded: false,
+            banner_expanded: false,
+            advanced_expanded: false,
+            software_advanced_expanded: false,
+        };
+        let curve_inputs = curve_inputs(cx, window);
+        for input in &curve_inputs {
+            cx.subscribe(input, |_this: &mut ShellView, _, ev: &InputEvent, cx| {
                 if matches!(ev, InputEvent::Change) {
                     cx.notify();
                 }
             })
             .detach();
-            self.mon = Some(MonitorState { filter });
         }
+        let thermal = ThermalState {
+            fan_sliders: None,
+            cpu_rpm: 0,
+            gpu_rpm: 0,
+            curve_inputs,
+            curve: FanCurve::balanced(),
+            curve_seeded: false,
+            curve_origin: None,
+            curve_expanded: false,
+            curve_note: None,
+        };
+        let exp = ExpState {
+            pl1: cx.new(|cx| InputState::new(window, cx).placeholder("PL1 W")),
+            pl2: cx.new(|cx| InputState::new(window, cx).placeholder("PL2 W")),
+            pl4: cx.new(|cx| InputState::new(window, cx).placeholder("PL4 W · 空=不改")),
+            seeded: false,
+            note: None,
+        };
+        (perf, thermal, exp)
     }
 
-    fn ensure_os_policy_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.os.is_some() {
-            return;
-        }
+    fn create_monitor_state(window: &mut Window, cx: &mut Context<Self>) -> MonitorState {
+        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("搜索指标…"));
+        cx.subscribe(&filter, |_this: &mut ShellView, _, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::Change) {
+                cx.notify();
+            }
+        })
+        .detach();
+        MonitorState { filter }
+    }
+
+    fn create_os_policy_state(window: &mut Window, cx: &mut Context<Self>) -> OsPolicyState {
         let inputs = [
             cx.new(|cx| InputState::new(window, cx).placeholder("PID")),
             cx.new(|cx| InputState::new(window, cx).placeholder("TID")),
@@ -431,7 +425,7 @@ impl ShellView {
             })
             .detach();
         }
-        self.os = Some(OsPolicyState {
+        OsPolicyState {
             pid: inputs[0].clone(),
             tid: inputs[1].clone(),
             cpu_sets: inputs[2].clone(),
@@ -453,25 +447,20 @@ impl ShellView {
             gpu_touched: false,
             advanced: false,
             note: None,
-        });
-        self.app.refresh_os_data();
+        }
     }
 
-    fn prepare_performance_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.ensure_performance_controls(window, cx);
-
+    fn seed_performance_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Seed each slider independently from the first observed readback —
         // one missing processor class must not blank the other class.
-        if let Some(perf) = self.perf.as_mut()
-            && !perf.seeded
-        {
+        if !self.perf.seeded {
             let obs = &self.state.observed;
             let get = |v: &ObservedValue<u8>| v.value().copied();
             for (entity, value) in [
-                (&perf.epp_ac, get(&obs.epp_ac)),
-                (&perf.epp_dc, get(&obs.epp_dc)),
-                (&perf.epp1_ac, get(&obs.epp1_ac)),
-                (&perf.epp1_dc, get(&obs.epp1_dc)),
+                (&self.perf.epp_ac, get(&obs.epp_ac)),
+                (&self.perf.epp_dc, get(&obs.epp_dc)),
+                (&self.perf.epp1_ac, get(&obs.epp1_ac)),
+                (&self.perf.epp1_dc, get(&obs.epp1_dc)),
             ] {
                 if let Some(value) = value {
                     let entity = entity.clone();
@@ -479,39 +468,31 @@ impl ShellView {
                 }
             }
             if self.state.windows_ppm.is_some() {
-                perf.seeded = true;
+                self.perf.seeded = true;
             }
         }
 
         // PPM hard bounds are optional on Windows/CPU combinations. Seed
         // each available value independently, then stop retrying once the
         // coordinator has produced one software-policy snapshot.
-        if let Some(perf) = self.perf.as_mut()
-            && !perf.bounds_seeded
-            && self.state.windows_ppm.is_some()
-        {
+        if !self.perf.bounds_seeded && self.state.windows_ppm.is_some() {
             let obs = &self.state.observed;
             let get = |v: &ObservedValue<u8>| v.value().copied();
             for (entity, value) in [
-                (&perf.min_perf_ac, get(&obs.min_performance_ac)),
-                (&perf.min_perf_dc, get(&obs.min_performance_dc)),
-                (&perf.max_perf_ac, get(&obs.max_performance_ac)),
-                (&perf.max_perf_dc, get(&obs.max_performance_dc)),
+                (&self.perf.min_perf_ac, get(&obs.min_performance_ac)),
+                (&self.perf.min_perf_dc, get(&obs.min_performance_dc)),
+                (&self.perf.max_perf_ac, get(&obs.max_performance_ac)),
+                (&self.perf.max_perf_dc, get(&obs.max_performance_dc)),
             ] {
                 if let Some(value) = value {
                     let entity = entity.clone();
                     entity.update(cx, |s, cx| s.set_value(value as f32, window, cx));
                 }
             }
-            perf.bounds_seeded = true;
+            self.perf.bounds_seeded = true;
         }
 
-        if self
-            .thermal
-            .as_ref()
-            .is_some_and(|thermal| !thermal.curve_seeded)
-            && self.state.caps.is_some()
-        {
+        if !self.thermal.curve_seeded && self.state.caps.is_some() {
             let curve_source = match self.state.observed.fan_mode.value() {
                 Some(FanMode::Curve(curve)) => Some((*curve, CurveOrigin::Active)),
                 _ => self
@@ -535,9 +516,8 @@ impl ShellView {
             };
             if let Some((curve, origin)) = curve_source {
                 self.set_curve_form(curve, window, cx);
-                let thermal = self.thermal.as_mut().expect("thermal controls initialized");
-                thermal.curve_seeded = true;
-                thermal.curve_origin = Some(origin);
+                self.thermal.curve_seeded = true;
+                self.thermal.curve_origin = Some(origin);
             }
         }
 
@@ -546,11 +526,7 @@ impl ShellView {
         // live RPM (clamped; fans may read 0 at idle fan-stop). Programmatic
         // set_value does NOT fire SliderEvent::Change — no dispatch (D6:
         // journal stayed clean through EPP seeding).
-        if self
-            .thermal
-            .as_ref()
-            .is_some_and(|thermal| thermal.fan_sliders.is_none())
-        {
+        if self.thermal.fan_sliders.is_none() {
             let clamp =
                 self.state
                     .caps
@@ -579,10 +555,9 @@ impl ShellView {
                 let (cpu_e, gpu_e) = fan_sliders(cx, (lo * 100) as f32, (hi * 100) as f32);
                 cpu_e.update(cx, |s, cx| s.set_value((c0 * 100) as f32, window, cx));
                 gpu_e.update(cx, |s, cx| s.set_value((g0 * 100) as f32, window, cx));
-                let thermal = self.thermal.as_mut().expect("thermal controls initialized");
-                thermal.cpu_rpm = c0;
-                thermal.gpu_rpm = g0;
-                thermal.fan_sliders = Some((cpu_e, gpu_e));
+                self.thermal.cpu_rpm = c0;
+                self.thermal.gpu_rpm = g0;
+                self.thermal.fan_sliders = Some((cpu_e, gpu_e));
             }
         }
 
@@ -591,30 +566,22 @@ impl ShellView {
         // write verifies this session, so it can't seed a fresh session — the
         // telemetry metrics are the same hardware readback the CLI shows.
         // PL4 stays empty = NO_CHANGE (mirrors the CLI's --pl4).
-        if self.exp.as_ref().is_some_and(|exp| !exp.seeded) {
+        if !self.exp.seeded {
             let snap = self.state.telemetry.as_deref();
             let val = |id| {
                 snap.and_then(|s| s.samples.get(&id))
                     .and_then(|s| s.value.as_f64())
             };
             if let (Some(pl1), Some(pl2)) = (val(ids::CPU_PL1_W), val(ids::CPU_PL2_W)) {
-                let (pl1_input, pl2_input) = {
-                    let exp = self
-                        .exp
-                        .as_ref()
-                        .expect("experimental controls initialized");
-                    (exp.pl1.clone(), exp.pl2.clone())
-                };
+                let pl1_input = self.exp.pl1.clone();
+                let pl2_input = self.exp.pl2.clone();
                 pl1_input.update(cx, |s, cx| {
                     s.set_value(format!("{}", pl1.round() as i64), window, cx)
                 });
                 pl2_input.update(cx, |s, cx| {
                     s.set_value(format!("{}", pl2.round() as i64), window, cx)
                 });
-                self.exp
-                    .as_mut()
-                    .expect("experimental controls initialized")
-                    .seeded = true;
+                self.exp.seeded = true;
             }
         }
     }
@@ -664,6 +631,15 @@ impl ShellView {
             cx.notify();
         });
 
+        // §Phase 2: page state is initialized ONCE here. No more imperative
+        // side effects inside `Render::render`. The seeding logic that
+        // previously ran on every render now runs reactively inside the
+        // `app_state_sub` observer below — by the time the observer fires,
+        // `self.state` is already the new snapshot.
+        let (perf, thermal, exp) = Self::create_performance_state(window, cx);
+        let mon = Self::create_monitor_state(window, cx);
+        let os = Self::create_os_policy_state(window, cx);
+
         Self {
             app: app.clone(),
             state: AppState::default(),
@@ -674,20 +650,21 @@ impl ShellView {
                 dashboard::DashboardPageState::new(app_state.clone(), app, cx_dash)
             }),
             settings_page: settings_entity,
-            perf: None,
-            thermal: None,
+            perf,
+            thermal,
             prof: ProfileState {
                 selected: None,
                 banner_expanded: false,
                 management_expanded: false,
                 note: None,
             },
-            mon: None,
+            mon,
             resident_runtime,
             overlay,
-            exp: None,
-            os: None,
+            exp,
+            os,
             app_state,
+            seeded_once: false,
             _appearance_sub: appearance_sub,
             _app_state_sub: app_state_sub,
         }
@@ -696,12 +673,13 @@ impl ShellView {
 
 impl Render for ShellView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.page == PageId::Performance {
-            self.prepare_performance_page(window, cx);
-        } else if self.page == PageId::Monitor {
-            self.ensure_monitor_filter(window, cx);
-        } else if self.page == PageId::Applications {
-            self.ensure_os_policy_page(window, cx);
+        // §Phase 2: page state is initialized ONCE in `new()` — no
+        // imperative side effects during render beyond the very first
+        // call (which seeds slider values from observed readback; the
+        // `seeded_once` flag makes the call a no-op on every later paint).
+        if !self.seeded_once {
+            self.seed_performance_state(window, cx);
+            self.seeded_once = true;
         }
 
         // NOTE: build everything that needs `&mut cx` (listeners, page
@@ -723,31 +701,18 @@ impl Render for ShellView {
                 dashboard::DashboardPageState::render_into(&self.dash_page, window, cx)
             }
             PageId::Performance => {
-                let perf = self
-                    .perf
-                    .as_ref()
-                    .expect("performance controls initialized");
-                let thermal = self.thermal.as_ref().expect("thermal controls initialized");
-                let exp = self
-                    .exp
-                    .as_ref()
-                    .expect("experimental controls initialized");
-                performance::render(&self.state, &self.app, perf, thermal, exp, cx)
+                performance::render(&self.state, &self.app, &self.perf, &self.thermal, &self.exp, cx)
                     .into_any_element()
             }
             PageId::Profiles => {
                 profiles::render(&self.state, &self.app, &self.prof, cx).into_any_element()
             }
-            PageId::Monitor => {
-                let mon = self.mon.as_ref().expect("monitor filter initialized");
-                monitor::render(&self.state, mon, cx).into_any_element()
-            }
+            PageId::Monitor => monitor::render(&self.state, &self.mon, cx).into_any_element(),
             PageId::Settings => {
                 settings::SettingsPageState::render_into(&self.settings_page, window, cx)
             }
             PageId::Applications => {
-                let os = self.os.as_ref().expect("OS policy controls initialized");
-                applications::render(&self.state, &self.app, os, cx).into_any_element()
+                applications::render(&self.state, &self.app, &self.os, cx).into_any_element()
             }
         };
 

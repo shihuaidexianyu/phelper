@@ -99,8 +99,7 @@ pub fn render_content(
             .outline()
             .on_click(cx.listener(
                 |this: &mut ShellView, _: &gpui::ClickEvent, _: &mut Window, cx| {
-                    let thermal = this.thermal.as_mut().expect("thermal controls initialized");
-                    thermal.curve_expanded = !thermal.curve_expanded;
+                    this.thermal.curve_expanded = !this.thermal.curve_expanded;
                     cx.notify();
                 },
             ));
@@ -246,11 +245,9 @@ pub fn render_content(
             .disabled(reason.is_some() || !thermal.curve_seeded)
             .on_click(cx.listener(
                 move |this: &mut ShellView, _: &gpui::ClickEvent, _: &mut Window, cx| {
+                    let inputs = this.thermal.curve_inputs.clone();
                     let read = |index: usize| {
-                        this.thermal
-                            .as_ref()
-                            .expect("thermal controls initialized")
-                            .curve_inputs[index]
+                        inputs[index]
                             .read(cx)
                             .text()
                             .to_string()
@@ -306,22 +303,17 @@ pub fn render_content(
 
                     match curve {
                         Ok(curve) => {
-                            let thermal =
-                                this.thermal.as_mut().expect("thermal controls initialized");
-                            thermal.curve = curve;
-                            thermal.curve_seeded = true;
-                            thermal.curve_origin = Some(CurveOrigin::Draft);
-                            thermal.curve_note = None;
+                            this.thermal.curve = curve;
+                            this.thermal.curve_seeded = true;
+                            this.thermal.curve_origin = Some(CurveOrigin::Draft);
+                            this.thermal.curve_note = None;
                             apply_app.dispatch(
                                 KnobId::FanMode,
                                 ControlCommand::SetFanMode(FanMode::Curve(curve)),
                             );
                         }
                         Err(message) => {
-                            this.thermal
-                                .as_mut()
-                                .expect("thermal controls initialized")
-                                .curve_note = Some((message, false));
+                            this.thermal.curve_note = Some((message, false));
                         }
                     }
                     cx.notify();
@@ -346,11 +338,9 @@ pub fn render_content(
                               window: &mut Window,
                               cx| {
                             this.set_curve_form(curve, window, cx);
-                            let thermal =
-                                this.thermal.as_mut().expect("thermal controls initialized");
-                            thermal.curve_seeded = true;
-                            thermal.curve_origin = Some(CurveOrigin::Draft);
-                            thermal.curve_note = None;
+                            this.thermal.curve_seeded = true;
+                            this.thermal.curve_origin = Some(CurveOrigin::Draft);
+                            this.thermal.curve_note = None;
                             app2.dispatch(
                                 KnobId::FanMode,
                                 ControlCommand::SetFanMode(FanMode::Curve(curve)),

@@ -334,11 +334,7 @@ pub fn render(
         .outline()
         .on_click(cx.listener(
             |this: &mut ShellView, _: &gpui::ClickEvent, _: &mut Window, cx| {
-                let perf = this
-                    .perf
-                    .as_mut()
-                    .expect("performance controls initialized");
-                perf.software_advanced_expanded = !perf.software_advanced_expanded;
+                this.perf.software_advanced_expanded = !this.perf.software_advanced_expanded;
                 cx.notify();
             },
         ));
@@ -467,11 +463,7 @@ pub fn render(
         state.evidence.back(),
         perf.banner_expanded,
         |this: &mut ShellView| {
-            let perf = this
-                .perf
-                .as_mut()
-                .expect("performance controls initialized");
-            perf.banner_expanded = !perf.banner_expanded;
+            this.perf.banner_expanded = !this.perf.banner_expanded;
         },
     );
 
@@ -512,11 +504,7 @@ fn experimental_drawer(
         .outline()
         .on_click(cx.listener(
             |this: &mut ShellView, _: &gpui::ClickEvent, _: &mut Window, cx| {
-                let perf = this
-                    .perf
-                    .as_mut()
-                    .expect("performance controls initialized");
-                perf.advanced_expanded = !perf.advanced_expanded;
+                this.perf.advanced_expanded = !this.perf.advanced_expanded;
                 cx.notify();
             },
         ));
@@ -720,10 +708,7 @@ fn experimental_drawer(
                                     let read =
                                         |e: &Entity<InputState>| e.read(app_cx).text().to_string();
                                     let (pl1s, pl2s, pl4s) = {
-                                        let exp = this
-                                            .exp
-                                            .as_ref()
-                                            .expect("experimental controls initialized");
+                                        let exp = &this.exp;
                                         (read(&exp.pl1), read(&exp.pl2), read(&exp.pl4))
                                     };
                                     let parse = |s: String| {
@@ -750,10 +735,7 @@ fn experimental_drawer(
                                         }
                                         Err(msg) => (msg, false),
                                     };
-                                    this.exp
-                                        .as_mut()
-                                        .expect("experimental controls initialized")
-                                        .note = Some(note);
+                                    this.exp.note = Some(note);
                                     app_cx.notify();
                                 },
                             )),

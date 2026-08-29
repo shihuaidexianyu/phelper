@@ -327,11 +327,9 @@ pub fn render(
             active,
             ("os-placement", id),
             move |this, _, _, cx| {
-                if let Some(os) = this.os.as_mut() {
-                    os.placement = placement.clone();
-                    os.placement_touched = true;
-                    cx.notify();
-                }
+                this.os.placement = placement.clone();
+                this.os.placement_touched = true;
+                cx.notify();
             },
             cx,
         ));
@@ -373,11 +371,9 @@ pub fn render(
             active,
             ("os-qos", id),
             move |this, _, _, cx| {
-                if let Some(os) = this.os.as_mut() {
-                    os.qos = value;
-                    os.qos_touched = true;
-                    cx.notify();
-                }
+                this.os.qos = value;
+                this.os.qos_touched = true;
+                cx.notify();
             },
             cx,
         ));
@@ -394,11 +390,9 @@ pub fn render(
             active,
             ("os-memory", id),
             move |this, _, _, cx| {
-                if let Some(os) = this.os.as_mut() {
-                    os.memory_priority = value;
-                    os.memory_priority_touched = true;
-                    cx.notify();
-                }
+                this.os.memory_priority = value;
+                this.os.memory_priority_touched = true;
+                cx.notify();
             },
             cx,
         ));
@@ -428,11 +422,9 @@ pub fn render(
             active,
             ("os-process-priority", id),
             move |this, _, _, cx| {
-                if let Some(os) = this.os.as_mut() {
-                    os.process_priority = value;
-                    os.process_priority_touched = true;
-                    cx.notify();
-                }
+                this.os.process_priority = value;
+                this.os.process_priority_touched = true;
+                cx.notify();
             },
             cx,
         ));
@@ -450,11 +442,9 @@ pub fn render(
             active,
             ("os-thread-priority", id),
             move |this, _, _, cx| {
-                if let Some(os) = this.os.as_mut() {
-                    os.thread_priority = value;
-                    os.thread_priority_touched = true;
-                    cx.notify();
-                }
+                this.os.thread_priority = value;
+                this.os.thread_priority_touched = true;
+                cx.notify();
             },
             cx,
         ));
@@ -471,11 +461,9 @@ pub fn render(
             active,
             ("os-gpu", id),
             move |this, _, _, cx| {
-                if let Some(os) = this.os.as_mut() {
-                    os.gpu_preference = value;
-                    os.gpu_touched = true;
-                    cx.notify();
-                }
+                this.os.gpu_preference = value;
+                this.os.gpu_touched = true;
+                cx.notify();
             },
             cx,
         ));
@@ -503,22 +491,15 @@ pub fn render(
         ))
         .on_click(cx.listener(
             move |this: &mut ShellView, _: &ClickEvent, _: &mut Window, cx| {
-                let result = this.os.as_ref().expect("OS policy controls initialized");
-                // Clone the small value state before mutating the local note.
-                let result = target_and_policy(result, cx);
+                let snapshot = &this.os;
+                let result = target_and_policy(snapshot, cx);
                 match result {
                     Ok((target, policy)) => {
-                        this.os
-                            .as_mut()
-                            .expect("OS policy controls initialized")
-                            .note = None;
+                        this.os.note = None;
                         apply_app.apply_os_policy(target, policy);
                     }
                     Err(error) => {
-                        this.os
-                            .as_mut()
-                            .expect("OS policy controls initialized")
-                            .note = Some((error, false));
+                        this.os.note = Some((error, false));
                     }
                 }
                 cx.notify();
@@ -533,9 +514,7 @@ pub fn render(
         .outline()
         .on_click(
             cx.listener(|this: &mut ShellView, _: &ClickEvent, _: &mut Window, cx| {
-                if let Some(os) = this.os.as_mut() {
-                    os.advanced = !os.advanced;
-                }
+                this.os.advanced = !this.os.advanced;
                 cx.notify();
             }),
         );
