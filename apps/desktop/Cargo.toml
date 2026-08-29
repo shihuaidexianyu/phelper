@@ -39,6 +39,10 @@ experimental = [
 [dependencies]
 phelper-core = { path = "../../crates/phelper-core", features = ["control"] }
 phelper-domain = { path = "../../crates/phelper-domain" }
+# futures-channel for the GPUI bridge task — std::sync::mpsc::recv()
+# in cx.spawn blocks the GPUI foreground executor (single-threaded)
+# and freezes the entire UI. futures::channel::mpsc awaits instead.
+futures = { version = "0.3", default-features = false, features = ["async-await"] }
 # Dependency pin discipline (architecture.md §45/§62 — upgrades are an
 # explicit decision, never a silent float):
 #   gpui-component is pinned to commit C below. Its own manifest floats on

@@ -36,37 +36,51 @@ use shell::ShellView;
 /// `dispatch_gate` validates a profile apply).
 enum GpuiPublisherRequest {
     Update(Box<dyn FnOnce(&mut AppState) + Send>),
-    Snapshot(std::sync::mpsc::SyncSender<AppState>),
+    Snapshot(futures::channel::oneshot::Sender<AppState>),
 }
 
-/// GPUI-thread bridge: the pump thread sends requests through a channel;
-/// a foreground task spawned in `application().run` drains the channel,
-/// routes Updates through `entity.update(..., cx.notify())` and answers
-/// Snapshots via `entity.read()`. `AsyncApp` itself is `!Send` (Rc-backed),
-/// so we can't keep it in the publisher struct — the foreground task owns
-/// the GPUI side of the bridge; the publisher just owns a `SyncSender`.
+/// GPUI-thread bridge: the pump thread sends requests through an async
+/// channel; a foreground task spawned in `application().run` drains the
+/// channel and routes Updates through `entity.update(..., cx.notify())`,
+/// Snapshots via `entity.read()`. `AsyncApp` is `!Send` (Rc-backed), so we
+/// can't keep it in the publisher struct — the foreground task owns the
+/// GPUI side; the publisher just owns a `Sender` (behind a Mutex so the
+/// pump can `try_send` from any thread).
+///
+/// §CRITICAL — use `futures::channel::mpsc`, NOT `std::sync::mpsc`. The
+/// GPUI foreground executor is single-threaded; a sync-blocking `recv()`
+/// in an `cx.spawn` task freezes the entire UI (the executor never
+/// reaches the render loop). Async `next().await` yields to the executor
+/// while waiting and the UI stays interactive.
 pub struct GpuiStatePublisher {
-    tx: std::sync::mpsc::SyncSender<GpuiPublisherRequest>,
+    tx: std::sync::Mutex<futures::channel::mpsc::Sender<GpuiPublisherRequest>>,
 }
 
 impl phelper_core::app::runtime::StatePublisher for GpuiStatePublisher {
     fn update(&self, apply: Box<dyn FnOnce(&mut AppState) + Send>) {
         // Best-effort: if the GPUI foreground is gone the app is shutting
         // down anyway — drop the update rather than block the pump.
-        let _ = self.tx.try_send(GpuiPublisherRequest::Update(apply));
+        if let Ok(mut tx) = self.tx.lock() {
+            let _ = tx.try_send(GpuiPublisherRequest::Update(apply));
+        }
     }
 
     fn snapshot(&self) -> AppState {
-        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
-        if self
+        let (reply_tx, mut reply_rx) = futures::channel::oneshot::channel();
+        let send_ok = self
             .tx
-            .try_send(GpuiPublisherRequest::Snapshot(reply_tx))
-            .is_ok()
-        {
-            // Block the caller (the pump) until the foreground task answers.
-            reply_rx
-                .recv()
-                .unwrap_or_else(|_| AppState::default())
+            .lock()
+            .map(|mut tx| tx.try_send(GpuiPublisherRequest::Snapshot(reply_tx)).is_ok())
+            .unwrap_or(false);
+        if send_ok {
+            // Block the pump briefly waiting for the foreground to answer.
+            // In practice the bridge task answers within a few ms; if it
+            // doesn't, we'd rather give the pump a stale default than
+            // deadlock the dispatch path.
+            match reply_rx.try_recv() {
+                Ok(Some(snap)) => snap,
+                _ => AppState::default(),
+            }
         } else {
             AppState::default()
         }
@@ -241,15 +255,18 @@ fn main() {
         let app_state_entity: Entity<AppState> = cx.new(|_| AppState::default());
         // The bridge channel: bounded so a stuck foreground can't make the
         // pump grow unbounded memory. Updates are best-effort (try_send);
-        // snapshots block the caller (the pump) for the reply.
-        let (publisher_tx, publisher_rx) =
-            std::sync::mpsc::sync_channel::<GpuiPublisherRequest>(64);
-        // Drain the bridge on the foreground executor. The closure receives
-        // `&mut AsyncApp`, so each request can route through `update_entity`
-        // / `read_entity` and the entity observer chain sees the mutations.
+        // snapshots are replied via oneshot (not blocking — see below).
+        //
+        // CRITICAL: this is `futures::channel::mpsc`, NOT `std::sync::mpsc`.
+        // A sync-blocking `recv()` in an `cx.spawn` task freezes the GPUI
+        // foreground executor (single-threaded) and the UI never renders.
+        // `next().await` yields to the executor while waiting.
+        let (publisher_tx, mut publisher_rx) =
+            futures::channel::mpsc::channel::<GpuiPublisherRequest>(64);
         let entity_for_bridge = app_state_entity.clone();
         cx.spawn(async move |async_app: &mut AsyncApp| {
-            while let Ok(req) = publisher_rx.recv() {
+            use futures::StreamExt;
+            while let Some(req) = publisher_rx.next().await {
                 match req {
                     GpuiPublisherRequest::Update(apply) => {
                         async_app.update_entity(&entity_for_bridge, |s, cx| {
@@ -263,10 +280,20 @@ fn main() {
                         let _ = reply.send(snap);
                     }
                 }
+                // Yield to the GPUI foreground executor between iterations.
+                // Without this, a busy pump (telemetry at 4 Hz × 6 collectors
+                // = 24 mut/sec, plus 2 s capability refresh, plus journal tail)
+                // keeps this loop running continuously; `next().await` is
+                // Ready immediately when the channel has more work, so the
+                // executor never gets a chance to schedule a render frame.
+                // A 0ms timer schedules a wake-up so other tasks get a turn.
+                async_app.background_executor().timer(Duration::ZERO).await;
             }
         })
         .detach();
-        let publisher = std::sync::Arc::new(GpuiStatePublisher { tx: publisher_tx });
+        let publisher = std::sync::Arc::new(GpuiStatePublisher {
+            tx: std::sync::Mutex::new(publisher_tx),
+        });
         let app = AppHandle::start_with_publisher(publisher, false);
 
         // Startup theme from the persisted pref (Settings page edits both
