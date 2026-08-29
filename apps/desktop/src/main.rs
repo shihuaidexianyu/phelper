@@ -25,10 +25,53 @@ use gpui::*;
 use gpui_component::*;
 
 use phelper_core::app::runtime::AppHandle;
+use phelper_core::app::state::AppState;
 
 use overlay::OverlayController;
 use resident::ResidentRuntime;
 use shell::ShellView;
+
+/// One pump-side request — either a state mutation (the pump updates
+/// fields and expects observers to fire) or a snapshot read (the pump's
+/// `dispatch_gate` validates a profile apply).
+enum GpuiPublisherRequest {
+    Update(Box<dyn FnOnce(&mut AppState) + Send>),
+    Snapshot(std::sync::mpsc::SyncSender<AppState>),
+}
+
+/// GPUI-thread bridge: the pump thread sends requests through a channel;
+/// a foreground task spawned in `application().run` drains the channel,
+/// routes Updates through `entity.update(..., cx.notify())` and answers
+/// Snapshots via `entity.read()`. `AsyncApp` itself is `!Send` (Rc-backed),
+/// so we can't keep it in the publisher struct — the foreground task owns
+/// the GPUI side of the bridge; the publisher just owns a `SyncSender`.
+pub struct GpuiStatePublisher {
+    tx: std::sync::mpsc::SyncSender<GpuiPublisherRequest>,
+}
+
+impl phelper_core::app::runtime::StatePublisher for GpuiStatePublisher {
+    fn update(&self, apply: Box<dyn FnOnce(&mut AppState) + Send>) {
+        // Best-effort: if the GPUI foreground is gone the app is shutting
+        // down anyway — drop the update rather than block the pump.
+        let _ = self.tx.try_send(GpuiPublisherRequest::Update(apply));
+    }
+
+    fn snapshot(&self) -> AppState {
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        if self
+            .tx
+            .try_send(GpuiPublisherRequest::Snapshot(reply_tx))
+            .is_ok()
+        {
+            // Block the caller (the pump) until the foreground task answers.
+            reply_rx
+                .recv()
+                .unwrap_or_else(|_| AppState::default())
+        } else {
+            AppState::default()
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LaunchMode {
@@ -176,7 +219,6 @@ fn main() {
     let _log_guard = init_logging();
     tracing::info!("phelper-desktop starting");
 
-    let app = AppHandle::start_fast();
     let (ui_settings, warn) = phelper_core::app::settings::UiSettings::load();
     if let Some(w) = warn {
         tracing::warn!("{w}");
@@ -188,24 +230,45 @@ fn main() {
             return;
         }
     };
-    let (resident_runtime, resident_rx) =
-        match ResidentRuntime::start(app.clone(), ui_settings.resident.clone(), executable) {
-            Ok(value) => value,
-            Err(error) => {
-                tracing::error!(%error, "resident runtime unavailable");
-                return;
-            }
-        };
-    let resident_owner = Arc::new(Mutex::new(resident_runtime));
-    let resident_handle = resident_owner
-        .lock()
-        .expect("resident runtime poisoned")
-        .handle();
-    let overlay_controller = OverlayController::new(ui_settings.resident.overlay.position);
-    let shutting_down = Arc::new(AtomicBool::new(false));
 
     gpui_platform::application().run(move |cx| {
         gpui_component::init(cx);
+
+        // §Phase 1: the GPUI-thread entity that owns the live AppState.
+        // Created here so both the shell and the overlay can `cx.observe`
+        // it; the pump thread writes through the `GpuiStatePublisher`
+        // bridge, which mutates and notifies this entity.
+        let app_state_entity: Entity<AppState> = cx.new(|_| AppState::default());
+        // The bridge channel: bounded so a stuck foreground can't make the
+        // pump grow unbounded memory. Updates are best-effort (try_send);
+        // snapshots block the caller (the pump) for the reply.
+        let (publisher_tx, publisher_rx) =
+            std::sync::mpsc::sync_channel::<GpuiPublisherRequest>(64);
+        // Drain the bridge on the foreground executor. The closure receives
+        // `&mut AsyncApp`, so each request can route through `update_entity`
+        // / `read_entity` and the entity observer chain sees the mutations.
+        let entity_for_bridge = app_state_entity.clone();
+        cx.spawn(async move |async_app: &mut AsyncApp| {
+            while let Ok(req) = publisher_rx.recv() {
+                match req {
+                    GpuiPublisherRequest::Update(apply) => {
+                        async_app.update_entity(&entity_for_bridge, |s, cx| {
+                            apply(s);
+                            cx.notify();
+                        });
+                    }
+                    GpuiPublisherRequest::Snapshot(reply) => {
+                        let snap =
+                            async_app.read_entity(&entity_for_bridge, |s, _| s.clone());
+                        let _ = reply.send(snap);
+                    }
+                }
+            }
+        })
+        .detach();
+        let publisher = std::sync::Arc::new(GpuiStatePublisher { tx: publisher_tx });
+        let app = AppHandle::start_with_publisher(publisher, false);
+
         // Startup theme from the persisted pref (Settings page edits both
         // the TOML and the live theme; broken/missing file → Dark default).
         let theme = ui_settings.theme;
@@ -213,10 +276,26 @@ fn main() {
         let ui_settings_for_view = ui_settings.clone();
         pages::settings::apply_pref(theme, cx);
 
+        let (resident_runtime, resident_rx) =
+            match ResidentRuntime::start(app.clone(), resident_settings.clone(), executable) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::error!(%error, "resident runtime unavailable");
+                    return;
+                }
+            };
+        let resident_owner = std::sync::Arc::new(std::sync::Mutex::new(resident_runtime));
+        let resident_handle = resident_owner
+            .lock()
+            .expect("resident runtime poisoned")
+            .handle();
+        let overlay_controller = OverlayController::new(ui_settings.resident.overlay.position);
+        let shutting_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         // Install the tray on the GPUI thread; tray-icon's Windows backend
         // owns a message window on the calling thread.
         let (tray_rx, tray_running) = tray::install();
-        let tray_running_for_window = Arc::clone(&tray_running);
+        let tray_running_for_window = std::sync::Arc::clone(&tray_running);
         let app_w = app.clone();
         let overlay_for_shell = overlay_controller.clone();
         let bounds = WindowBounds::Windowed(Bounds {
@@ -244,10 +323,10 @@ fn main() {
                     };
                     let app_t = app_w.clone();
                     let overlay_t = overlay_controller.clone();
-                    let resident_t = Arc::clone(&resident_owner);
+                    let resident_t = std::sync::Arc::clone(&resident_owner);
                     let resident_events = resident_rx;
                     let tray_running_t = tray_running_for_window;
-                    let shutting_t = Arc::clone(&shutting_down);
+                    let shutting_t = std::sync::Arc::clone(&shutting_down);
                     cx.spawn(async move |cx| {
                         loop {
                             cx.background_executor()
@@ -292,9 +371,11 @@ fn main() {
                         }
                     })
                     .detach();
+                    let app_state_for_view = app_state_entity.clone();
                     let view = cx.new(|cx| {
                         ShellView::new(
                             app_w,
+                            app_state_for_view,
                             ui_settings_for_view,
                             resident_handle,
                             overlay_for_shell,
@@ -309,10 +390,17 @@ fn main() {
 
         let overlay_app = app.clone();
         let overlay_controller_for_view = overlay_controller.clone();
+        let app_state_for_overlay = app_state_entity.clone();
         let overlay_handle = cx
             .open_window(overlay::options(), move |window, cx| {
                 let view = cx.new(|cx| {
-                    overlay::OverlayView::new(overlay_app, overlay_controller_for_view, window, cx)
+                    overlay::OverlayView::new(
+                        overlay_app,
+                        app_state_for_overlay,
+                        overlay_controller_for_view,
+                        window,
+                        cx,
+                    )
                 });
                 cx.new(|cx| Root::new(view, window, cx))
             })

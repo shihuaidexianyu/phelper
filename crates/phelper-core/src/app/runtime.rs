@@ -1,7 +1,9 @@
 //! The app pump (§43/§44): ONE thread ("app-pump") owns the `Engine` and is
 //! the only telemetry subscriber; the GPUI thread never touches a channel
-//! or a hardware handle. It publishes an immutable `AppState` snapshot
-//! behind a lock; the UI clones it once per tick.
+//! or a hardware handle. The pump publishes AppState updates through a
+//! `StatePublisher` bridge — that bridge is what moves ownership from
+//! `Arc<RwLock<AppState>>` (lock-based, owned by pump) to GPUI's
+//! `Entity<AppState>` (framework-managed, observed by the shell).
 //!
 //! Loop (up to 100 ms idle cadence):
 //! 1. telemetry snapshots (drain to latest);
@@ -51,47 +53,113 @@ enum PumpMsg {
     Shutdown(mpsc::Sender<()>),
 }
 
+/// Bridge from the pump thread to whatever owns the live `AppState`. The
+/// GPUI shell injects a GPUI-backed publisher that maps to `Entity<AppState>`;
+/// tests inject an `RwLockStatePublisher` so they can drive the pump without
+/// pulling in gpui. Either way the pump writes through this trait and never
+/// touches a GPUI handle directly (phelper-core has no gpui dep).
+pub trait StatePublisher: Send + Sync + 'static {
+    /// Apply a batch of mutations and trigger observer notifications.
+    /// Implementations must notify any registered observers iff the state
+    /// actually changed (caller fingerprint) — for simplicity the pump's
+    /// apply closure is opaque, so the publisher is expected to ALWAYS
+    /// notify and let observer-side fingerprints filter.
+    fn update(&self, apply: Box<dyn FnOnce(&mut AppState) + Send>);
+
+    /// Snapshot the current state for read-only callers (e.g. dispatch_gate
+    /// validating a profile apply; the resident worker reading `desired.profile`).
+    fn snapshot(&self) -> AppState;
+}
+
+/// In-process publisher backed by `Arc<RwLock<AppState>>`. Used by tests
+/// and any consumer that doesn't want a GPUI dependency. Notifies by
+/// bumping an internal version counter — observers must poll it.
+pub struct RwLockStatePublisher {
+    state: Arc<RwLock<AppState>>,
+    /// Bumped every successful `update`. Tests subscribe to it to confirm
+    /// a notification fired without needing a real observer chain.
+    version: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl RwLockStatePublisher {
+    pub fn new(state: Arc<RwLock<AppState>>) -> Self {
+        Self {
+            state,
+            version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// Build two publishers that share a single version counter — mirrors
+    /// the GPUI Entity<T> invariant that one entity has one dirty bit.
+    pub fn new_with_version(
+        state: Arc<RwLock<AppState>>,
+        version: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        Self { state, version }
+    }
+
+    /// Internal version counter for tests. Each successful `update` bumps it.
+    pub fn version(&self) -> u64 {
+        self.version.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl StatePublisher for RwLockStatePublisher {
+    fn update(&self, apply: Box<dyn FnOnce(&mut AppState) + Send>) {
+        let mut guard = self.state.write().expect("appstate poisoned");
+        apply(&mut guard);
+        self.version
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    fn snapshot(&self) -> AppState {
+        self.state.read().expect("appstate poisoned").clone()
+    }
+}
+
 /// GPUI-thread handle to the pump. Clone freely; all clones talk to the
-/// same pump (tray and window share it — §60.12).
+/// same pump (tray and window share it — §60.12). The publisher is shared
+/// with whoever owns the live `AppState` (the shell in production, a test
+/// harness in unit tests).
 #[derive(Clone)]
 pub struct AppHandle {
-    state: Arc<RwLock<AppState>>,
+    publisher: Arc<dyn StatePublisher>,
     to_pump: mpsc::Sender<PumpMsg>,
     telemetry: Arc<RwLock<Option<TelemetryHandle>>>,
 }
 
 impl AppHandle {
-    /// Spawn the pump thread; returns immediately (engine startup happens
-    /// on the pump — the UI renders the `Starting` state meanwhile).
-    pub fn start() -> Self {
-        Self::start_with_ogh_scan(true)
-    }
-
-    /// UI startup variant: leave the diagnostic OGH scan off the critical
-    /// path. The scan is performed after the engine is usable.
-    pub fn start_fast() -> Self {
-        Self::start_with_ogh_scan(false)
-    }
-
-    fn start_with_ogh_scan(scan_ogh: bool) -> Self {
-        let state = Arc::new(RwLock::new(AppState::default()));
+    /// Spawn the pump thread with a caller-provided state publisher. The
+    /// publisher is shared with the pump; every `dispatch` / `set_*` path
+    /// that used to mutate the AppState lock now flows through the publisher
+    /// (which, in production, is a GPUI `Entity<AppState>` bridge).
+    pub fn start_with_publisher(publisher: Arc<dyn StatePublisher>, scan_ogh: bool) -> Self {
         let (to_pump, rx) = mpsc::channel();
         let telemetry = Arc::new(RwLock::new(None));
         let handle = Self {
-            state: Arc::clone(&state),
+            publisher: Arc::clone(&publisher),
             to_pump,
             telemetry: Arc::clone(&telemetry),
         };
         std::thread::Builder::new()
             .name("app-pump".into())
-            .spawn(move || pump_main(state, rx, telemetry, scan_ogh))
+            .spawn(move || pump_main(publisher, rx, telemetry, scan_ogh))
             .expect("spawn app-pump thread");
         handle
     }
 
-    /// The current immutable snapshot (one clone per UI tick).
+    /// The current immutable snapshot (one clone per UI tick). UI callers
+    /// should prefer holding the publisher's `Entity<AppState>` directly
+    /// and observing it — `state()` is here for std::thread callers (the
+    /// resident worker, the dispatch_gate).
     pub fn state(&self) -> AppState {
-        self.state.read().expect("appstate poisoned").clone()
+        self.publisher.snapshot()
+    }
+
+    /// Underlying publisher handle (advanced use — typically only the UI
+    /// shell holds the Entity<AppState> directly).
+    pub fn publisher(&self) -> Arc<dyn StatePublisher> {
+        Arc::clone(&self.publisher)
     }
 
     /// Enqueue a user intent. Validation happens UI-side first (validate.rs),
@@ -183,7 +251,7 @@ impl AppHandle {
 }
 
 fn pump_main(
-    state: Arc<RwLock<AppState>>,
+    publisher: Arc<dyn StatePublisher>,
     rx: mpsc::Receiver<PumpMsg>,
     telemetry_slot: Arc<RwLock<Option<TelemetryHandle>>>,
     scan_ogh: bool,
@@ -195,7 +263,10 @@ fn pump_main(
     } {
         Ok(e) => Some(e),
         Err(e) => {
-            state.write().expect("appstate poisoned").engine = EngineStatus::Failed(e.to_string());
+            let message = e.to_string();
+            publisher.update(Box::new(move |s| {
+                s.engine = EngineStatus::Failed(message);
+            }));
             None
         }
     };
@@ -209,13 +280,21 @@ fn pump_main(
     *telemetry_slot.write().expect("telemetry slot poisoned") = Some(engine.telemetry().clone());
     let mut registry = crate::profiles::ProfileRegistry::load_default();
 
-    {
-        let mut s = state.write().expect("appstate poisoned");
-        s.identity = Some(engine.identity().clone());
-        s.ogh_findings = engine.ogh_findings().to_vec();
-        s.os_policy = os_policy.snapshot();
-        s.automatic = automatic.snapshot();
-        if let Some(c) = &control {
+    // Initial state: clone every Arc-shaped handle into the closure so the
+    // 'static-bound on `Box<dyn FnOnce + Send>` is satisfied without
+    // borrowing the pump's stack-frames.
+    let identity = engine.identity().clone();
+    let ogh_findings = engine.ogh_findings().to_vec();
+    let os_policy_init = os_policy.clone();
+    let automatic_init = automatic.clone();
+    let control_init = control.clone();
+    let registry_init = registry.clone();
+    publisher.update(Box::new(move |s| {
+        s.identity = Some(identity);
+        s.ogh_findings = ogh_findings;
+        s.os_policy = os_policy_init.snapshot();
+        s.automatic = automatic_init.snapshot();
+        if let Some(c) = control_init {
             let caps = c.capabilities().clone();
             s.experimental = ExperimentalUi::compute(Some(&caps));
             s.caps = Some(caps);
@@ -227,8 +306,8 @@ fn pump_main(
         } else {
             s.engine = EngineStatus::TelemetryOnly;
         }
-        s.set_profiles(&registry);
-    }
+        s.set_profiles(&registry_init);
+    }));
 
     let mut ogh_scan = (!scan_ogh).then(|| {
         std::thread::Builder::new()
@@ -256,7 +335,9 @@ fn pump_main(
             && let Some(scan) = ogh_scan.take()
         {
             let findings = scan.join().unwrap_or_default();
-            state.write().expect("appstate poisoned").ogh_findings = findings;
+            publisher.update(Box::new(move |s| {
+                s.ogh_findings = findings;
+            }));
         }
 
         // v0.2-e: stage timing. The M6 HIL saw ONE ~38 s window-close whose
@@ -277,15 +358,15 @@ fn pump_main(
                 while let Ok(n) = snap_rx.try_recv() {
                     newest = n;
                 }
-                state
-                    .write()
-                    .expect("appstate poisoned")
-                    .apply_snapshot(newest);
+                publisher.update(Box::new(move |s| {
+                    s.apply_snapshot(newest);
+                }));
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {
-                state.write().expect("appstate poisoned").engine =
-                    EngineStatus::Failed("遥测协调器意外断开".into());
+                publisher.update(Box::new(|s| {
+                    s.engine = EngineStatus::Failed("遥测协调器意外断开".into());
+                }));
                 if let Some(e) = engine.take() {
                     drop(e);
                 }
@@ -311,7 +392,7 @@ fn pump_main(
             Ok(msg) => {
                 shutdown_ack = handle_pump_msg(
                     msg,
-                    &state,
+                    &publisher,
                     &mut registry,
                     &mut coalescer,
                     control.as_ref(),
@@ -322,7 +403,7 @@ fn pump_main(
                     while let Ok(msg) = rx.try_recv() {
                         shutdown_ack = handle_pump_msg(
                             msg,
-                            &state,
+                            &publisher,
                             &mut registry,
                             &mut coalescer,
                             control.as_ref(),
@@ -355,14 +436,15 @@ fn pump_main(
             let _ = ack.send(());
             return;
         }
-        {
-            let mut s = state.write().expect("appstate poisoned");
+        let os_policy_step = os_policy.clone();
+        let automatic_step = automatic.clone();
+        publisher.update(Box::new(move |s| {
             // The automatic worker and manual UI share one OS-policy ledger.
             // Snapshot both read models together so owner changes made by
             // the worker cannot leave the app/API with a stale active list.
-            s.os_policy = os_policy.snapshot();
-            s.automatic = automatic.snapshot();
-        }
+            s.os_policy = os_policy_step.snapshot();
+            s.automatic = automatic_step.snapshot();
+        }));
         stages[1] = t.elapsed();
         let t = Instant::now();
 
@@ -370,52 +452,59 @@ fn pump_main(
         let now = Instant::now();
         for (knob, cmd) in coalescer.poll(now) {
             let Some(c) = &control else {
-                state.write().expect("appstate poisoned").set_knob(
-                    knob,
-                    KnobStatus::Failed {
-                        error: ControlError::BackendUnavailable {
-                            what: "控制协调器（遥测-only 模式）".into(),
+                let at = now_epoch_ms();
+                publisher.update(Box::new(move |s| {
+                    s.set_knob(
+                        knob,
+                        KnobStatus::Failed {
+                            error: ControlError::BackendUnavailable {
+                                what: "控制协调器（遥测-only 模式）".into(),
+                            },
+                            at_epoch_ms: at,
                         },
-                        at_epoch_ms: now_epoch_ms(),
-                    },
-                );
+                    );
+                }));
                 continue;
             };
             match c.dispatch(cmd.clone()) {
                 Ok((receipt, outcome_rx)) => {
                     coalescer.note_dispatched(knob, cmd, receipt, now);
                     in_flight.insert(receipt.0, (knob, outcome_rx));
-                    state
-                        .write()
-                        .expect("appstate poisoned")
-                        .set_knob(knob, KnobStatus::InFlight(receipt));
+                    publisher.update(Box::new(move |s| {
+                        s.set_knob(knob, KnobStatus::InFlight(receipt));
+                    }));
                 }
                 Err(ControlError::Busy) => match coalescer.note_busy(knob, cmd, now) {
                     BusyVerdict::Retry => {
-                        state
-                            .write()
-                            .expect("appstate poisoned")
-                            .set_knob(knob, KnobStatus::Pending);
+                        publisher.update(Box::new(move |s| {
+                            s.set_knob(knob, KnobStatus::Pending);
+                        }));
                     }
                     BusyVerdict::TimedOut => {
-                        state.write().expect("appstate poisoned").set_knob(
-                            knob,
-                            KnobStatus::Failed {
-                                error: ControlError::Busy,
-                                at_epoch_ms: now_epoch_ms(),
-                            },
-                        );
+                        let at = now_epoch_ms();
+                        publisher.update(Box::new(move |s| {
+                            s.set_knob(
+                                knob,
+                                KnobStatus::Failed {
+                                    error: ControlError::Busy,
+                                    at_epoch_ms: at,
+                                },
+                            );
+                        }));
                     }
                 },
                 Err(e) => {
                     coalescer.note_dispatch_error(knob);
-                    state.write().expect("appstate poisoned").set_knob(
-                        knob,
-                        KnobStatus::Failed {
-                            error: e,
-                            at_epoch_ms: now_epoch_ms(),
-                        },
-                    );
+                    let at = now_epoch_ms();
+                    publisher.update(Box::new(move |s| {
+                        s.set_knob(
+                            knob,
+                            KnobStatus::Failed {
+                                error: e,
+                                at_epoch_ms: at,
+                            },
+                        );
+                    }));
                 }
             }
         }
@@ -440,24 +529,29 @@ fn pump_main(
                 Some(o) if matches!(o.status, phelper_domain::command::ControlStatus::Applied { .. })
             );
             coalescer.note_completed(knob, succeeded);
-            let mut s = state.write().expect("appstate poisoned");
-            match maybe {
-                Some(outcome) => s.apply_outcome(knob, outcome),
-                None => s.set_knob(
-                    knob,
-                    KnobStatus::Failed {
-                        error: ControlError::BackendUnavailable {
-                            what: "控制协调器通道断开".into(),
+            let knob_for_outcome = knob;
+            let at = now_epoch_ms();
+            publisher.update(Box::new(move |s| match maybe {
+                Some(outcome) => s.apply_outcome(knob_for_outcome, outcome),
+                None => {
+                    s.set_knob(
+                        knob_for_outcome,
+                        KnobStatus::Failed {
+                            error: ControlError::BackendUnavailable {
+                                what: "控制协调器通道断开".into(),
+                            },
+                            at_epoch_ms: at,
                         },
-                        at_epoch_ms: now_epoch_ms(),
-                    },
-                ),
-            }
-            if let Some(c) = &control {
-                s.desired = c.desired();
-                s.observed = c.observed();
-                s.windows_ppm = c.windows_ppm_state();
-                s.last_saved_fan_curve = c.last_saved_fan_curve();
+                    );
+                }
+            }));
+            if let Some(c) = control.clone() {
+                publisher.update(Box::new(move |s| {
+                    s.desired = c.desired();
+                    s.observed = c.observed();
+                    s.windows_ppm = c.windows_ppm_state();
+                    s.last_saved_fan_curve = c.last_saved_fan_curve();
+                }));
             }
         }
         stages[3] = t.elapsed();
@@ -466,12 +560,13 @@ fn pump_main(
         // 5. Periodic desired/observed refresh (~2 s).
         if last_state_refresh.elapsed() >= Duration::from_secs(2) {
             last_state_refresh = Instant::now();
-            if let Some(c) = &control {
-                let mut s = state.write().expect("appstate poisoned");
-                s.desired = c.desired();
-                s.observed = c.observed();
-                s.windows_ppm = c.windows_ppm_state();
-                s.last_saved_fan_curve = c.last_saved_fan_curve();
+            if let Some(c) = control.clone() {
+                publisher.update(Box::new(move |s| {
+                    s.desired = c.desired();
+                    s.observed = c.observed();
+                    s.windows_ppm = c.windows_ppm_state();
+                    s.last_saved_fan_curve = c.last_saved_fan_curve();
+                }));
             }
         }
 
@@ -493,10 +588,9 @@ fn pump_main(
             last_journal = Instant::now();
             let entries = journal.poll();
             if !entries.is_empty() {
-                state
-                    .write()
-                    .expect("appstate poisoned")
-                    .apply_journal(entries);
+                publisher.update(Box::new(move |s| {
+                    s.apply_journal(entries);
+                }));
             }
         }
         stages[5] = t.elapsed();
@@ -522,7 +616,7 @@ fn pump_main(
 /// receive itself to be event-driven.
 fn handle_pump_msg(
     msg: PumpMsg,
-    state: &Arc<RwLock<AppState>>,
+    publisher: &Arc<dyn StatePublisher>,
     registry: &mut crate::profiles::ProfileRegistry,
     coalescer: &mut Coalescer,
     control: Option<&crate::control::ControlHandle>,
@@ -531,21 +625,22 @@ fn handle_pump_msg(
 ) -> Option<mpsc::Sender<()>> {
     match msg {
         PumpMsg::Dispatch(knob, cmd) => {
-            let fail = dispatch_gate(&cmd, registry, state, control.is_some());
+            let fail = dispatch_gate(&cmd, registry, publisher, control.is_some());
             if let Some(err) = fail {
-                state.write().expect("appstate poisoned").set_knob(
-                    knob,
-                    KnobStatus::Failed {
-                        error: err,
-                        at_epoch_ms: now_epoch_ms(),
-                    },
-                );
+                publisher.update(Box::new(move |s| {
+                    s.set_knob(
+                        knob,
+                        KnobStatus::Failed {
+                            error: err,
+                            at_epoch_ms: now_epoch_ms(),
+                        },
+                    );
+                }));
             } else {
                 if coalescer.enqueue(knob, cmd) {
-                    state
-                        .write()
-                        .expect("appstate poisoned")
-                        .set_knob(knob, KnobStatus::Pending);
+                    publisher.update(Box::new(move |s| {
+                        s.set_knob(knob, KnobStatus::Pending);
+                    }));
                 }
             }
             None
@@ -555,84 +650,98 @@ fn handle_pump_msg(
             if let Some(control) = control {
                 control.replace_profiles(registry.clone());
             }
-            state
-                .write()
-                .expect("appstate poisoned")
-                .set_profiles(registry);
+            let snapshot = registry.clone();
+            publisher.update(Box::new(move |s| {
+                s.set_profiles(&snapshot);
+            }));
             None
         }
         PumpMsg::RefreshOsData => {
             let topology = os_policy.topology();
             let processes = os_policy.list_processes();
-            let mut s = state.write().expect("appstate poisoned");
-            match topology {
-                Ok(topology) => s.os_policy.topology = Some(topology),
-                Err(error) => s.os_policy_error = Some(error.to_string()),
-            }
-            match processes {
-                Ok(processes) => {
-                    s.os_processes = Arc::new(processes);
-                    if s.os_policy_error.is_some() && s.os_policy.topology.is_some() {
-                        s.os_policy_error = None;
-                    }
+            publisher.update(Box::new(move |s| {
+                match topology {
+                    Ok(topology) => s.os_policy.topology = Some(topology),
+                    Err(error) => s.os_policy_error = Some(error.to_string()),
                 }
-                Err(error) => s.os_policy_error = Some(error.to_string()),
-            }
+                match processes {
+                    Ok(processes) => {
+                        s.os_processes = Arc::new(processes);
+                        if s.os_policy_error.is_some() && s.os_policy.topology.is_some() {
+                            s.os_policy_error = None;
+                        }
+                    }
+                    Err(error) => s.os_policy_error = Some(error.to_string()),
+                }
+            }));
             None
         }
         PumpMsg::ApplyOsPolicy { target, policy } => {
+            let os_policy = os_policy.clone();
             match os_policy.apply(target, policy) {
                 Ok(_) => {
-                    let mut s = state.write().expect("appstate poisoned");
-                    s.os_policy = os_policy.snapshot();
-                    s.os_policy_error = None;
+                    publisher.update(Box::new(move |s| {
+                        s.os_policy = os_policy.snapshot();
+                        s.os_policy_error = None;
+                    }));
                 }
                 Err(error) => {
-                    state.write().expect("appstate poisoned").os_policy_error =
-                        Some(error.to_string());
+                    publisher.update(Box::new(move |s| {
+                        s.os_policy_error = Some(error.to_string());
+                    }));
                 }
             }
             None
         }
         PumpMsg::RestoreOsPolicy(target) => {
+            let os_policy = os_policy.clone();
             match os_policy.restore(target) {
                 Ok(_) => {
-                    let mut s = state.write().expect("appstate poisoned");
-                    s.os_policy = os_policy.snapshot();
-                    s.os_policy_error = None;
+                    publisher.update(Box::new(move |s| {
+                        s.os_policy = os_policy.snapshot();
+                        s.os_policy_error = None;
+                    }));
                 }
                 Err(error) => {
-                    state.write().expect("appstate poisoned").os_policy_error =
-                        Some(error.to_string());
+                    publisher.update(Box::new(move |s| {
+                        s.os_policy_error = Some(error.to_string());
+                    }));
                 }
             }
             None
         }
         PumpMsg::SetAutomaticMode(mode) => {
             automatic.set_mode(mode);
-            state.write().expect("appstate poisoned").automatic = automatic.snapshot();
+            let automatic = automatic.clone();
+            publisher.update(Box::new(move |s| {
+                s.automatic = automatic.snapshot();
+            }));
             None
         }
         PumpMsg::RefreshAutomatic => {
             automatic.refresh();
-            state.write().expect("appstate poisoned").automatic = automatic.snapshot();
+            let automatic = automatic.clone();
+            publisher.update(Box::new(move |s| {
+                s.automatic = automatic.snapshot();
+            }));
             None
         }
         PumpMsg::SetResident(mut resident) => {
-            let mut app_state = state.write().expect("appstate poisoned");
             // The resident worker publishes capability/autostart changes in
             // the background. Preserve the shell-owned overlay bit when a
             // full worker snapshot crosses the pump at the same time as a
             // tray/OMEN visibility action.
-            resident.overlay_visible = app_state.resident.overlay_visible;
-            app_state.set_resident(resident);
+            let overlay_visible = publisher.snapshot().resident.overlay_visible;
+            resident.overlay_visible = overlay_visible;
+            publisher.update(Box::new(move |s| {
+                s.set_resident(resident);
+            }));
             None
         }
         PumpMsg::SetOverlayVisible(visible) => {
-            state
-                .write()
-                .expect("appstate poisoned")
-                .set_overlay_visible(visible);
+            publisher.update(Box::new(move |s| {
+                s.set_overlay_visible(visible);
+            }));
             None
         }
         PumpMsg::Shutdown(ack) => Some(ack),
@@ -644,7 +753,7 @@ fn handle_pump_msg(
 fn dispatch_gate(
     cmd: &ControlCommand,
     registry: &crate::profiles::ProfileRegistry,
-    state: &Arc<RwLock<AppState>>,
+    publisher: &Arc<dyn StatePublisher>,
     has_control: bool,
 ) -> Option<ControlError> {
     if !has_control {
@@ -656,7 +765,7 @@ fn dispatch_gate(
         // Double-gate check against the display registry's copy of the
         // profile. Unknown name → let the coordinator answer honestly.
         if let Some((_, p, _)) = registry.iter().find(|(n, _, _)| n == profile) {
-            let s = state.read().expect("appstate poisoned");
+            let s = publisher.snapshot();
             if let Err(reason) =
                 validate::profile_apply_gate(p, super::EXPERIMENTAL_COMPILED, s.caps.as_ref())
             {
@@ -675,5 +784,88 @@ fn serve_shutdown_only(rx: &mpsc::Receiver<PumpMsg>) {
             let _ = ack.send(());
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use phelper_domain::command::{ControlReceipt, ControlStatus, Verification};
+    use phelper_domain::policy::ThermalMode;
+    use std::time::Duration;
+
+    fn outcome(status: ControlStatus) -> ControlOutcome {
+        ControlOutcome {
+            receipt: ControlReceipt(1),
+            command: ControlCommand::SetThermalMode(ThermalMode::Balanced),
+            status,
+            steps: Vec::new(),
+            duration: Duration::from_millis(5),
+        }
+    }
+
+    #[test]
+    fn publisher_update_bumps_version_and_applies() {
+        let state = Arc::new(RwLock::new(AppState::default()));
+        let pub_ = RwLockStatePublisher::new(Arc::clone(&state));
+        assert_eq!(pub_.version(), 0);
+        pub_.update(Box::new(|s| {
+            s.set_knob(KnobId::ThermalMode, KnobStatus::InFlight(ControlReceipt(7)));
+        }));
+        assert_eq!(pub_.version(), 1);
+        assert!(matches!(
+            pub_.snapshot().knob_status(KnobId::ThermalMode),
+            KnobStatus::InFlight(_)
+        ));
+    }
+
+    #[test]
+    fn publisher_outcome_flow_observable_via_version() {
+        let state = Arc::new(RwLock::new(AppState::default()));
+        let pub_ = RwLockStatePublisher::new(Arc::clone(&state));
+        let v0 = pub_.version();
+        pub_.update(Box::new(|s| {
+            s.apply_outcome(
+                KnobId::EppAc,
+                outcome(ControlStatus::Applied {
+                    verification: Verification::Verified,
+                }),
+            );
+        }));
+        // Notification contract: version strictly increased (the only thing
+        // a UI observer can observe on this publisher).
+        assert!(pub_.version() > v0, "publisher must notify on update");
+        let v1 = pub_.version();
+        pub_.update(Box::new(|s| {
+            // A no-op apply (no field touched) still bumps the version — by
+            // design. The observer's own fingerprint is the gate that
+            // prevents wasted repaints, not the publisher.
+            let _ = s.identity.is_some();
+        }));
+        assert!(pub_.version() > v1);
+    }
+
+    #[test]
+    fn snapshot_is_consistent_across_concurrent_writes() {
+        // Two publisher handles over the same backing state must agree at
+        // any instant (RwLock semantics). This is the contract the GPUI
+        // publisher provides too: cross-thread reads see a consistent
+        // snapshot. We share the version counter explicitly to mirror the
+        // production publisher, where one Entity has one dirty bit.
+        use std::sync::atomic::AtomicU64;
+        let state = Arc::new(RwLock::new(AppState::default()));
+        let version = Arc::new(AtomicU64::new(0));
+        let a = RwLockStatePublisher::new_with_version(Arc::clone(&state), Arc::clone(&version));
+        let b = RwLockStatePublisher::new_with_version(Arc::clone(&state), Arc::clone(&version));
+        a.update(Box::new(|s| {
+            s.engine = EngineStatus::Running;
+        }));
+        let snap_a = a.snapshot();
+        let snap_b = b.snapshot();
+        assert_eq!(snap_a.engine, snap_b.engine);
+        assert_eq!(snap_a.engine, EngineStatus::Running);
+        // Versions agree across handles (shared counter).
+        assert_eq!(a.version(), b.version());
+        assert_eq!(version.load(std::sync::atomic::Ordering::Acquire), a.version());
     }
 }

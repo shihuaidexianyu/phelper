@@ -1,10 +1,14 @@
-//! Shell — sidebar + page switching + the 50 ms responsive state ticker.
-//! The ticker is the ONLY AppState pull; pages render from the snapshot.
+//! Shell — sidebar + page switching. The `Entity<AppState>` observer chain
+//! replaces the v0.2-d 50 ms ticker: pump writes go through
+//! `GpuiStatePublisher`, which notifies the entity, which fires the
+//! `_app_state_sub` closure below — the closure copies the new state and
+//! only notifies the shell if the per-page fingerprint moved.
 
 use std::time::Duration;
 
 use gpui::{
-    AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Task, Window, div, px,
+    AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Window,
+    div, px,
 };
 use gpui_component::{
     ActiveTheme, h_flex,
@@ -147,11 +151,11 @@ pub struct OsPolicyState {
 
 pub struct ShellView {
     pub(crate) app: AppHandle,
+    /// Live `AppState` (kept in sync by the entity observer below).
     pub(crate) state: AppState,
     pub(crate) page: PageId,
-    /// v0.2-d: last painted visual fingerprint + paint time — the tick
-    /// skips cx.notify() while the current page's displayed values are
-    /// unchanged (5 s forced-refresh backstop, see fingerprint.rs).
+    /// Last painted visual fingerprint + paint time — the observer's
+    /// `cx.notify()` is gated on this (5 s forced-refresh backstop).
     pub(crate) last_fp: Option<u64>,
     pub(crate) last_paint: std::time::Instant,
     pub dash: dashboard::DashState,
@@ -164,8 +168,13 @@ pub struct ShellView {
     pub overlay: OverlayController,
     pub exp: Option<ExpState>,
     pub os: Option<OsPolicyState>,
-    _appearance_sub: gpui::Subscription,
-    _tick: Task<()>,
+    /// Owned by the shell so the `Entity<AppState>` outlives the shell
+    /// (the bridge closure on the main thread also keeps a clone; this
+    /// field is the shell's "I am still watching" anchor).
+    #[allow(dead_code)]
+    app_state: Entity<AppState>,
+    _appearance_sub: Subscription,
+    _app_state_sub: Subscription,
 }
 
 /// One slider entity wired to dispatch `map(value)` on every Change — the
@@ -615,34 +624,26 @@ impl ShellView {
 
     pub fn new(
         app: AppHandle,
+        app_state: Entity<AppState>,
         ui_settings: phelper_core::app::settings::UiSettings,
         resident_runtime: ResidentRuntimeHandle,
         overlay: OverlayController,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let _tick = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(50))
-                    .await;
-                let r = this.update(cx, |this, cx| {
-                    this.state = this.app.state();
-                    // v0.2-d: repaint only when the current page's displayed
-                    // values actually moved (interactive events notify on
-                    // their own; 5 s backstop fails open toward painting).
-                    let fp = this.fingerprint();
-                    if Some(fp) != this.last_fp
-                        || this.last_paint.elapsed() >= Duration::from_secs(5)
-                    {
-                        this.last_fp = Some(fp);
-                        this.last_paint = std::time::Instant::now();
-                        cx.notify();
-                    }
-                });
-                if r.is_err() {
-                    break;
-                }
+        // Observer on the live `Entity<AppState>` — the producer (pump) is
+        // the only writer; the observer copies into our snapshot and only
+        // notifies the shell when the per-page fingerprint moved (5 s
+        // backstop fails open toward painting).
+        let app_state_sub = cx.observe(&app_state, |this, app_state, cx| {
+            this.state = app_state.read(cx).clone();
+            let fp = this.fingerprint();
+            if Some(fp) != this.last_fp
+                || this.last_paint.elapsed() >= Duration::from_secs(5)
+            {
+                this.last_fp = Some(fp);
+                this.last_paint = std::time::Instant::now();
+                cx.notify();
             }
         });
         // OS theme flipped while we run: re-resolve "跟随系统" live. The
@@ -702,8 +703,9 @@ impl ShellView {
             overlay,
             exp: None,
             os: None,
+            app_state,
             _appearance_sub: appearance_sub,
-            _tick,
+            _app_state_sub: app_state_sub,
         }
     }
 }

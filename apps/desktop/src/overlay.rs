@@ -2,22 +2,22 @@
 //!
 //! The overlay is a normal GPUI window with a small Windows style adjustment:
 //! topmost, no activation and disabled input.  It is created once, hidden by
-//! default and repainted from the existing `AppHandle` snapshot at most four
-//! times per second.
+//! default and observes the same `Entity<AppState>` the shell observes — the
+//! 250 ms ticker is gone (§Phase 1.5).
 
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicIsize, Ordering},
 };
-use std::time::Duration;
 
 use gpui::{
-    Bounds, Context, InteractiveElement, IntoElement, ParentElement, Render, Styled, Task, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, point, px, rgba,
-    size,
+    Bounds, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render, Styled,
+    Subscription, Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions,
+    div, point, px, rgba, size,
 };
 use gpui_component::{ActiveTheme, StyledExt};
 use phelper_core::app::runtime::AppHandle;
+use phelper_core::app::state::AppState;
 use phelper_domain::resident::OverlayPosition;
 use phelper_domain::telemetry::{MetricId, ids};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -107,55 +107,48 @@ impl OverlayController {
 
 pub struct OverlayView {
     app: AppHandle,
+    /// Owned by the overlay so the `Entity<AppState>` outlives this view
+    /// (the bridge closure keeps a clone on the GPUI side; this is the
+    /// overlay's "I am still watching" anchor).
+    #[allow(dead_code)]
+    app_state: Entity<AppState>,
     last_frame: Option<(usize, Option<String>)>,
-    _tick: Task<()>,
+    _app_state_sub: Subscription,
 }
 
 impl OverlayView {
     pub fn new(
         app: AppHandle,
+        app_state: Entity<AppState>,
         controller: OverlayController,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let hwnd = raw_hwnd(window);
         controller.bind(hwnd);
-        let tick_controller = controller.clone();
-        let _tick = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(250))
-                    .await;
-                if tick_controller.stopped.load(Ordering::Acquire) {
-                    break;
-                }
-                if !tick_controller.visible() {
-                    continue;
-                }
-                if this
-                    .update(cx, |this, cx| {
-                        let state = this.app.state();
-                        let telemetry = state
-                            .telemetry
-                            .as_ref()
-                            .map(|snapshot| Arc::as_ptr(snapshot) as usize)
-                            .unwrap_or_default();
-                        let frame = (telemetry, state.desired.profile.clone());
-                        if this.last_frame.as_ref() != Some(&frame) {
-                            this.last_frame = Some(frame);
-                            cx.notify();
-                        }
-                    })
-                    .is_err()
-                {
-                    break;
-                }
+        // Mirror the shell's observer pattern, but the overlay only repaints
+        // when the telemetry snapshot pointer or desired profile changes.
+        // The shared `Entity<AppState>` is the same one the shell watches.
+        let app_state_sub = cx.observe(&app_state, |this, app_state, cx| {
+            let telemetry = app_state
+                .read_with(cx, |s, _| {
+                    s.telemetry
+                        .as_ref()
+                        .map(|snapshot| Arc::as_ptr(snapshot) as usize)
+                        .unwrap_or_default()
+                });
+            let profile = app_state.read_with(cx, |s, _| s.desired.profile.clone());
+            let frame = (telemetry, profile);
+            if this.last_frame.as_ref() != Some(&frame) {
+                this.last_frame = Some(frame);
+                cx.notify();
             }
         });
         Self {
             app,
+            app_state,
             last_frame: None,
-            _tick,
+            _app_state_sub: app_state_sub,
         }
     }
 }
