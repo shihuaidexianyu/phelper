@@ -96,11 +96,8 @@ pub struct ProfileState {
     pub note: Option<(String, bool)>,
 }
 
-/// Monitor page view-state: the substring filter input (text is read from
-/// the entity at render; no mirrored string needed).
-pub struct MonitorState {
-    pub filter: Entity<InputState>,
-}
+/// Monitor page view-state: now lives in `Entity<MonitorPageState>` (see
+/// `pages::monitor`). The shell holds the handle and reads from it.
 
 /// Settings page view-state now lives in `Entity<SettingsPageState>`
 /// (see `pages::settings`). The shell keeps a handle to read the current
@@ -162,7 +159,7 @@ pub struct ShellView {
     pub perf: PerfState,
     pub thermal: ThermalState,
     pub prof: ProfileState,
-    pub mon: MonitorState,
+    pub mon: Entity<monitor::MonitorPageState>,
     pub settings_page: Entity<settings::SettingsPageState>,
     pub resident_runtime: ResidentRuntimeHandle,
     pub overlay: OverlayController,
@@ -396,17 +393,6 @@ impl ShellView {
         (perf, thermal, exp)
     }
 
-    fn create_monitor_state(window: &mut Window, cx: &mut Context<Self>) -> MonitorState {
-        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("搜索指标…"));
-        cx.subscribe(&filter, |_this: &mut ShellView, _, ev: &InputEvent, cx| {
-            if matches!(ev, InputEvent::Change) {
-                cx.notify();
-            }
-        })
-        .detach();
-        MonitorState { filter }
-    }
-
     fn create_os_policy_state(window: &mut Window, cx: &mut Context<Self>) -> OsPolicyState {
         let inputs = [
             cx.new(|cx| InputState::new(window, cx).placeholder("PID")),
@@ -637,7 +623,7 @@ impl ShellView {
         // `app_state_sub` observer below — by the time the observer fires,
         // `self.state` is already the new snapshot.
         let (perf, thermal, exp) = Self::create_performance_state(window, cx);
-        let mon = Self::create_monitor_state(window, cx);
+        let mon = cx.new(|cx_mon| monitor::MonitorPageState::new(app_state.clone(), window, cx_mon));
         let os = Self::create_os_policy_state(window, cx);
 
         Self {
@@ -707,7 +693,7 @@ impl Render for ShellView {
             PageId::Profiles => {
                 profiles::render(&self.state, &self.app, &self.prof, cx).into_any_element()
             }
-            PageId::Monitor => monitor::render(&self.state, &self.mon, cx).into_any_element(),
+            PageId::Monitor => monitor::MonitorPageState::render_into(&self.mon, window, cx),
             PageId::Settings => {
                 settings::SettingsPageState::render_into(&self.settings_page, window, cx)
             }

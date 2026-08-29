@@ -1,17 +1,95 @@
 //! Monitor: a compact live-value table. It answers only "what is the machine
 //! doing right now?"; raw register and provider details stay out of the main
-//! control surface.
+//! control surface. §Phase 2 — page is its own entity.
 
-use gpui::{Context, IntoElement, ParentElement, Styled, div, px};
-use gpui_component::{ActiveTheme, StyledExt, input::Input};
+use std::time::Duration;
+
+use gpui::{
+    AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Window,
+    div, px,
+};
+use gpui_component::{ActiveTheme, StyledExt, input::Input, input::InputState};
 use phelper_core::app::AppState;
 use phelper_core::app::fmt;
 use phelper_core::telemetry::registry;
 use phelper_domain::telemetry::{MetricId, MetricQuality, ids};
 
-use crate::shell::{MonitorState, ShellView};
-
 use super::dashboard::page_root;
+
+pub struct MonitorPageState {
+    filter: Entity<InputState>,
+    app_state: Entity<AppState>,
+    last_fp: Option<u64>,
+    last_paint: std::time::Instant,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl MonitorPageState {
+    pub fn new(
+        app_state: Entity<AppState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("搜索指标…"));
+        cx.subscribe(&filter, |_this, _, ev: &gpui_component::input::InputEvent, cx| {
+            if matches!(ev, gpui_component::input::InputEvent::Change) {
+                cx.notify();
+            }
+        });
+        let app_state_sub = cx.observe(&app_state, |this, app_state, cx| {
+            let fp = this.fingerprint(&app_state.read(cx));
+            if Some(fp) != this.last_fp
+                || this.last_paint.elapsed() >= Duration::from_secs(5)
+            {
+                this.last_fp = Some(fp);
+                this.last_paint = std::time::Instant::now();
+                cx.notify();
+            }
+        });
+        Self {
+            filter,
+            app_state,
+            last_fp: None,
+            last_paint: std::time::Instant::now(),
+            _subscriptions: vec![app_state_sub],
+        }
+    }
+
+    /// Per-page fingerprint: the 41-metric presence/quality/source matrix +
+    /// 1 s time bucket (page paints ≤1 Hz — no point repainting more
+    /// often than the bucket itself).
+    fn fingerprint(&self, state: &AppState) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        let snap = state.telemetry.as_deref();
+        for meta in registry::all() {
+            if !is_monitor_metric(meta.id) {
+                continue;
+            }
+            meta.id.0.hash(&mut h);
+            snap.and_then(|x| x.samples.get(&meta.id))
+                .map(|x| format!("{:?}-{:?}", x.quality, x.source))
+                .hash(&mut h);
+        }
+        phelper_core::app::now_epoch_ms() / 1000
+    }
+
+    pub fn render_into(
+        entity: &Entity<Self>,
+        window: &mut Window,
+        cx: &mut Context<crate::shell::ShellView>,
+    ) -> gpui::AnyElement {
+        entity.update(cx, |view, cx| view.render(window, cx).into_any_element())
+    }
+}
+
+impl Render for MonitorPageState {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let state = self.app_state.read_with(cx, |s, _| s.clone());
+        render_monitor(&state, &self.filter, cx)
+    }
+}
 
 fn metric_label(id: MetricId) -> &'static str {
     match id {
@@ -106,13 +184,13 @@ fn value_zh(id: MetricId, v: f64, unit: &str) -> String {
     }
 }
 
-pub fn render(
+pub fn render_monitor(
     state: &AppState,
-    mon: &MonitorState,
-    cx: &mut Context<ShellView>,
-) -> impl IntoElement {
+    filter: &Entity<InputState>,
+    cx: &mut Context<MonitorPageState>,
+) -> gpui_component::scroll::Scrollable<gpui::Stateful<gpui::Div>> {
     let theme = cx.theme();
-    let query = mon.filter.read(cx).text().to_string().to_lowercase();
+    let query = filter.read(cx).text().to_string().to_lowercase();
     let snap = state.telemetry.as_deref();
     let w_id = px(210.);
     let w_val = px(140.);
@@ -123,7 +201,7 @@ pub fn render(
         .justify_between()
         .gap_3()
         .child(div().text_xl().font_semibold().child("监视器"))
-        .child(div().w(px(240.)).child(Input::new(&mon.filter)));
+        .child(div().w(px(240.)).child(Input::new(filter)));
     let header = div()
         .h_flex()
         .gap_2()
