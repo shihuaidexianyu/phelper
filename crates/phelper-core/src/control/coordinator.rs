@@ -246,7 +246,11 @@ impl ControlHandle {
     pub(crate) fn shutdown(&self) {
         let (tx, rx) = mpsc::channel();
         if self.tx.send(ControlRequest::Shutdown(tx)).is_ok() {
-            let _ = rx.recv_timeout(Duration::from_secs(15));
+            // Shutdown is the safety barrier between the control thread and
+            // teardown of telemetry/HP actor.  Timing out here would let the
+            // engine dismantle those dependencies while a queued command or
+            // firmware restore was still using them.
+            let _ = rx.recv();
         }
     }
 }
@@ -708,6 +712,23 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         };
         for (i, step_cmd) in plan.iter().enumerate() {
             match self.exec_one(step_cmd, &mut steps) {
+                ControlStatus::Applied {
+                    verification: failed @ Verification::Failed { .. },
+                } => {
+                    // The backend accepted the write, but the hardware did
+                    // not verify the requested state.  Preserve that honest
+                    // Applied+Failed verdict for a one-step command; inside
+                    // a profile it is a failed plan step, so later writes
+                    // must not run and the profile must not be stamped.
+                    status = if i == 0 && plan.len() == 1 {
+                        ControlStatus::Applied {
+                            verification: failed,
+                        }
+                    } else {
+                        ControlStatus::Partial
+                    };
+                    break;
+                }
                 ControlStatus::Applied { verification } => {
                     weakest = weakest_verification(&weakest, &verification);
                     status = ControlStatus::Applied {
@@ -788,14 +809,11 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             plan.push(ControlCommand::SetPowerLimits(l));
         }
         if let Some(patch) = p.gpu_policy {
-            let hp = self
-                .hp
-                .as_ref()
-                .ok_or_else(|| ControlError::BackendUnavailable {
-                    what: "HP platform (0x21 merge source)".into(),
-                })?;
-            let current = hp.gpu_platform_policy().map_err(map_hp_error)?;
-            plan.push(ControlCommand::SetGpuPlatformPolicy(patch.apply(current)));
+            // Keep the sparse patch intact until its own execution slot.
+            // Earlier PPM/power steps may take long enough for firmware or
+            // another process to change 0x21; merging here would turn that
+            // old value into a destructive full-structure write.
+            plan.push(ControlCommand::SetGpuPlatformPolicyPatch(patch));
         }
         if let Some(m) = p.thermal_mode {
             plan.push(ControlCommand::SetThermalMode(m));
@@ -1319,7 +1337,7 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         };
         let merged = patch.apply(current);
         let status = self.exec_gpu_policy(merged, steps);
-        if matches!(status, ControlStatus::Applied { .. }) {
+        if Self::control_status_succeeded(&status) {
             // record_desired() can't fill this in — the merged value only
             // exists here — so the patch arm stamps desired itself.
             self.desired
@@ -2564,7 +2582,18 @@ fn map_hp_error(e: HpWmiError) -> ControlError {
 }
 
 fn map_hp_error_ref(e: &HpWmiError) -> ControlError {
-    map_hp_error(HpWmiError::Transport(e.to_string()))
+    match e {
+        HpWmiError::FirmwareReturnCode { code } => ControlError::FirmwareRejected {
+            detail: format!("bios rc={code}"),
+        },
+        HpWmiError::Timeout => ControlError::Timeout,
+        HpWmiError::InvalidInput(reason) => ControlError::UnsafeRequest {
+            reason: (*reason).into(),
+        },
+        other => ControlError::BackendUnavailable {
+            what: other.to_string(),
+        },
+    }
 }
 
 fn failed_step(step: &str, backend: &str, e: &HpWmiError, before: String) -> StepOutcome {
@@ -3126,6 +3155,7 @@ mod tests {
         let state = rig.hp.state();
         assert_eq!(state.fan_writes.len(), fan_writes_before_max);
         assert_eq!(state.max_fan_writes, vec![true]);
+        drop(state);
         assert_eq!(rig.handle.observed().fan_mode.value(), Some(&FanMode::Max));
         rig.handle.shutdown();
     }
@@ -3581,7 +3611,7 @@ mod tests {
         }
         fn pl4_w(&self) -> Option<(f64, Instant)> {
             self.has_pl4
-                .then(|| (*self.link.lock().unwrap()).2)
+                .then(|| self.link.lock().unwrap().2)
                 .map(|v| (v, Instant::now()))
         }
     }
@@ -4048,6 +4078,42 @@ mod tests {
     }
 
     #[test]
+    fn profile_verification_failure_stops_later_writes() {
+        // A firmware-accepted 0x22 write whose 0x21 readback does not move
+        // is not a successful profile step.  Thermal/fan writes after it
+        // must not run, and the named profile must not be stamped active.
+        let hp = MockHp::default();
+        let startup = hp.state().gpu_policy.expect("mock startup policy");
+        hp.state().gpu_policy_pin = Some(startup);
+        let p = PerformanceProfile {
+            gpu_policy: Some(GpuPolicyPatch {
+                ctgp: Some(!startup.ctgp),
+                ..Default::default()
+            }),
+            thermal_mode: Some(ThermalMode::Performance),
+            fan: Some(FanMode::Max),
+            ..Default::default()
+        };
+        let rig = TestRig::start_with("prof-verify-stop", hp, registry_with("drift", p));
+
+        let outcome = block(
+            &rig.handle,
+            ControlCommand::ApplyProfile {
+                profile: "drift".into(),
+            },
+        );
+
+        assert!(matches!(outcome.status, ControlStatus::Partial));
+        let state = rig.hp.state();
+        assert_eq!(state.gpu_policy_writes.len(), 1);
+        assert!(state.thermal_writes.is_empty());
+        assert!(state.max_fan_writes.is_empty());
+        drop(state);
+        assert_eq!(rig.handle.desired().profile, None);
+        rig.handle.shutdown();
+    }
+
+    #[test]
     fn profile_field_failing_safety_rejects_whole_pre_write() {
         // EPP 101 is invalid: the whole profile must reject before ANY
         // step touches hardware (AR-11 — no half-applied intent).
@@ -4076,8 +4142,10 @@ mod tests {
 
     #[test]
     fn direct_knob_change_clears_profile_stamp() {
-        let mut p = PerformanceProfile::default();
-        p.thermal_mode = Some(ThermalMode::Performance);
+        let p = PerformanceProfile {
+            thermal_mode: Some(ThermalMode::Performance),
+            ..Default::default()
+        };
         let rig = TestRig::start_with("prof-clear", MockHp::default(), registry_with("t", p));
         block(
             &rig.handle,

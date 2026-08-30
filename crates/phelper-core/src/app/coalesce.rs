@@ -121,7 +121,7 @@ impl Coalescer {
         self.slot.busy_since = None;
     }
 
-    pub fn note_completed(&mut self, knob: KnobId, _succeeded: bool) {
+    pub fn note_completed(&mut self, knob: KnobId) {
         debug_assert_eq!(knob, KnobId::Profile);
         self.slot.in_flight = None;
         self.slot.busy_since = None;
@@ -151,7 +151,7 @@ mod tests {
         queue.note_dispatched(KnobId::Profile, command, ControlReceipt(1), now);
         queue.enqueue(KnobId::Profile, profile("gaming"));
         assert!(queue.poll(now).is_empty());
-        queue.note_completed(KnobId::Profile, true);
+        queue.note_completed(KnobId::Profile);
         assert_eq!(queue.poll(now).len(), 1);
     }
 

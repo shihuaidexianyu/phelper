@@ -7,9 +7,8 @@
 //! — the process stays alive so the coordinator's KeepAliveService heartbeat
 //! stops the firmware from clawing the state back. Ctrl+C (or hold expiry)
 //! triggers graceful engine shutdown, which restores firmware auto (AR-12).
-//! `--hold 0` = fire-and-exit WITHOUT restore: the write stands and the
-//! firmware clawback (~120 s, heartbeat stops with the process) is the
-//! safety net — that path is exactly what HIL step 10 proves with taskkill.
+//! A zero hold is rejected before the engine starts: normal CLI commands may
+//! not bypass the graceful restore path merely to reproduce a crash test.
 //! PPM commands (epp / epp1 / max-freq / min-perf / max-perf / boost) are
 //! Windows-native settings: they persist across process exit and need no hold.
 
@@ -22,9 +21,8 @@ use phelper_core::domain::capability::{CapabilitySet, Support};
 use phelper_core::domain::command::{
     ControlCommand, ControlOutcome, ControlStatus, StepOutcome, Verification,
 };
-use phelper_core::domain::policy::{
-    BoostPolicy, CpuPolicy, FanLevels, FanMode, GpuPlatformPolicy, ThermalMode,
-};
+use phelper_core::domain::policy::{BoostPolicy, CpuPolicy, FanLevels, FanMode, ThermalMode};
+use phelper_core::domain::profile::GpuPolicyPatch;
 use phelper_core::domain::state::ObservedState;
 use phelper_core::{Engine, control::journal::ControlJournal};
 
@@ -97,8 +95,7 @@ enum ControlCmd {
     Thermal {
         #[arg(value_enum)]
         mode: ThermalArg,
-        /// Seconds to keep the process (and heartbeat) alive; 0 = fire and
-        /// exit WITHOUT restore (firmware clawback ~120 s is the net).
+        /// Seconds to keep the process (and heartbeat) alive; must be > 0.
         #[arg(long, default_value_t = 120)]
         hold: u64,
     },
@@ -264,15 +261,6 @@ enum Plan {
     Change(ControlCommand),
     /// Dispatch, hold the process for the heartbeat, then graceful restore.
     HpState(ControlCommand, u64),
-    /// 0x22 read-modify-write: partial fields, merged with the live 0x21
-    /// readback after engine start, then treated as HpState.
-    GpuPolicyMerge {
-        ctgp: Option<bool>,
-        ppab: Option<bool>,
-        dstate: Option<u8>,
-        slowdown_temp: Option<u8>,
-        hold: u64,
-    },
     /// Profile actions that never touch hardware (no engine start).
     ProfileList,
     ProfileShow(String),
@@ -287,7 +275,7 @@ enum Plan {
 /// Pure argument → command mapping. All rejections happen HERE, before
 /// `Engine::start()` — a rejected command must leave zero hardware trace.
 fn plan(args: &ControlArgs) -> Result<Plan> {
-    Ok(match &args.cmd {
+    let planned = match &args.cmd {
         ControlCmd::Status => Plan::Status,
         ControlCmd::Epp { ac, dc } => {
             if ac.is_none() && dc.is_none() {
@@ -413,13 +401,15 @@ fn plan(args: &ControlArgs) -> Result<Plan> {
             {
                 bail!("--slowdown-temp: {t} outside plausible band 30..=110 °C");
             }
-            Plan::GpuPolicyMerge {
-                ctgp: *ctgp,
-                ppab: *ppab,
-                dstate: *dstate,
-                slowdown_temp: *slowdown_temp,
-                hold: *hold,
-            }
+            Plan::HpState(
+                ControlCommand::SetGpuPlatformPolicyPatch(GpuPolicyPatch {
+                    ctgp: *ctgp,
+                    ppab: *ppab,
+                    dstate: *dstate,
+                    slowdown_temp_c: *slowdown_temp,
+                }),
+                *hold,
+            )
         }
         ControlCmd::Fan { mode } => match mode {
             // Restoring the default needs no heartbeat: shutdown's restore
@@ -489,7 +479,17 @@ fn plan(args: &ControlArgs) -> Result<Plan> {
                 }
             }
         },
-    })
+    };
+
+    let hold = match &planned {
+        Plan::HpState(_, hold) | Plan::ProfileApply { hold, .. } => Some(*hold),
+        _ => None,
+    };
+    if hold == Some(0) {
+        bail!("--hold must be greater than zero so graceful restore cannot be bypassed");
+    }
+
+    Ok(planned)
 }
 
 pub fn run(args: ControlArgs) -> Result<()> {
@@ -519,37 +519,6 @@ pub fn run(args: ControlArgs) -> Result<()> {
         }
         Plan::ProfileList | Plan::ProfileShow(_) | Plan::ProfileExport(_) => {
             unreachable!("handled before engine start")
-        }
-        Plan::GpuPolicyMerge {
-            ctgp,
-            ppab,
-            dstate,
-            slowdown_temp,
-            hold,
-        } => {
-            // Read-modify-write merge against the live 0x21 readback (the
-            // coordinator populated observed.gpu_platform_policy at start).
-            let merged = {
-                let control = engine.control().context(
-                    "control unavailable (engine is telemetry-only — see startup warnings)",
-                )?;
-                let cur = control
-                    .observed()
-                    .gpu_platform_policy
-                    .value()
-                    .copied()
-                    .context(
-                        "0x21 readback unavailable — cannot preserve unspecified fields \
-                         (gpu_platform_policy observed is Unknown)",
-                    )?;
-                GpuPlatformPolicy {
-                    ctgp: ctgp.unwrap_or(cur.ctgp),
-                    ppab: ppab.unwrap_or(cur.ppab),
-                    dstate: dstate.unwrap_or(cur.dstate),
-                    slowdown_temp_c: slowdown_temp.unwrap_or(cur.slowdown_temp_c),
-                }
-            };
-            run_hp_state(engine, ControlCommand::SetGpuPlatformPolicy(merged), hold)
         }
     }
 }
@@ -619,25 +588,10 @@ fn profile_export(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// HP-state change + optional heartbeat hold + graceful restore. The engine
-/// is shut down (restoring firmware auto, AR-12) even when the change or
-/// the hold fails — the only path that skips restore is the deliberate
-/// `--hold 0` process exit.
+/// HP-state change + heartbeat hold + graceful restore. The engine is shut
+/// down (restoring firmware auto, AR-12) even when the change or hold fails.
 fn run_hp_state(engine: Engine, cmd: ControlCommand, hold: u64) -> Result<()> {
-    let r = change(&engine, cmd).and_then(|()| {
-        if hold == 0 {
-            eprintln!(
-                "\n*** exiting WITHOUT restore (--hold 0): the write stands, \
-                 heartbeat stops with this process, and the firmware clawback \
-                 (~120 s) returns fans/thermal to automatic (AR-12) ***"
-            );
-            // Deliberately skip Engine::shutdown — its restore sequence
-            // would undo the write immediately, which is not what --hold 0
-            // means. The clawback is the documented safety net here.
-            std::process::exit(0);
-        }
-        hold_loop(hold)
-    });
+    let r = change(&engine, cmd).and_then(|()| hold_loop(hold));
     engine.shutdown();
     if r.is_ok() {
         eprintln!("engine stopped; firmware automatic state restored");
@@ -859,5 +813,23 @@ fn print_journal_tail(n: usize) {
     for line in &lines[start..] {
         // Journal lines are self-contained JSONL (§56) — print raw.
         println!("  {line}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_hold_is_rejected_before_engine_start() {
+        let args = ControlArgs {
+            cmd: ControlCmd::Thermal {
+                mode: ThermalArg::Balanced,
+                hold: 0,
+            },
+        };
+
+        let error = plan(&args).err().expect("zero hold must be rejected");
+        assert!(error.to_string().contains("greater than zero"));
     }
 }

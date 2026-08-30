@@ -150,22 +150,21 @@ UI 只能发送 Application Command，并订阅 Application State。
 
 ---
 
-## AR-03 — 所有写操作必须经过 ControlCoordinator
+## AR-03 — 所有硬件/固件性能写入必须经过 ControlCoordinator
 
 无论写操作来自：
 
-- Performance 页面；
-- Thermal 页面；
-- Tray；
-- Hotkey；
 - Profile；
-- 自动调优；
 - CLI；
+- 将来的硬件自动调优；
 - 将来的 API；
 
 最终必须进入同一个 ControlCoordinator。
 
 不存在第二条“快捷硬件写路径”。
+
+进程/线程级 Windows 调度不是硬件性能写入：它通过独立的 `OsPolicyHandle`
+按目标维护 baseline、owner 和恢复账本，不得借用本条规则逃避自身的退出恢复。
 
 ---
 
@@ -340,7 +339,7 @@ firmware automatic control
 
 ```mermaid
 flowchart TB
-    UI["GPUI Desktop<br/>Dashboard / Performance+Fan / Monitor / Profiles / Settings"]
+    UI["GPUI Desktop<br/>Dashboard / Profiles"]
     APP["Application Layer<br/>App State / Commands / Coordinators"]
     TELE["Telemetry Engine"]
     CTRL["Control Engine"]
@@ -1946,19 +1945,13 @@ UI 组件不直接拥有 domain truth。
 
 ```text
 Dashboard
-
-Performance（CPU + 风扇）
-
-Monitor
-
 Profiles
-
-Settings
 ```
 
-Diagnostics is an engineering/support surface, not a user-facing page. The
-normal control flow is Dashboard → Performance（CPU + fan） → Profiles, with
-Monitor and Settings retained as secondary pages.
+The current desktop is intentionally minimal: Dashboard is read-only status and
+Profiles is the sole write surface. Fine-grained controls, monitoring tables,
+application scheduling, diagnostics, and settings remain core/CLI concerns and
+are not user-facing pages.
 
 ---
 
@@ -2751,7 +2744,7 @@ OGH 第二写者检测：启动扫描（Win32_Process 写者名单 / Win32_Servi
   已知被动 / Appx 包），warn-only 不杀进程不阻塞
 CLI control：status / epp / max-freq / boost / thermal / fan
   auto|max|manual，BEFORE/COMMAND/AFTER 证据输出，--hold 默认 120s
-  心跳保持，Ctrl+C/Break 优雅恢复，--hold 0=发后即退（clawback 兜底）
+  心跳保持，Ctrl+C/Break 优雅恢复；历史 HIL 的 --hold 0 绕过已从正常 CLI 删除
 明确未做（留 M3+）：0x29 功率限制、0x22 GPU 策略写、MUX 写、profiles、
   EC、PERFEPP1；software fan curve 后续已作为安全 MVP 落地
 ```
@@ -2957,7 +2950,7 @@ Windows 设置中的“最佳节能/均衡/最佳性能”通过
 
 ## Phase 3 — GPUI Shell
 
-建立：
+历史阶段最初建立：
 
 ```text
 Dashboard
@@ -2967,9 +2960,8 @@ Profiles
 Settings
 ```
 
-UI 只依赖 AppState；Thermals 已并入 Performance，桌面 Diagnostics 入口已移除。
-Performance 页的首屏只放 EPP/EPP1 和频率上限；PPM 性能上下限放在“更多参数”中，
-并在页头显示活动计划、Windows 配置模式和实际生效模式的简短上下文。
+该信息架构后来已经收缩为 Dashboard + Profiles。UI 仍只消费 AppState；精细控制、
+Monitor、Settings 和 Diagnostics 不再属于当前桌面产品。
 
 ---
 
@@ -3173,7 +3165,7 @@ Diff apply / readback / restore
 | Hardware Windows service | Deferred |
 | Custom software fan curve | Implemented（四点安全 MVP；默认 Profile 仍等待实机 soak） |
 | Power-aware automatic scheduling | Phase 1 implemented（`Off` / `BatteryEfficiency`；默认关闭；见 `docs/automatic-scheduling-architecture.md`） |
-| Resident desktop integrations（autostart / OMEN key / overlay） | 已实现；实机 HIL 待完成（见 `docs/resident-desktop-integrations.md`） |
+| Resident desktop integrations（autostart / OMEN key / overlay） | Removed from the minimal desktop；历史设计见 `docs/resident-desktop-integrations.md` |
 
 ---
 

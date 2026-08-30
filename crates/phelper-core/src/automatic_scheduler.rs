@@ -104,7 +104,10 @@ impl AutomaticSchedulerHandle {
             .send(AutomaticMessage::Shutdown(ack_tx))
             .is_ok()
         {
-            let _ = ack_rx.recv_timeout(Duration::from_secs(5));
+            // Restoration can touch many processes.  Returning after an
+            // arbitrary timeout would let the CLI exit with OS policies
+            // still owned by a worker that is about to be terminated.
+            let _ = ack_rx.recv();
         }
     }
 }

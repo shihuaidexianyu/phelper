@@ -12,7 +12,6 @@ use phelper_domain::telemetry::{MetricQuality, MetricSample, MetricSource, Provi
 use tracing::{debug, warn};
 
 use super::registry;
-use crate::platform::hp_wmi::actor::HpHandle;
 
 /// One scheduled data source. Object-safe; the coordinator boxes these.
 pub(crate) trait Collector: Send {
@@ -116,6 +115,7 @@ impl Collector for PawnioCollector {
         use crate::platform::pawnio as p;
         let src = MetricSource::PawnIoMsr;
         let mut out = Vec::with_capacity(12);
+        let mut degraded = None;
         let now = Instant::now();
         self.ticks = self.ticks.wrapping_add(1);
 
@@ -133,7 +133,7 @@ impl Collector for PawnioCollector {
             }
             Err(e) => {
                 debug!(%e, "pkg therm read failed");
-                self.status = ProviderStatus::Degraded(format!("therm read: {e}"));
+                degraded = Some(format!("therm read: {e}"));
             }
         }
 
@@ -152,7 +152,7 @@ impl Collector for PawnioCollector {
             }
             Err(e) => {
                 debug!(%e, "rapl read failed");
-                self.status = ProviderStatus::Degraded(format!("rapl read: {e}"));
+                degraded = Some(format!("rapl read: {e}"));
             }
         }
 
@@ -168,7 +168,7 @@ impl Collector for PawnioCollector {
             }
             _ => {
                 debug!("mperf/aperf read failed");
-                self.status = ProviderStatus::Degraded("mperf/aperf read failed".into());
+                degraded = Some("mperf/aperf read failed".into());
             }
         }
 
@@ -190,7 +190,7 @@ impl Collector for PawnioCollector {
             }
             Err(e) => {
                 debug!(%e, "0x610 power-limit read failed");
-                self.status = ProviderStatus::Degraded(format!("0x610 read: {e}"));
+                degraded = Some(format!("0x610 read: {e}"));
             }
         }
 
@@ -209,10 +209,7 @@ impl Collector for PawnioCollector {
             }
         }
 
-        if !matches!(self.status, ProviderStatus::Ok) && !out.is_empty() {
-            // A later read succeeded after an earlier degradation.
-            self.status = ProviderStatus::Ok;
-        }
+        self.status = degraded.map_or(ProviderStatus::Ok, ProviderStatus::Degraded);
         out
     }
 
@@ -564,14 +561,14 @@ impl Collector for PpmCollector {
 /// this guard is the hard backstop (RefreshNow bursts, future control path).
 const FAN_MIN_INTERVAL: Duration = Duration::from_millis(900);
 
-pub(crate) struct HpFanCollector {
-    hp: Arc<HpHandle>,
+pub(crate) struct HpFanCollector<H> {
+    hp: Arc<H>,
     last: Option<(Instant, phelper_domain::policy::FanLevels)>,
     status: ProviderStatus,
 }
 
-impl HpFanCollector {
-    pub(crate) fn new(hp: Arc<HpHandle>) -> Self {
+impl<H> HpFanCollector<H> {
+    pub(crate) fn new(hp: Arc<H>) -> Self {
         Self {
             hp,
             last: None,
@@ -580,7 +577,7 @@ impl HpFanCollector {
     }
 }
 
-impl Collector for HpFanCollector {
+impl<H: HpPlatform + Sync> Collector for HpFanCollector<H> {
     fn name(&self) -> &'static str {
         "hp-wmi/fans"
     }
@@ -595,34 +592,93 @@ impl Collector for HpFanCollector {
         let throttled = self
             .last
             .is_some_and(|(at, _)| at.elapsed() < FAN_MIN_INTERVAL);
-        if !throttled || self.last.is_none() {
-            match self.hp.fan_levels() {
-                Ok(levels) => {
-                    self.last = Some((Instant::now(), levels));
-                    self.status = ProviderStatus::Ok;
-                }
-                Err(e) => {
-                    warn!(%e, "fan levels read failed");
-                    self.status = ProviderStatus::Degraded(format!("0x2D read: {e}"));
-                }
-            }
+        if throttled {
+            // The store already holds the last real sample. Re-emitting it
+            // with `fresh()` would forge a new timestamp and defeat the
+            // sensor-freeze watchdog used by manual fan control.
+            return Vec::new();
         }
-        // Throttled ticks re-publish the cached levels: the value is the
-        // latest known from firmware and the 1 Hz rule outranks per-tick
-        // freshness here.
-        match self.last {
-            Some((_, levels)) => {
+        match self.hp.fan_levels() {
+            Ok(levels) => {
+                self.last = Some((Instant::now(), levels));
+                self.status = ProviderStatus::Ok;
                 let src = MetricSource::HpWmi;
                 vec![
                     fresh(ids::FAN_CPU_RPM, f64::from(levels.cpu_rpm()).into(), src),
                     fresh(ids::FAN_GPU_RPM, f64::from(levels.gpu_rpm()).into(), src),
                 ]
             }
-            None => Vec::new(),
+            Err(e) => {
+                warn!(%e, "fan levels read failed");
+                self.status = ProviderStatus::Degraded(format!("0x2D read: {e}"));
+                // Preserve the previous sample and its original timestamp in
+                // the store. No data is more honest than freshly dated old
+                // data, especially for the fail-closed watchdog.
+                Vec::new()
+            }
         }
     }
 
     fn status(&self) -> ProviderStatus {
         self.status.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use phelper_domain::error::HpWmiError;
+    use phelper_domain::hp::{FanTable, SystemDesignData};
+    use phelper_domain::policy::{FanLevels, GpuPlatformPolicy, MuxMode};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    struct FakeHp(Mutex<VecDeque<Result<FanLevels, HpWmiError>>>);
+
+    impl HpPlatform for FakeHp {
+        fn fan_count(&self) -> Result<u8, HpWmiError> {
+            Ok(2)
+        }
+        fn system_design_data(&self) -> Result<SystemDesignData, HpWmiError> {
+            Err(HpWmiError::NotAvailable("test"))
+        }
+        fn fan_table(&self) -> Result<FanTable, HpWmiError> {
+            Err(HpWmiError::NotAvailable("test"))
+        }
+        fn fan_levels(&self) -> Result<FanLevels, HpWmiError> {
+            self.0
+                .lock()
+                .expect("fake hp")
+                .pop_front()
+                .unwrap_or(Err(HpWmiError::NotAvailable("test")))
+        }
+        fn gpu_platform_policy(&self) -> Result<GpuPlatformPolicy, HpWmiError> {
+            Err(HpWmiError::NotAvailable("test"))
+        }
+        fn mux_mode(&self) -> Result<MuxMode, HpWmiError> {
+            Err(HpWmiError::NotAvailable("test"))
+        }
+        fn max_fan_readback_diagnostic(&self) -> Result<bool, HpWmiError> {
+            Err(HpWmiError::NotAvailable("test"))
+        }
+    }
+
+    #[test]
+    fn failed_fan_read_does_not_forge_a_fresh_sample() {
+        let hp = Arc::new(FakeHp(Mutex::new(VecDeque::from([
+            Ok(FanLevels::new(30, 32)),
+            Err(HpWmiError::Timeout),
+        ]))));
+        let mut collector = HpFanCollector::new(hp);
+        let first = collector.collect();
+        assert_eq!(first.len(), 2);
+
+        let old_at = Instant::now() - FAN_MIN_INTERVAL;
+        collector.last.as_mut().expect("last sample").0 = old_at;
+        let failed = collector.collect();
+
+        assert!(failed.is_empty());
+        assert_eq!(collector.last.expect("cached sample").0, old_at);
+        assert!(matches!(collector.status(), ProviderStatus::Degraded(_)));
     }
 }

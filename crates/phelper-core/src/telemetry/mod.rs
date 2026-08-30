@@ -18,7 +18,7 @@ mod store;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -58,7 +58,7 @@ enum Command {
     /// Out-of-cadence refresh of every collector (per-collector firmware
     /// guards still apply — the HP 1 Hz fan rule is not bypassable).
     RefreshNow,
-    Subscribe(Sender<Arc<TelemetrySnapshot>>),
+    Subscribe(SyncSender<Arc<TelemetrySnapshot>>),
     Shutdown(Sender<()>),
 }
 
@@ -106,7 +106,9 @@ impl TelemetryHandle {
     /// Subscribe to snapshot broadcasts after each collection round.
     /// Slow/dead receivers are pruned automatically.
     pub fn subscribe(&self) -> Receiver<Arc<TelemetrySnapshot>> {
-        let (tx, rx) = mpsc::channel();
+        // Snapshots are replaceable state, not an event log. Capacity one
+        // bounds memory when a UI subscriber stalls.
+        let (tx, rx) = mpsc::sync_channel(1);
         let _ = self.cmd.send(Command::Subscribe(tx));
         rx
     }
@@ -120,7 +122,9 @@ impl TelemetryHandle {
     pub(crate) fn shutdown(&self) {
         let (tx, rx) = mpsc::channel();
         if self.cmd.send(Command::Shutdown(tx)).is_ok() {
-            let _ = rx.recv_timeout(Duration::from_secs(10));
+            // Engine teardown must not stop the HP actor while a collector
+            // still owns an in-flight read against it.
+            let _ = rx.recv();
         }
     }
 }
@@ -173,7 +177,7 @@ impl TelemetryCoordinator {
             "telemetry coordinator running"
         );
         let mut next_due: Vec<Instant> = vec![Instant::now(); self.collectors.len()];
-        let mut subscribers: Vec<Sender<Arc<TelemetrySnapshot>>> = Vec::new();
+        let mut subscribers: Vec<SyncSender<Arc<TelemetrySnapshot>>> = Vec::new();
 
         loop {
             self.heartbeat.fetch_add(1, Ordering::Relaxed);
@@ -265,12 +269,46 @@ impl TelemetryCoordinator {
 
     fn publish(
         store: &Arc<RwLock<TelemetryStore>>,
-        subscribers: &mut Vec<Sender<Arc<TelemetrySnapshot>>>,
+        subscribers: &mut Vec<SyncSender<Arc<TelemetrySnapshot>>>,
     ) {
         if subscribers.is_empty() {
             return;
         }
         let snap = Arc::new(store.read().expect("store poisoned").snapshot());
-        subscribers.retain(|tx| tx.send(Arc::clone(&snap)).is_ok());
+        subscribers.retain(|tx| match tx.try_send(Arc::clone(&snap)) {
+            Ok(()) | Err(TrySendError::Full(_)) => true,
+            Err(TrySendError::Disconnected(_)) => false,
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use phelper_domain::telemetry::{MetricSource, MetricValue, ids};
+
+    #[test]
+    fn slow_snapshot_subscriber_is_bounded_and_pruned_on_disconnect() {
+        let store = Arc::new(RwLock::new(TelemetryStore::default()));
+        store.write().expect("store").push(MetricSample::fresh(
+            ids::CPU_PKG_TEMP_C,
+            MetricValue::F64(70.0),
+            MetricSource::PawnIoMsr,
+        ));
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut subscribers = vec![tx];
+
+        TelemetryCoordinator::publish(&store, &mut subscribers);
+        TelemetryCoordinator::publish(&store, &mut subscribers);
+        assert_eq!(subscribers.len(), 1, "a full subscriber remains registered");
+        assert_eq!(
+            rx.try_iter().count(),
+            1,
+            "capacity one prevents backlog growth"
+        );
+
+        drop(rx);
+        TelemetryCoordinator::publish(&store, &mut subscribers);
+        assert!(subscribers.is_empty());
     }
 }

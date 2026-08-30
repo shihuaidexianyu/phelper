@@ -185,6 +185,18 @@ fn pump_main(publisher: Arc<dyn StatePublisher>, rx: mpsc::Receiver<PumpMsg>) {
         s.set_profiles(&registry_init);
     }));
 
+    // The UI variant deliberately keeps this diagnostic off the critical
+    // startup path.  Complete the promised second-writer scan in its own
+    // read-only worker; scan() logs every finding, including active writers.
+    if let Err(error) = std::thread::Builder::new()
+        .name("ogh-watch".into())
+        .spawn(|| {
+            let _ = crate::platform::ogh_watch::scan();
+        })
+    {
+        tracing::warn!(%error, "could not start OGH second-writer scan");
+    }
+
     let snap_rx = engine.telemetry().subscribe();
     let mut engine = Some(engine);
     let mut coalescer = Coalescer::new();
@@ -221,7 +233,7 @@ fn pump_main(publisher: Arc<dyn StatePublisher>, rx: mpsc::Receiver<PumpMsg>) {
                     s.engine = EngineStatus::Failed("遥测协调器意外断开".into());
                 }));
                 if let Some(e) = engine.take() {
-                    drop(e);
+                    e.shutdown();
                 }
                 serve_shutdown_only(&rx);
                 return;
@@ -357,13 +369,7 @@ fn pump_main(publisher: Arc<dyn StatePublisher>, rx: mpsc::Receiver<PumpMsg>) {
         }
         for (rid, knob, maybe) in finished {
             in_flight.remove(&rid);
-            // Failed/rejected outcomes clear the coalescer's dedup memory
-            // (note_completed false) so the user can retry the same value.
-            let succeeded = matches!(
-                &maybe,
-                Some(o) if matches!(o.status, phelper_domain::command::ControlStatus::Applied { .. })
-            );
-            coalescer.note_completed(knob, succeeded);
+            coalescer.note_completed(knob);
             let knob_for_outcome = knob;
             let at = now_epoch_ms();
             publisher.update(Box::new(move |s| match maybe {

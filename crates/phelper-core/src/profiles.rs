@@ -359,9 +359,11 @@ gpu_preference = "high_performance"
 
     #[test]
     fn toml_round_trip_curve_profile() {
-        let mut profile = PerformanceProfile::default();
-        profile.description = "曲线档".into();
-        profile.fan = Some(FanMode::Curve(phelper_domain::policy::FanCurve::balanced()));
+        let profile = PerformanceProfile {
+            description: "曲线档".into(),
+            fan: Some(FanMode::Curve(phelper_domain::policy::FanCurve::balanced())),
+            ..Default::default()
+        };
         let out = to_toml(&profile).expect("serialize");
         let parsed: PerformanceProfile = toml::from_str(&out).expect("re-parse");
         assert_eq!(parsed, profile);

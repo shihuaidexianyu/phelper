@@ -156,8 +156,10 @@ mod tests {
         assert!(KeepAliveService::tracked(&o).is_empty());
 
         // Balanced thermal is the firmware fallback → not tracked.
-        let mut o = ObservedState::default();
-        o.thermal_mode = trusted(ThermalMode::Balanced);
+        let mut o = ObservedState {
+            thermal_mode: trusted(ThermalMode::Balanced),
+            ..Default::default()
+        };
         assert!(KeepAliveService::tracked(&o).is_empty());
 
         // Performance → tracked.
@@ -165,8 +167,10 @@ mod tests {
         assert_eq!(KeepAliveService::tracked(&o), vec![ReAssert::ThermalMode]);
 
         // Manual fan → tracked; auto fan → not.
-        let mut o = ObservedState::default();
-        o.fan_mode = trusted(FanMode::Manual(FanLevels::new(30, 30)));
+        let mut o = ObservedState {
+            fan_mode: trusted(FanMode::Manual(FanLevels::new(30, 30))),
+            ..Default::default()
+        };
         assert_eq!(KeepAliveService::tracked(&o), vec![ReAssert::FanLevels]);
         o.fan_mode = trusted(FanMode::FirmwareAuto);
         assert!(KeepAliveService::tracked(&o).is_empty());
@@ -177,17 +181,21 @@ mod tests {
         assert_eq!(KeepAliveService::tracked(&o), vec![ReAssert::FanLevels]);
 
         // Max fan on → tracked; off → not.
-        let mut o = ObservedState::default();
-        o.max_fan = trusted(true);
+        let mut o = ObservedState {
+            max_fan: trusted(true),
+            ..Default::default()
+        };
         assert_eq!(KeepAliveService::tracked(&o), vec![ReAssert::MaxFan]);
         o.max_fan = trusted(false);
         assert!(KeepAliveService::tracked(&o).is_empty());
 
         // All three at once.
-        let mut o = ObservedState::default();
-        o.thermal_mode = trusted(ThermalMode::Performance);
-        o.fan_mode = trusted(FanMode::Manual(FanLevels::new(30, 30)));
-        o.max_fan = trusted(true);
+        let o = ObservedState {
+            thermal_mode: trusted(ThermalMode::Performance),
+            fan_mode: trusted(FanMode::Manual(FanLevels::new(30, 30))),
+            max_fan: trusted(true),
+            ..Default::default()
+        };
         assert_eq!(
             KeepAliveService::tracked(&o),
             vec![ReAssert::ThermalMode, ReAssert::FanLevels, ReAssert::MaxFan]
@@ -198,8 +206,10 @@ mod tests {
     fn reschedule_and_due_math() {
         let mut ka = KeepAliveService::new();
         let t0 = Instant::now();
-        let mut o = ObservedState::default();
-        o.max_fan = trusted(true);
+        let o = ObservedState {
+            max_fan: trusted(true),
+            ..Default::default()
+        };
 
         ka.reschedule(&o, t0);
         assert!(!ka.is_due(t0));

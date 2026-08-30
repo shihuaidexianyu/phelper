@@ -282,6 +282,10 @@ pub fn run(args: OsPolicyArgs) -> Result<()> {
         OsPolicyCmd::Apply(args) => {
             let target = target(args.pid, args.tid)?;
             let policy = policy(&args, target)?;
+            // Install the graceful-exit path before the first mutation.  If
+            // handler installation fails, no process/thread state has yet
+            // been changed and therefore no restore obligation is lost.
+            let stop = ctrlc_flag()?;
             let result = handle.apply(target, policy)?;
             println!(
                 "applied {:?} to {}",
@@ -291,7 +295,6 @@ pub fn run(args: OsPolicyArgs) -> Result<()> {
             if result.gpu_requires_restart {
                 println!("GPU preference is a next-launch setting; restart the target process");
             }
-            let stop = ctrlc_flag()?;
             if args.hold == 0 {
                 eprintln!("holding until Ctrl+C (policy will be restored on exit)…");
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {

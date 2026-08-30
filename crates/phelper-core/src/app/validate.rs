@@ -40,8 +40,10 @@ mod tests {
             "description = \"d\"\n[power_limits]\npl1_w = 45\npl2_w = 90\npl4_w = 0\ncpu_gpu_concurrent_w = 0\n",
         )
         .unwrap();
-        let mut capabilities = CapabilitySet::default();
-        capabilities.power_limits = Support::Experimental;
+        let capabilities = CapabilitySet {
+            power_limits: Support::Experimental,
+            ..Default::default()
+        };
         assert!(profile_apply_gate(&profile, false, Some(&capabilities)).is_err());
         assert!(profile_apply_gate(&profile, true, Some(&capabilities)).is_ok());
     }

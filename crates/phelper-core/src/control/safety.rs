@@ -594,21 +594,23 @@ mod tests {
     }
 
     fn observed_manual(levels: FanLevels) -> ObservedState {
-        let mut o = ObservedState::default();
-        o.fan_mode = phelper_domain::state::ObservedValue::TrustedWrite {
-            value: FanMode::Manual(levels),
-            at: Instant::now(),
-        };
-        o
+        ObservedState {
+            fan_mode: phelper_domain::state::ObservedValue::TrustedWrite {
+                value: FanMode::Manual(levels),
+                at: Instant::now(),
+            },
+            ..Default::default()
+        }
     }
 
     fn observed_max_fan() -> ObservedState {
-        let mut o = ObservedState::default();
-        o.max_fan = phelper_domain::state::ObservedValue::TrustedWrite {
-            value: true,
-            at: Instant::now(),
-        };
-        o
+        ObservedState {
+            max_fan: phelper_domain::state::ObservedValue::TrustedWrite {
+                value: true,
+                at: Instant::now(),
+            },
+            ..Default::default()
+        }
     }
 
     fn observed_max_mode() -> ObservedState {
@@ -1083,16 +1085,18 @@ mod tests {
     #[test]
     fn performance_bounds_compare_against_verified_current_value() {
         let s = SafetySupervisor::new();
-        let mut observed = ObservedState::default();
-        observed.min_performance_ac = phelper_domain::state::ObservedValue::Verified {
-            value: 80,
-            at: Instant::now(),
-            source: "test",
-        };
-        observed.max_performance_ac = phelper_domain::state::ObservedValue::Verified {
-            value: 90,
-            at: Instant::now(),
-            source: "test",
+        let observed = ObservedState {
+            min_performance_ac: phelper_domain::state::ObservedValue::Verified {
+                value: 80,
+                at: Instant::now(),
+                source: "test",
+            },
+            max_performance_ac: phelper_domain::state::ObservedValue::Verified {
+                value: 90,
+                at: Instant::now(),
+                source: "test",
+            },
+            ..Default::default()
         };
         let invalid = CpuPolicy {
             max_performance_ac: Some(70),

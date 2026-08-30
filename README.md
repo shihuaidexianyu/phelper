@@ -14,12 +14,12 @@ phelper 只关注性能、功耗、散热和可观测性：把 CPU/GPU/风扇等
 - 应用调度：按进程/线程控制 P/E 核 CPU Sets、Affinity、QoS、优先级、内存优先级、理想处理器和下次启动的 GPU 首选项
 - 自动调度：可选的 BatteryEfficiency；确认电池供电后，对安全过滤的当前用户进程使用 E-core CPU Sets + EcoQoS，并在交流/退出时恢复
 - 配置档：内置 `silent`、`balanced`、`gaming`、`cpu-max`，以及用户 TOML 配置档
-- 桌面端：Rust + GPUI，单实例、管理员权限、最小化到托盘、快速启动；可选当前用户登录自启、OMEN 键映射和轻量悬浮窗
+- 桌面端：Rust + GPUI，单实例、管理员权限，只保留“概览”和“配置档”两个基本页面
 - 开发/验证 CLI：能力探测、实时遥测、控制命令和硬件验证工具
 
 ## 安全边界
 
-phelper 的控制 core 不把 UI 当作安全边界。所有写入都会经过能力检查和参数校验，并由单一 `ControlCoordinator` 串行执行。
+phelper 的控制 core 不把 UI 当作安全边界。所有硬件/固件性能写入都会经过能力检查和参数校验，并由单一 `ControlCoordinator` 串行执行。进程/线程级 Windows 调度使用独立的目标所有权与恢复账本。
 
 - 启动阶段默认只读，不会因为加载上次曲线而接管风扇
 - 只有本会话实际写过风扇或 Thermal Mode，退出时才会尝试恢复
@@ -53,15 +53,9 @@ board 8BAB
 在仓库根目录执行：
 
 ```powershell
-# 桌面端，包含已验证的实验性抽屉
-cargo build -p phelper-desktop --release --features experimental
+# 桌面端
+cargo build -p phelper-desktop --release
 .\target\release\phelper-desktop.exe
-```
-
-不编译实验性 CPU 功耗限制功能：
-
-```powershell
-cargo build -p phelper-desktop --release --no-default-features
 ```
 
 构建产物为 `target\release\phelper-desktop.exe`。PawnIO 的 `IntelMSR` 和 `IntelMCHBAR` 模块已经作为编译期资源嵌入 core，不需要把仓库中的 `assets` 目录复制到 exe 旁边。
@@ -118,7 +112,7 @@ cargo run -p phelper-cli -- os auto status
 cargo run -p phelper-cli -- os auto battery --hold 120
 ```
 
-桌面端对应的是“应用”页。常用的 P/E 核、QoS、优先级、内存和 GPU 首选项直接可选，Affinity、CPU Set ID 和理想处理器放在“高级”。完整边界见 [`docs/windows-os-policy.md`](docs/windows-os-policy.md)。
+这些调度能力目前只在 core 和开发 CLI 中提供，不属于精简后的桌面端。完整边界见 [`docs/windows-os-policy.md`](docs/windows-os-policy.md)。
 
 这里的“软件策略”不是一个模式按钮：EPP 是偏好，性能上下限是 PPM 范围约束，
 频率上限是 MHz 天花板，Boost 是睿频策略。它们写入当前 Windows 活动电源计划的
@@ -141,7 +135,7 @@ cargo run -p phelper-cli -- control fan auto
 cargo run -p phelper-cli --features experimental -- control power-limits --pl1 45 --pl2 90 --hold 120
 ```
 
-`--hold 120` 用于保持心跳；正常 Ctrl+C 或到期会走优雅退出路径。硬件验证 spike 命令只应按项目 runbook 在 reference machine 上执行。
+`--hold 120` 用于保持心跳；正常 Ctrl+C 或到期会走优雅退出路径。`--hold 0` 会在引擎启动前被拒绝，正常 CLI 不提供跳过恢复的路径。
 
 ## 用户数据
 
@@ -152,9 +146,7 @@ cargo run -p phelper-cli --features experimental -- control power-limits --pl1 4
 | `profiles\*.toml` | 用户配置档 |
 | `state\fan_curve.toml` | 最近一次明确应用的曲线，仅作为下次编辑来源 |
 | `state\control-journal.jsonl` | 控制写入和恢复日志 |
-| `settings.toml` | UI 设置 |
 | `logs\phelper-desktop.log` | 桌面端运行日志 |
-| `reports\` | 诊断报告导出 |
 
 用户配置档使用严格 TOML 解析，未知字段会被拒绝。可以先导出内置配置档作为模板：
 
@@ -177,7 +169,7 @@ architecture.md          架构基线与安全不变量
 docs/automatic-scheduling-architecture.md
                          自动调度专项架构与 Phase 1 实现边界
 docs/resident-desktop-integrations.md
-                         自启、OMEN 键映射和悬浮窗的边界与验收
+                         已撤下的常驻桌面集成历史设计
 ```
 
 core 不依赖 GPUI。桌面端只是读取 `AppState` 并提交命令，硬件访问、控制顺序、验证、心跳和恢复都由 core 负责。
@@ -191,7 +183,7 @@ cargo fmt --all -- --check
 cargo check --workspace --all-features
 cargo clippy --workspace --all-features -- -D warnings
 cargo test --workspace --all-features
-cargo build -p phelper-desktop --release --features experimental
+cargo build -p phelper-desktop --release
 ```
 
 完整架构、安全不变量和硬件证据记录在 [`architecture.md`](architecture.md)；reference machine 的可行性边界见 [`docs/feasibility-16-wf0032TX.md`](docs/feasibility-16-wf0032TX.md)。
@@ -200,15 +192,14 @@ cargo build -p phelper-desktop --release --features experimental
 
 - 目前不是通用 OMEN/Victus 控制器，只服务于 8BAB reference platform
 - 风扇当前读回的是实时 RPM/level，不是硬件内部的温度到转速曲线
-- Windows PPM 的细粒度参数已经进入 core、CLI 和性能页；Boost 仍可通过 profile/CLI
-  设置，界面只在“更多参数”中展示不常用的性能上下限，避免把主页面做成参数表
-- Windows OS 级应用调度已经进入 core、CLI 和“应用”页；CPU Sets 用 Windows 拓扑的
-  efficiency class 区分 P/E 核，Affinity 只作为显式高级选项
+- Windows PPM 的细粒度参数保留在 core 和 CLI；精简桌面端只通过配置档提交控制意图
+- Windows OS 级应用调度保留在 core 和 CLI；CPU Sets 用 Windows 拓扑的 efficiency
+  class 区分 P/E 核，Affinity 只作为显式高级选项
 - 电源感知自动调度已实现 `Off` / `BatteryEfficiency` 第一版；默认关闭，当前不持久化，
   仍需完成 reference machine 的功耗和兼容性 A/B/HIL 验证；设计边界见
   [`docs/automatic-scheduling-architecture.md`](docs/automatic-scheduling-architecture.md)
 - 不追踪游戏进程，也不提供帧率/帧时间采集；监控范围限定为硬件和 Windows 系统指标
 - MUX 显卡模式切换暂不提供：它需要重启，且不影响当前性能控制闭环；只保留必要的只读状态/能力记录
 - `0x29` CPU 功耗限制仍属于实验性能力，不包含在内置配置档中
-- 常驻桌面集成已实现自启、OMEN 键事件桥和悬浮窗；OMEN 实体键仍需在 reference machine
-  上完成实际按键 HIL 验证，未验证的设备不会假报支持
+- 自启、托盘、OMEN 键事件桥、悬浮窗和主题设置已从当前桌面产品中移除；如未来确有需求，
+  需重新经过独立的设计与验收

@@ -2,6 +2,9 @@
 
 状态：已审查，Phase A～E 已实现；实机 HIL 待完成
 日期：2026-08-28
+> 历史设计文档：自启、OMEN 键映射和悬浮窗实现已从当前精简桌面端移除。
+> 本文仅保留设计证据，不代表当前产品具备这些功能；重新引入必须重新评审和验收。
+
 适用平台：Windows 11，reference platform = OMEN 16-wf0032TX / board 8BAB
 
 本文设计三项用户能力：
@@ -597,5 +600,5 @@ OMEN 键动作选择只有动作名和当前值，不解释 WMI、pipe、Task Sc
 - OMEN event capability 的真实存在性必须先通过只读探测确认；
 - 任何未验证的事件 provider、键码或任务触发条件都只能是 `Unknown/Unsupported`。
 
-以上条件已满足，Phase A～E 的代码已落地；未验证的物理 OMEN 键行为仍保持为
+以下内容记录当时的验收目标，不代表当前代码状态；物理 OMEN 键行为仍保持为
 待 HIL 结论，不在文档或 UI 中假报成功。

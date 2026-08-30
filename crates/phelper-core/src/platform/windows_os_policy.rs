@@ -339,10 +339,8 @@ impl OsPolicyHandle {
             if !had_baseline {
                 inner.baselines.remove(&target);
             }
-            if gpu_ledger_new {
-                if let Some(key) = &gpu_key {
-                    inner.gpu_baselines.remove(key);
-                }
+            if gpu_ledger_new && let Some(key) = &gpu_key {
+                inner.gpu_baselines.remove(key);
             }
             inner.recovery_pending.remove(&target);
             return Err(error);
@@ -1680,12 +1678,10 @@ fn restore_process_handle(
     }
     if b.affinity.available
         && let Some(affinity) = b.affinity.value
-    {
-        if let Err(error) = unsafe { SetProcessAffinityMask(handle, affinity.mask as usize) }
+        && let Err(error) = unsafe { SetProcessAffinityMask(handle, affinity.mask as usize) }
             .map_err(|e| os_error("SetProcessAffinityMask(restore)", e))
-        {
-            first_error.get_or_insert(error);
-        }
+    {
+        first_error.get_or_insert(error);
     }
     if b.qos.available
         && let Some(qos) = b.qos.value
@@ -1705,12 +1701,10 @@ fn restore_process_handle(
     }
     if b.priority.available
         && let Some(priority) = b.priority.value
-    {
-        if let Err(error) = unsafe { SetPriorityClass(handle, PROCESS_CREATION_FLAGS(priority)) }
+        && let Err(error) = unsafe { SetPriorityClass(handle, PROCESS_CREATION_FLAGS(priority)) }
             .map_err(|e| os_error("SetPriorityClass(restore)", e))
-        {
-            first_error.get_or_insert(error);
-        }
+    {
+        first_error.get_or_insert(error);
     }
     if b.memory_priority.available
         && let Some(priority) = b.memory_priority.value
@@ -1734,10 +1728,9 @@ fn restore_process_handle(
     if restore_gpu
         && b.gpu_preference.available
         && let Some(path) = &b.executable
+        && let Err(error) = restore_gpu_preference(path, b.gpu_preference.value.as_ref())
     {
-        if let Err(error) = restore_gpu_preference(path, b.gpu_preference.value.as_ref()) {
-            first_error.get_or_insert(error);
-        }
+        first_error.get_or_insert(error);
     }
     first_error.map_or(Ok(()), Err)
 }
@@ -1774,12 +1767,10 @@ fn restore_thread_handle(handle: HANDLE, b: &ThreadBaseline) -> Result<(), Platf
     }
     if b.priority.available
         && let Some(priority) = b.priority.value
-    {
-        if let Err(error) = unsafe { SetThreadPriority(handle, THREAD_PRIORITY(priority)) }
+        && let Err(error) = unsafe { SetThreadPriority(handle, THREAD_PRIORITY(priority)) }
             .map_err(|e| os_error("SetThreadPriority(restore)", e))
-        {
-            first_error.get_or_insert(error);
-        }
+    {
+        first_error.get_or_insert(error);
     }
     if b.memory_priority.available
         && let Some(priority) = b.memory_priority.value

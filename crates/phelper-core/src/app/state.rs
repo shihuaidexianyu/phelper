@@ -98,6 +98,15 @@ impl AppState {
     pub fn apply_outcome(&mut self, knob: KnobId, outcome: ControlOutcome) {
         let at = super::now_epoch_ms();
         let status = match &outcome.status {
+            ControlStatus::Applied {
+                verification: Verification::Failed { expected, actual },
+            } => KnobStatus::Failed {
+                error: ControlError::VerificationFailed {
+                    expected: expected.clone(),
+                    actual: actual.clone(),
+                },
+                at_epoch_ms: at,
+            },
             ControlStatus::Applied { verification } => KnobStatus::Applied {
                 verification: verification.clone(),
                 at_epoch_ms: at,
@@ -187,6 +196,27 @@ mod tests {
                 error: ControlError::Busy,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn failed_verification_is_not_presented_as_applied() {
+        let mut s = AppState::default();
+        s.apply_outcome(
+            KnobId::Profile,
+            outcome(ControlStatus::Applied {
+                verification: Verification::Failed {
+                    expected: "requested".into(),
+                    actual: "unchanged".into(),
+                },
+            }),
+        );
+        assert!(matches!(
+            s.knob_status(KnobId::Profile),
+            KnobStatus::Failed {
+                error: ControlError::VerificationFailed { expected, actual },
+                ..
+            } if expected == "requested" && actual == "unchanged"
         ));
     }
 
