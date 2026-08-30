@@ -7,11 +7,11 @@
 //!
 //! Loop (up to 100 ms idle cadence):
 //! 1. telemetry snapshots (drain to latest);
-//! 2. UI messages (Dispatch / RefreshProfiles / Shutdown); the pump waits on
+//! 2. UI messages (Dispatch / Shutdown); the pump waits on
 //!    this channel, so a control request wakes it immediately;
 //! 3. coalescer poll → dispatch through `ControlHandle` (Busy → backoff);
 //! 4. in-flight outcome sweep → evidence + desired/observed refresh;
-//! 5. ~2 s desired/observed refresh; ~1 s journal tail.
+//! 5. ~2 s desired/observed refresh.
 //!
 //! Shutdown is the AR-12 load-bearing path: `AppHandle::shutdown()` blocks
 //! until `Engine::shutdown()` has restored firmware automatic state.
@@ -20,36 +20,17 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock, mpsc};
 use std::time::{Duration, Instant};
 
-use phelper_domain::automatic::AutomaticMode;
 use phelper_domain::command::{ControlCommand, ControlOutcome};
 use phelper_domain::error::ControlError;
-use phelper_domain::os_policy::{OsPolicyTarget, OsSchedulingPolicy};
-use phelper_domain::resident::ResidentSnapshot;
-use phelper_domain::telemetry::{MetricId, MetricSample, WindowStats};
 
 use crate::Engine;
-use crate::automatic_scheduler::AutomaticSchedulerHandle;
-use crate::os_policy::OsPolicyHandle;
-use crate::telemetry::TelemetryHandle;
 
 use super::coalesce::{BusyVerdict, Coalescer};
-use super::journal_tail::JournalTail;
-use super::state::{AppState, EngineStatus, ExperimentalUi, KnobId, KnobStatus};
+use super::state::{AppState, EngineStatus, KnobId, KnobStatus};
 use super::{now_epoch_ms, validate};
 
 enum PumpMsg {
     Dispatch(KnobId, ControlCommand),
-    RefreshProfiles,
-    RefreshOsData,
-    ApplyOsPolicy {
-        target: OsPolicyTarget,
-        policy: OsSchedulingPolicy,
-    },
-    RestoreOsPolicy(OsPolicyTarget),
-    SetAutomaticMode(AutomaticMode),
-    RefreshAutomatic,
-    SetResident(ResidentSnapshot),
-    SetOverlayVisible(bool),
     Shutdown(mpsc::Sender<()>),
 }
 
@@ -66,8 +47,7 @@ pub trait StatePublisher: Send + Sync + 'static {
     /// notify and let observer-side fingerprints filter.
     fn update(&self, apply: Box<dyn FnOnce(&mut AppState) + Send>);
 
-    /// Snapshot the current state for read-only callers (e.g. dispatch_gate
-    /// validating a profile apply; the resident worker reading `desired.profile`).
+    /// Snapshot the current state for profile validation and UI reads.
     fn snapshot(&self) -> AppState;
 }
 
@@ -125,7 +105,6 @@ impl StatePublisher for RwLockStatePublisher {
 pub struct AppHandle {
     publisher: Arc<dyn StatePublisher>,
     to_pump: mpsc::Sender<PumpMsg>,
-    telemetry: Arc<RwLock<Option<TelemetryHandle>>>,
 }
 
 impl AppHandle {
@@ -133,111 +112,29 @@ impl AppHandle {
     /// publisher is shared with the pump; every `dispatch` / `set_*` path
     /// that used to mutate the AppState lock now flows through the publisher
     /// (which, in production, is a GPUI `Entity<AppState>` bridge).
-    pub fn start_with_publisher(publisher: Arc<dyn StatePublisher>, scan_ogh: bool) -> Self {
+    pub fn start_with_publisher(publisher: Arc<dyn StatePublisher>) -> Self {
         let (to_pump, rx) = mpsc::channel();
-        let telemetry = Arc::new(RwLock::new(None));
         let handle = Self {
             publisher: Arc::clone(&publisher),
             to_pump,
-            telemetry: Arc::clone(&telemetry),
         };
         std::thread::Builder::new()
             .name("app-pump".into())
-            .spawn(move || pump_main(publisher, rx, telemetry, scan_ogh))
+            .spawn(move || pump_main(publisher, rx))
             .expect("spawn app-pump thread");
         handle
     }
 
-    /// The current immutable snapshot (one clone per UI tick). UI callers
-    /// should prefer holding the publisher's `Entity<AppState>` directly
-    /// and observing it — `state()` is here for std::thread callers (the
-    /// resident worker, the dispatch_gate).
+    /// The current immutable snapshot. The desktop shell keeps a local copy
+    /// updated by the publisher and uses this once during construction.
     pub fn state(&self) -> AppState {
         self.publisher.snapshot()
-    }
-
-    /// Underlying publisher handle (advanced use — typically only the UI
-    /// shell holds the Entity<AppState> directly).
-    pub fn publisher(&self) -> Arc<dyn StatePublisher> {
-        Arc::clone(&self.publisher)
     }
 
     /// Enqueue a user intent. Validation happens UI-side first (validate.rs),
     /// and the pump re-applies the command-level gates before dispatch.
     pub fn dispatch(&self, knob: KnobId, cmd: ControlCommand) {
         let _ = self.to_pump.send(PumpMsg::Dispatch(knob, cmd));
-    }
-
-    pub fn refresh_profiles(&self) {
-        let _ = self.to_pump.send(PumpMsg::RefreshProfiles);
-    }
-
-    /// Refresh the process picker and the lazy CPU topology query.  It is
-    /// explicit so process enumeration never slows the first screen.
-    pub fn refresh_os_data(&self) {
-        let _ = self.to_pump.send(PumpMsg::RefreshOsData);
-    }
-
-    /// Apply a Windows process/thread policy through the engine-owned core
-    /// service.  The UI never opens a Windows handle itself.
-    pub fn apply_os_policy(&self, target: OsPolicyTarget, policy: OsSchedulingPolicy) {
-        let _ = self.to_pump.send(PumpMsg::ApplyOsPolicy { target, policy });
-    }
-
-    pub fn restore_os_policy(&self, target: OsPolicyTarget) {
-        let _ = self.to_pump.send(PumpMsg::RestoreOsPolicy(target));
-    }
-
-    /// Select the power-aware automatic scheduling mode.  The core worker is
-    /// idle until this explicit intent is sent.
-    pub fn set_automatic_mode(&self, mode: AutomaticMode) {
-        let _ = self.to_pump.send(PumpMsg::SetAutomaticMode(mode));
-    }
-
-    pub fn refresh_automatic(&self) {
-        let _ = self.to_pump.send(PumpMsg::RefreshAutomatic);
-    }
-
-    /// Publish resident integration state through the same app-pump read
-    /// model used by the UI. The platform work itself remains off the UI
-    /// thread.
-    pub fn set_resident_snapshot(&self, resident: ResidentSnapshot) {
-        let _ = self.to_pump.send(PumpMsg::SetResident(resident));
-    }
-
-    /// Update only the read-model visibility bit.  Overlay show/hide itself
-    /// belongs to the desktop shell; this keeps the resident worker from
-    /// racing a stale full snapshot over the user's current visibility.
-    pub fn set_overlay_visible(&self, visible: bool) {
-        let _ = self.to_pump.send(PumpMsg::SetOverlayVisible(visible));
-    }
-
-    /// §39 passthrough for charts (never a hardware call — the store).
-    pub fn history(&self, id: MetricId, window: Duration) -> Vec<MetricSample> {
-        self.telemetry
-            .read()
-            .expect("telemetry slot poisoned")
-            .as_ref()
-            .map(|t| t.history(id, window))
-            .unwrap_or_default()
-    }
-
-    pub fn stats(&self, id: MetricId, window: Duration) -> Option<WindowStats> {
-        self.telemetry
-            .read()
-            .expect("telemetry slot poisoned")
-            .as_ref()
-            .and_then(|t| t.stats(id, window))
-    }
-
-    /// Per-collector worst scheduling lateness (diagnostics page).
-    pub fn scheduler_jitter(&self) -> std::collections::BTreeMap<&'static str, Duration> {
-        self.telemetry
-            .read()
-            .expect("telemetry slot poisoned")
-            .as_ref()
-            .map(|t| t.scheduler_jitter())
-            .unwrap_or_default()
     }
 
     /// AR-12 graceful shutdown: restores firmware automatic state, then
@@ -250,17 +147,8 @@ impl AppHandle {
     }
 }
 
-fn pump_main(
-    publisher: Arc<dyn StatePublisher>,
-    rx: mpsc::Receiver<PumpMsg>,
-    telemetry_slot: Arc<RwLock<Option<TelemetryHandle>>>,
-    scan_ogh: bool,
-) {
-    let engine = match if scan_ogh {
-        Engine::start()
-    } else {
-        Engine::start_without_ogh_scan()
-    } {
+fn pump_main(publisher: Arc<dyn StatePublisher>, rx: mpsc::Receiver<PumpMsg>) {
+    let engine = match Engine::start_without_ogh_scan() {
         Ok(e) => Some(e),
         Err(e) => {
             let message = e.to_string();
@@ -275,33 +163,21 @@ fn pump_main(
         return;
     };
     let control = engine.control().cloned();
-    let os_policy = engine.os_policy().clone();
-    let automatic = engine.automatic_scheduler().clone();
-    *telemetry_slot.write().expect("telemetry slot poisoned") = Some(engine.telemetry().clone());
-    let mut registry = crate::profiles::ProfileRegistry::load_default();
+    // The remaining UI exposes built-ins only, so do not scan user profile
+    // files a second time after Engine startup.
+    let registry = crate::profiles::ProfileRegistry::with_builtins();
 
     // Initial state: clone every Arc-shaped handle into the closure so the
     // 'static-bound on `Box<dyn FnOnce + Send>` is satisfied without
     // borrowing the pump's stack-frames.
-    let identity = engine.identity().clone();
-    let ogh_findings = engine.ogh_findings().to_vec();
-    let os_policy_init = os_policy.clone();
-    let automatic_init = automatic.clone();
     let control_init = control.clone();
     let registry_init = registry.clone();
     publisher.update(Box::new(move |s| {
-        s.identity = Some(identity);
-        s.ogh_findings = ogh_findings;
-        s.os_policy = os_policy_init.snapshot();
-        s.automatic = automatic_init.snapshot();
         if let Some(c) = control_init {
             let caps = c.capabilities().clone();
-            s.experimental = ExperimentalUi::compute(Some(&caps));
             s.caps = Some(caps);
             s.desired = c.desired();
             s.observed = c.observed();
-            s.windows_ppm = c.windows_ppm_state();
-            s.last_saved_fan_curve = c.last_saved_fan_curve();
             s.engine = EngineStatus::Running;
         } else {
             s.engine = EngineStatus::TelemetryOnly;
@@ -309,44 +185,21 @@ fn pump_main(
         s.set_profiles(&registry_init);
     }));
 
-    let mut ogh_scan = (!scan_ogh).then(|| {
-        std::thread::Builder::new()
-            .name("ogh-watch".into())
-            .spawn(|| {
-                // Diagnostic-only work: let the first usable state settle
-                // before the WMI and registry scan runs in the background.
-                std::thread::sleep(Duration::from_secs(2));
-                crate::platform::ogh_watch::scan()
-            })
-            .expect("spawn ogh-watch")
-    });
-
     let snap_rx = engine.telemetry().subscribe();
     let mut engine = Some(engine);
     let mut coalescer = Coalescer::new();
     let mut in_flight: BTreeMap<u64, (KnobId, mpsc::Receiver<ControlOutcome>)> = BTreeMap::new();
-    let mut journal = JournalTail::default_journal();
     let mut last_state_refresh = Instant::now() - Duration::from_secs(60);
-    let mut last_journal = Instant::now() - Duration::from_secs(60);
     let mut last_observed_reprobe = Instant::now();
 
     loop {
-        if ogh_scan.as_ref().is_some_and(|scan| scan.is_finished())
-            && let Some(scan) = ogh_scan.take()
-        {
-            let findings = scan.join().unwrap_or_default();
-            publisher.update(Box::new(move |s| {
-                s.ogh_findings = findings;
-            }));
-        }
-
         // v0.2-e: stage timing. The M6 HIL saw ONE ~38 s window-close whose
         // root cause was never isolated (every call in this loop is
         // non-blocking by audit). Any iteration over SLOW_ITER logs its
         // per-stage durations — a recurrence names the stage in the log.
         const SLOW_ITER: Duration = Duration::from_secs(2);
         let iter_start = Instant::now();
-        let mut stages = [Duration::ZERO; 6];
+        let mut stages = [Duration::ZERO; 4];
 
         // 1. Telemetry: drain to the latest snapshot only. Do not wait on
         // this channel: waiting here used to make a user command sit behind
@@ -390,25 +243,16 @@ fn pump_main(
         };
         match rx.recv_timeout(ui_wait) {
             Ok(msg) => {
-                shutdown_ack = handle_pump_msg(
-                    msg,
-                    &publisher,
-                    &mut registry,
-                    &mut coalescer,
-                    control.as_ref(),
-                    &os_policy,
-                    &automatic,
-                );
+                shutdown_ack =
+                    handle_pump_msg(msg, &publisher, &registry, &mut coalescer, control.as_ref());
                 if shutdown_ack.is_none() {
                     while let Ok(msg) = rx.try_recv() {
                         shutdown_ack = handle_pump_msg(
                             msg,
                             &publisher,
-                            &mut registry,
+                            &registry,
                             &mut coalescer,
                             control.as_ref(),
-                            &os_policy,
-                            &automatic,
                         );
                         if shutdown_ack.is_some() {
                             break;
@@ -436,15 +280,6 @@ fn pump_main(
             let _ = ack.send(());
             return;
         }
-        let os_policy_step = os_policy.clone();
-        let automatic_step = automatic.clone();
-        publisher.update(Box::new(move |s| {
-            // The automatic worker and manual UI share one OS-policy ledger.
-            // Snapshot both read models together so owner changes made by
-            // the worker cannot leave the app/API with a stale active list.
-            s.os_policy = os_policy_step.snapshot();
-            s.automatic = automatic_step.snapshot();
-        }));
         stages[1] = t.elapsed();
         let t = Instant::now();
 
@@ -549,14 +384,9 @@ fn pump_main(
                 publisher.update(Box::new(move |s| {
                     s.desired = c.desired();
                     s.observed = c.observed();
-                    s.windows_ppm = c.windows_ppm_state();
-                    s.last_saved_fan_curve = c.last_saved_fan_curve();
                 }));
             }
         }
-        stages[3] = t.elapsed();
-        let t = Instant::now();
-
         // 5. Periodic desired/observed refresh (~2 s).
         if last_state_refresh.elapsed() >= Duration::from_secs(2) {
             last_state_refresh = Instant::now();
@@ -564,8 +394,6 @@ fn pump_main(
                 publisher.update(Box::new(move |s| {
                     s.desired = c.desired();
                     s.observed = c.observed();
-                    s.windows_ppm = c.windows_ppm_state();
-                    s.last_saved_fan_curve = c.last_saved_fan_curve();
                 }));
             }
         }
@@ -580,20 +408,7 @@ fn pump_main(
                 c.refresh_observed();
             }
         }
-        stages[4] = t.elapsed();
-        let t = Instant::now();
-
-        // 6. Journal live tail (~1 s; cross-process — CLI writes show up).
-        if last_journal.elapsed() >= Duration::from_secs(1) {
-            last_journal = Instant::now();
-            let entries = journal.poll();
-            if !entries.is_empty() {
-                publisher.update(Box::new(move |s| {
-                    s.apply_journal(entries);
-                }));
-            }
-        }
-        stages[5] = t.elapsed();
+        stages[3] = t.elapsed();
 
         let total = iter_start.elapsed();
         if total > SLOW_ITER {
@@ -602,9 +417,7 @@ fn pump_main(
                 snap_ms = stages[0].as_millis(),
                 ui_msgs_ms = stages[1].as_millis(),
                 dispatch_ms = stages[2].as_millis(),
-                sweep_ms = stages[3].as_millis(),
-                refresh_ms = stages[4].as_millis(),
-                journal_ms = stages[5].as_millis(),
+                state_ms = stages[3].as_millis(),
                 "app-pump iteration exceeded 2 s — stage timings above"
             );
         }
@@ -617,11 +430,9 @@ fn pump_main(
 fn handle_pump_msg(
     msg: PumpMsg,
     publisher: &Arc<dyn StatePublisher>,
-    registry: &mut crate::profiles::ProfileRegistry,
+    registry: &crate::profiles::ProfileRegistry,
     coalescer: &mut Coalescer,
     control: Option<&crate::control::ControlHandle>,
-    os_policy: &OsPolicyHandle,
-    automatic: &AutomaticSchedulerHandle,
 ) -> Option<mpsc::Sender<()>> {
     match msg {
         PumpMsg::Dispatch(knob, cmd) => {
@@ -643,105 +454,6 @@ fn handle_pump_msg(
                     }));
                 }
             }
-            None
-        }
-        PumpMsg::RefreshProfiles => {
-            *registry = crate::profiles::ProfileRegistry::load_default();
-            if let Some(control) = control {
-                control.replace_profiles(registry.clone());
-            }
-            let snapshot = registry.clone();
-            publisher.update(Box::new(move |s| {
-                s.set_profiles(&snapshot);
-            }));
-            None
-        }
-        PumpMsg::RefreshOsData => {
-            let topology = os_policy.topology();
-            let processes = os_policy.list_processes();
-            publisher.update(Box::new(move |s| {
-                match topology {
-                    Ok(topology) => s.os_policy.topology = Some(topology),
-                    Err(error) => s.os_policy_error = Some(error.to_string()),
-                }
-                match processes {
-                    Ok(processes) => {
-                        s.os_processes = Arc::new(processes);
-                        if s.os_policy_error.is_some() && s.os_policy.topology.is_some() {
-                            s.os_policy_error = None;
-                        }
-                    }
-                    Err(error) => s.os_policy_error = Some(error.to_string()),
-                }
-            }));
-            None
-        }
-        PumpMsg::ApplyOsPolicy { target, policy } => {
-            let os_policy = os_policy.clone();
-            match os_policy.apply(target, policy) {
-                Ok(_) => {
-                    publisher.update(Box::new(move |s| {
-                        s.os_policy = os_policy.snapshot();
-                        s.os_policy_error = None;
-                    }));
-                }
-                Err(error) => {
-                    publisher.update(Box::new(move |s| {
-                        s.os_policy_error = Some(error.to_string());
-                    }));
-                }
-            }
-            None
-        }
-        PumpMsg::RestoreOsPolicy(target) => {
-            let os_policy = os_policy.clone();
-            match os_policy.restore(target) {
-                Ok(_) => {
-                    publisher.update(Box::new(move |s| {
-                        s.os_policy = os_policy.snapshot();
-                        s.os_policy_error = None;
-                    }));
-                }
-                Err(error) => {
-                    publisher.update(Box::new(move |s| {
-                        s.os_policy_error = Some(error.to_string());
-                    }));
-                }
-            }
-            None
-        }
-        PumpMsg::SetAutomaticMode(mode) => {
-            automatic.set_mode(mode);
-            let automatic = automatic.clone();
-            publisher.update(Box::new(move |s| {
-                s.automatic = automatic.snapshot();
-            }));
-            None
-        }
-        PumpMsg::RefreshAutomatic => {
-            automatic.refresh();
-            let automatic = automatic.clone();
-            publisher.update(Box::new(move |s| {
-                s.automatic = automatic.snapshot();
-            }));
-            None
-        }
-        PumpMsg::SetResident(mut resident) => {
-            // The resident worker publishes capability/autostart changes in
-            // the background. Preserve the shell-owned overlay bit when a
-            // full worker snapshot crosses the pump at the same time as a
-            // tray/OMEN visibility action.
-            let overlay_visible = publisher.snapshot().resident.overlay_visible;
-            resident.overlay_visible = overlay_visible;
-            publisher.update(Box::new(move |s| {
-                s.set_resident(resident);
-            }));
-            None
-        }
-        PumpMsg::SetOverlayVisible(visible) => {
-            publisher.update(Box::new(move |s| {
-                s.set_overlay_visible(visible);
-            }));
             None
         }
         PumpMsg::Shutdown(ack) => Some(ack),
@@ -810,11 +522,11 @@ mod tests {
         let pub_ = RwLockStatePublisher::new(Arc::clone(&state));
         assert_eq!(pub_.version(), 0);
         pub_.update(Box::new(|s| {
-            s.set_knob(KnobId::ThermalMode, KnobStatus::InFlight(ControlReceipt(7)));
+            s.set_knob(KnobId::Profile, KnobStatus::InFlight(ControlReceipt(7)));
         }));
         assert_eq!(pub_.version(), 1);
         assert!(matches!(
-            pub_.snapshot().knob_status(KnobId::ThermalMode),
+            pub_.snapshot().knob_status(KnobId::Profile),
             KnobStatus::InFlight(_)
         ));
     }
@@ -826,7 +538,7 @@ mod tests {
         let v0 = pub_.version();
         pub_.update(Box::new(|s| {
             s.apply_outcome(
-                KnobId::EppAc,
+                KnobId::Profile,
                 outcome(ControlStatus::Applied {
                     verification: Verification::Verified,
                 }),
@@ -840,7 +552,7 @@ mod tests {
             // A no-op apply (no field touched) still bumps the version — by
             // design. The observer's own fingerprint is the gate that
             // prevents wasted repaints, not the publisher.
-            let _ = s.identity.is_some();
+            let _ = &s.engine;
         }));
         assert!(pub_.version() > v1);
     }
@@ -866,6 +578,9 @@ mod tests {
         assert_eq!(snap_a.engine, EngineStatus::Running);
         // Versions agree across handles (shared counter).
         assert_eq!(a.version(), b.version());
-        assert_eq!(version.load(std::sync::atomic::Ordering::Acquire), a.version());
+        assert_eq!(
+            version.load(std::sync::atomic::Ordering::Acquire),
+            a.version()
+        );
     }
 }

@@ -16,6 +16,5 @@ pub mod os_policy;
 pub mod policy;
 pub mod ports;
 pub mod profile;
-pub mod resident;
 pub mod state;
 pub mod telemetry;

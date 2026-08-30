@@ -4,7 +4,6 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 description = "GPUI desktop shell for phelper (OMEN 16-wf0032TX / board 8BAB). Self-elevating (runas relaunch) — see below."
-build = "build.rs"
 
 # The requireAdministrator manifest this crate would need is impossible:
 # gpui.lib force-embeds its own asInvoker RT_MANIFEST resource (gpui's
@@ -16,25 +15,13 @@ build = "build.rs"
 # final process is always elevated, same UAC-at-launch UX as a manifest.
 # Upside: `cargo run -p phelper-desktop` works from ANY shell.
 #
-# [[bin]] test/bench are disabled anyway: this crate carries ZERO unit
-# tests (all logic lives in phelper-core::app and is tested there).
+# Keep the binary test harness enabled: the desktop's state bridge has a
+# small unit-testable contract even though rendering remains integration QA.
 [[bin]]
 name = "phelper-desktop"
 path = "src/main.rs"
-test = false
+test = true
 bench = false
-
-[features]
-# The desktop app ships WITH the verified-experimental drawers (0x29 power
-# limits / read-only EC diagnostics) — this is the user's own reference
-# machine and both passed on-device verification (M3/M4). Build with
-# --no-default-features for the stable configuration whose experimental
-# drawer is compiled out (HIL gating check).
-default = ["experimental"]
-experimental = [
-    "phelper-core/experimental-hp-power-limits",
-    "phelper-core/experimental-ec",
-]
 
 [dependencies]
 phelper-core = { path = "../../crates/phelper-core", features = ["control"] }
@@ -61,24 +48,13 @@ futures = { version = "0.3", default-features = false, features = ["async-await"
 gpui = { git = "https://github.com/zed-industries/zed.git" }
 gpui_platform = { git = "https://github.com/zed-industries/zed.git" }
 gpui-component = { git = "https://github.com/longbridge/gpui-component.git", rev = "0bfcb640235b7f76c4f764c2fa6454be4cf4711a" }
-# Tray (architecture.md §45: GPUI ships no tray support; tray-icon fills it).
-tray-icon = "0.21"
-# HWND extraction from gpui::Window (tray show/hide targets the raw handle).
-raw-window-handle = "0.6"
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 
-[build-dependencies]
-# The generated resource contains only the app icon. GPUI already owns the
-# manifest resource, so this deliberately does not add a second manifest.
-embed-resource = "3.0"
-
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
-    "Win32_Security",
     "Win32_System_Threading",
-    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }

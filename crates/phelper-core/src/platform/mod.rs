@@ -19,5 +19,4 @@ pub(crate) mod windows_pdh;
 pub(crate) mod windows_power;
 pub(crate) mod windows_ppm;
 #[cfg(windows)]
-pub mod windows_resident;
 pub(crate) mod wmi_util;

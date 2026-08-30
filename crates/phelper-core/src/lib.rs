@@ -14,7 +14,6 @@ pub mod os_policy;
 pub mod persistence;
 mod platform;
 pub mod profiles;
-pub mod resident;
 pub mod smoke;
 pub mod telemetry;
 

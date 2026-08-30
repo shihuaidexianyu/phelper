@@ -1,7 +1,3 @@
-//! Reusable display widgets. Pure presentation: `&AppState`/samples in,
-//! element trees out (plan D-F). No hardware, no handles beyond read-only
-//! passthrough.
+//! Reusable presentation widgets for the minimal overview.
 
-pub mod knob_row;
 pub mod metric_card;
-pub mod trend_chart;
