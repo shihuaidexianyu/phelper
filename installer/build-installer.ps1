@@ -17,7 +17,7 @@ if ([string]::IsNullOrWhiteSpace($BuildDir)) {
 if (-not $SkipBuild) {
     Push-Location $repoRoot
     try {
-        cargo build -p phelper-desktop --release --features experimental
+        cargo build -p phelper-desktop --release
         if ($LASTEXITCODE -ne 0) {
             throw "release build failed with exit code $LASTEXITCODE"
         }

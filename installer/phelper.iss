@@ -32,6 +32,7 @@ OutputBaseFilename=phelper-Setup-{#MyAppVersion}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=..\apps\desktop\assets\phelper.ico
 CloseApplications=no
 RestartApplications=no
 UninstallDisplayName={#MyAppName}
