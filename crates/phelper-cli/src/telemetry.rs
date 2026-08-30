@@ -118,8 +118,8 @@ pub fn run(args: TelemetryArgs) -> Result<()> {
         ids::GPU_TEMP_C,
         ids::GPU_POWER_W,
         ids::GPU_CORE_CLOCK_MHZ,
-        ids::FAN_CPU_RPM,
-        ids::FAN_GPU_RPM,
+        ids::FAN_LEFT_RPM,
+        ids::FAN_RIGHT_RPM,
     ] {
         match handle.stats(id, window) {
             Some(st) => eprintln!(

@@ -119,8 +119,8 @@ fn print_report(r: &ProbeReport) {
         println!("  num_fans={} entries={}", t.num_fans, t.entries.len());
         for (i, e) in t.entries.iter().enumerate() {
             println!(
-                "    [{i}] cpu={} gpu={} noise={}dB",
-                e.cpu, e.gpu, e.noise_db
+                "    [{i}] left={} right={} noise={}dB",
+                e.left, e.right, e.noise_db
             );
         }
         println!("  clamp: {:?}", t.clamp_range());
@@ -128,11 +128,11 @@ fn print_report(r: &ProbeReport) {
     if let Some(l) = &r.fan_levels {
         println!("\n-- fan levels (0x2D) --");
         println!(
-            "  cpu={} ({} RPM) gpu={} ({} RPM)",
-            l.cpu,
-            l.cpu_rpm(),
-            l.gpu,
-            l.gpu_rpm()
+            "  left={} ({} RPM) right={} ({} RPM)",
+            l.left,
+            l.left_rpm(),
+            l.right,
+            l.right_rpm()
         );
     }
     if let Some(p) = &r.gpu_platform_policy {

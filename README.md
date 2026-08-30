@@ -1,76 +1,95 @@
 # phelper
 
-面向 HP OMEN 笔记本的轻量性能控制与硬件遥测工具。
+phelper 是一个面向特定 HP OMEN 笔记本的轻量性能控制与硬件遥测工具，使用 Rust 和 GPUI 构建。
 
-phelper 只关注性能、功耗、散热和可观测性：把 CPU/GPU/风扇等状态集中展示，并通过能力探测、单写入者、校验、心跳和退出恢复控制硬件状态。它不是 OMEN Gaming Hub 的完整替代品，也不包含商城、账号、云服务或 RGB 编辑器。
+它只做三件事：展示必要的 CPU、GPU 和风扇状态，通过少量经过验证的配置档切换性能策略，以及在系统托盘中可靠常驻。它不是 OMEN Gaming Hub 的完整替代品，也不包含账号、商城、云服务、RGB、游戏库等功能。
 
-> 当前只对 **OMEN Gaming Laptop 16-wf0032TX（SKU 81L09PA，board 8BAB）** 做过完整验证。其他 OMEN/Victus 机型不在承诺支持范围内；未知 board 默认保持只读。
+> [!WARNING]
+> 当前产品只支持 **OMEN Gaming Laptop 16-wf0032TX（SKU 81L09PA，board 8BAB）**。桌面端和控制 Engine 会拒绝未知主板；只读探测命令能够运行，不代表设备受到支持。
 
-## 功能
+## 当前界面
 
-- CPU：温度、功率、有效频率、利用率，以及 Windows PPM 的 EPP、E-core EPP、频率上限、性能上下限和 AC/DC Boost
-- GPU：温度、功率、利用率、频率、显存和功耗上限
-- 散热：CPU/GPU 风扇转速、HP Thermal Mode、最大风扇、手动风扇和软件风扇曲线
-- 应用调度：按进程/线程控制 P/E 核 CPU Sets、Affinity、QoS、优先级、内存优先级、理想处理器和下次启动的 GPU 首选项
-- 自动调度：可选的 BatteryEfficiency；确认电池供电后，对安全过滤的当前用户进程使用 E-core CPU Sets + EcoQoS，并在交流/退出时恢复
-- 配置档：内置 `silent`、`balanced`、`gaming`、`cpu-max`，以及用户 TOML 配置档
-- 桌面端：Rust + GPUI，单实例、管理员权限，只保留“概览”和“配置档”两个基本页面
-- 开发/验证 CLI：能力探测、实时遥测、控制命令和硬件验证工具
+桌面端刻意保持最小化，目前只有三个页面：
 
-## 安全边界
+- **概览**：CPU 温度、功率、利用率，GPU 温度、功率、利用率，以及左/右风扇转速和当前风扇模式。
+- **配置档**：应用四个内置配置档。它是桌面端唯一的写入入口。
+- **设置**：只包含开机启动开关。
 
-phelper 的控制 core 不把 UI 当作安全边界。所有硬件/固件性能写入都会经过能力检查和参数校验，并由单一 `ControlCoordinator` 串行执行。进程/线程级 Windows 调度使用独立的目标所有权与恢复账本。
+风扇按机身物理位置标为左、右。8BAB 固件会分别校准两个通道，因此同型号风扇的实时转速不必完全相同。
 
-- 启动阶段默认只读，不会因为加载上次曲线而接管风扇
-- 只有本会话实际写过风扇或 Thermal Mode，退出时才会尝试恢复
-- 手动风扇和软件曲线由 phelper 的心跳维持；停止程序后由固件接管
-- 恢复失败会保留失败状态，不会伪报“已恢复”
-- 风扇曲线是软件策略，不是假装从硬件读回的固件曲线
-- 不提供任意 EC 写入；实验性 CPU 功耗限制始终受编译开关和运行时能力双重限制
-- 控制日志写入本地 JSONL，便于定位实际写入和恢复结果
+| 配置档 | 用途 |
+| --- | --- |
+| `silent` | 安静省电，低速风扇曲线 |
+| `balanced` | 均衡性能与散热 |
+| `gaming` | 游戏优先，使用性能风扇曲线 |
+| `cpu-max` | 持续性能优先，风扇全速运行 |
 
-在本机上，固件自动模式可能在低温空闲时让风扇停转。这是固件行为；phelper 不会在“只查看”或“未接管退出”时主动写入 `0,0` 造成额外停转。
+桌面端设置页只保留“开机启动”。托盘只提供“显示/隐藏 phelper”和“退出”；主题设置、OMEN 键映射、悬浮窗、应用调度页面、精细参数页面和诊断页面不属于当前桌面产品。
 
-## 环境
+## 常驻与开机启动
 
-- Windows 11
-- Rust toolchain：仓库中的 `rust-toolchain.toml`（当前为 Rust 1.98.0）
-- 支持 MSVC 的 Visual Studio C++ Build Tools
-- NVIDIA GPU 遥测需要正常安装 NVIDIA 驱动
-- 需要管理员权限：桌面端会通过 UAC 自动提权
+- 点击窗口关闭按钮只会隐藏主窗口，遥测、控制心跳和安全保护继续工作。
+- 左键单击托盘图标会重新显示主窗口；托盘菜单也可显式显示或隐藏。
+- 只有托盘菜单中的“退出”才会停止程序，并走完整的硬件安全恢复流程。
+- 在设置页开启“开机启动”后，phelper 使用当前用户的 Windows 登录任务，以最高运行级别和 `--background` 参数启动；登录时不弹主窗口，也不会出现登录后的 UAC 确认框。
+- 再次运行程序只会唤醒已有窗口，不会启动第二个硬件控制实例。
 
-当前支持范围锁定在：
+开机启动默认关闭。它只操作名为 `phelper-user-logon` 的任务计划；关闭开关或卸载程序时会删除这个任务，不修改其他软件或 HP 的任务。
+
+## 支持平台
+
+完整验证环境：
 
 ```text
-OMEN Gaming Laptop 16-wf0032TX / SKU 81L09PA
+Windows 11
+OMEN Gaming Laptop 16-wf0032TX
+SKU 81L09PA / board 8BAB
 Intel Core i9-13900HX
 NVIDIA GeForce RTX 4060 Laptop GPU
-board 8BAB
 ```
 
-## 构建和运行
+其他 OMEN/Victus 型号目前不在支持范围内。不要仅根据品牌、CPU 或 GPU 型号推断兼容性。
+
+## 构建与运行
+
+需要：
+
+- 仓库中 `rust-toolchain.toml` 指定的 Rust 工具链
+- Visual Studio C++ Build Tools（MSVC）
+- Windows 11
+- 正常安装的 NVIDIA 驱动
 
 在仓库根目录执行：
 
 ```powershell
-# 桌面端
 cargo build -p phelper-desktop --release
 .\target\release\phelper-desktop.exe
 ```
 
-构建产物为 `target\release\phelper-desktop.exe`。PawnIO 的 `IntelMSR` 和 `IntelMCHBAR` 模块已经作为编译期资源嵌入 core，不需要把仓库中的 `assets` 目录复制到 exe 旁边。
+首次手动启动时，桌面端会通过 UAC 请求管理员权限。启用开机启动后，Windows 任务计划程序会在当前用户登录时直接以最高权限后台启动。命名互斥量始终阻止多个实例同时控制硬件。
 
-构建 Windows 安装包（需要 Inno Setup 6 的 `ISCC.exe`）：
+PawnIO 的 `IntelMSR` 和 `IntelMCHBAR` 模块已经嵌入可执行文件，无需在程序旁复制 `assets` 目录。
 
-```powershell
-.\installer\build-installer.ps1
-```
+## 安全模型
 
-安装包输出到 `dist\phelper-Setup-0.1.0.exe`，默认安装到 `Program Files\phelper`，并提供开始菜单入口和可选桌面快捷方式。安装包只部署桌面 exe；用户配置、配置档、日志和控制日志保留在 `%LOCALAPPDATA%\phelper`，卸载时不会删除。
+UI 不是安全边界。所有 HP 固件和 Windows PPM 性能写入都必须经过 core：
 
-## CLI
+- 启动后先探测设备身份和能力，未知能力视为不支持。
+- `ControlCoordinator` 是唯一硬件性能写入者，所有命令串行执行。
+- 配置档在写入前完成整体验证，某一步失败后不会继续执行后续步骤。
+- 请求状态、实际读回状态和实时遥测彼此独立；API 返回成功不等于硬件验证成功。
+- 手动风扇和软件风扇曲线依赖心跳维持；托盘退出、Windows 注销或系统关闭时恢复固件控制。关闭主窗口只是隐藏，不会触发恢复。
+- 温度数据冻结、心跳连续失败或验证不确定时按 fail-closed 处理。
+- 不提供任意 EC、MSR 或 MCHBAR 写入接口；PawnIO 只用于受限的只读遥测。
+- 每次控制及恢复结果写入本地 JSONL 日志。
 
-CLI 是开发和硬件验证工具，不是产品 UI。建议第一次先做只读探测：
+正常 CLI 同样不能跳过退出恢复。需要心跳的命令必须使用大于零的 `--hold`；Ctrl+C 或保持时间结束都会进入优雅退出路径。
+
+## 工程 CLI
+
+`phelper-cli` 是开发、诊断和硬件验证工具，不是产品 UI。
+
+第一次检查设备时，优先使用只读命令：
 
 ```powershell
 cargo run -p phelper-cli -- probe
@@ -78,7 +97,7 @@ cargo run -p phelper-cli -- telemetry --duration 30
 cargo run -p phelper-cli -- control status
 ```
 
-配置档操作：
+配置档管理：
 
 ```powershell
 cargo run -p phelper-cli -- control profile list
@@ -87,55 +106,36 @@ cargo run -p phelper-cli -- control profile export balanced
 cargo run -p phelper-cli -- control profile apply balanced --hold 120
 ```
 
-Windows 软件策略也可以逐项调整。`--ac` 和 `--dc` 只修改对应电源轨，未指定的一侧保持不变：
+core 和 CLI 还保留 Windows PPM 参数、风扇/Thermal Mode、进程与线程调度以及电源感知自动调度等工程能力。这些能力不会自动出现在精简桌面端。使用前请阅读：
 
-```powershell
-cargo run -p phelper-cli -- control epp --ac 20 --dc 60
-cargo run -p phelper-cli -- control min-perf --ac 20 --dc 5
-cargo run -p phelper-cli -- control max-perf --ac 100 --dc 80
-cargo run -p phelper-cli -- control boost --ac aggressive --dc efficient-enabled
-```
+- [Windows 电源策略](docs/windows-power-policy.md)
+- [Windows 进程与线程调度](docs/windows-os-policy.md)
+- [自动调度架构](docs/automatic-scheduling-architecture.md)
 
-OS 级应用调度不启动硬件控制引擎，目标明确写成 PID 或 TID，并在 CLI 进程结束前自动恢复：
-
-```powershell
-cargo run -p phelper-cli -- os topology
-cargo run -p phelper-cli -- os processes
-cargo run -p phelper-cli -- os apply --pid 1234 --cpu performance --qos high --process-priority above-normal --hold 120
-```
-
-电源感知自动调度默认关闭。先用只读状态确认供电上下文；实机验证时使用有边界的
-保持时间，退出会恢复自动接管的进程策略：
-
-```powershell
-cargo run -p phelper-cli -- os auto status
-cargo run -p phelper-cli -- os auto battery --hold 120
-```
-
-这些调度能力目前只在 core 和开发 CLI 中提供，不属于精简后的桌面端。完整边界见 [`docs/windows-os-policy.md`](docs/windows-os-policy.md)。
-
-这里的“软件策略”不是一个模式按钮：EPP 是偏好，性能上下限是 PPM 范围约束，
-频率上限是 MHz 天花板，Boost 是睿频策略。它们写入当前 Windows 活动电源计划的
-AC/DC 索引，并在写后立即读回校验。Windows 设置中的“节能/均衡/性能”高层选择和
-实际生效模式只做只读显示，不会被 phelper 静默切换；这几层可能同时存在不同值。
-具体分层、边界和官方 API 见 [`docs/windows-power-policy.md`](docs/windows-power-policy.md)。
-
-风扇和 Thermal Mode 控制会占用硬件控制权，请确认目标机器和参数后再执行：
-
-```powershell
-cargo run -p phelper-cli -- control fan manual --cpu 3000 --gpu 3000 --hold 120
-cargo run -p phelper-cli -- control fan max --on --hold 120
-cargo run -p phelper-cli -- control thermal performance --hold 120
-cargo run -p phelper-cli -- control fan auto
-```
-
-实验性命令需要显式启用 feature：
+实验性 `0x29` CPU 功耗限制只存在于显式启用 feature 的 CLI 构建中：
 
 ```powershell
 cargo run -p phelper-cli --features experimental -- control power-limits --pl1 45 --pl2 90 --hold 120
 ```
 
-`--hold 120` 用于保持心跳；正常 Ctrl+C 或到期会走优雅退出路径。`--hold 0` 会在引擎启动前被拒绝，正常 CLI 不提供跳过恢复的路径。
+这不是推荐的日常入口，也不会进入内置配置档。
+
+## 自定义配置档
+
+桌面端只展示内置配置档。自定义 TOML 配置档由 core 和 CLI 从以下目录加载：
+
+```text
+%LOCALAPPDATA%\phelper\profiles\*.toml
+```
+
+可以导出内置配置档作为模板：
+
+```powershell
+New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\phelper\profiles" | Out-Null
+cargo run -p phelper-cli -- control profile export gaming > "$env:LOCALAPPDATA\phelper\profiles\my-gaming.toml"
+```
+
+解析采用严格模式：未知字段会被拒绝，损坏的文件会产生警告但不会阻止 Engine 加载其他配置档。自定义文件不能覆盖同名内置配置档。
 
 ## 用户数据
 
@@ -143,63 +143,57 @@ cargo run -p phelper-cli --features experimental -- control power-limits --pl1 4
 
 | 路径 | 内容 |
 | --- | --- |
-| `profiles\*.toml` | 用户配置档 |
-| `state\fan_curve.toml` | 最近一次明确应用的曲线，仅作为下次编辑来源 |
-| `state\control-journal.jsonl` | 控制写入和恢复日志 |
+| `profiles\*.toml` | CLI 可用的自定义配置档 |
+| `state\fan_curve.toml` | 最近一次明确应用的软件风扇曲线，仅用于后续编辑 |
+| `state\control-journal.jsonl` | 控制、校验和恢复记录 |
 | `logs\phelper-desktop.log` | 桌面端运行日志 |
 
-用户配置档使用严格 TOML 解析，未知字段会被拒绝。可以先导出内置配置档作为模板：
-
-```powershell
-cargo run -p phelper-cli -- control profile export gaming > "$env:LOCALAPPDATA\phelper\profiles\my-gaming.toml"
-```
-
-然后按需修改。配置档中的字段都是“希望改变的值”，没有填写的字段保持当前状态；实验性 `power_limits` 不会绕过 core 的安全门。
-带有 `[os_policy]` 的配置档必须配合明确的 PID/TID 使用；硬件 `profile apply` 不会猜测应用目标。
+卸载或删除可执行文件不会自动删除这些数据。
 
 ## 项目结构
 
 ```text
-crates/phelper-domain/   与平台无关的策略、命令、状态和端口
-crates/phelper-core/     Engine、遥测、控制、能力探测和持久化
-crates/phelper-cli/      开发/验证 CLI
-apps/desktop/            GPUI 桌面端
-docs/                    专项调研和 provider 说明
+crates/phelper-domain/   与平台无关的领域模型、命令、状态和端口
+crates/phelper-core/     Engine、能力探测、遥测、控制、安全和平台适配
+crates/phelper-cli/      开发与验证 CLI
+apps/desktop/            只包含概览和配置档的 GPUI 桌面端
+docs/                    专项设计、调研和硬件验证记录
 architecture.md          架构基线与安全不变量
-docs/automatic-scheduling-architecture.md
-                         自动调度专项架构与 Phase 1 实现边界
-docs/resident-desktop-integrations.md
-                         已撤下的常驻桌面集成历史设计
 ```
 
-core 不依赖 GPUI。桌面端只是读取 `AppState` 并提交命令，硬件访问、控制顺序、验证、心跳和恢复都由 core 负责。
+依赖方向为：
+
+```text
+phelper-domain <- phelper-core <- desktop / CLI
+```
+
+`phelper-domain` 不依赖 Win32、WMI、PawnIO、NVIDIA API 或 GPUI。桌面端只消费 `AppState` 并提交领域命令，不直接访问硬件。
 
 ## 验证
 
-提交前建议运行：
+提交前运行：
 
 ```powershell
 cargo fmt --all -- --check
-cargo check --workspace --all-features
-cargo clippy --workspace --all-features -- -D warnings
-cargo test --workspace --all-features
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets --all-features
 cargo build -p phelper-desktop --release
 ```
 
-完整架构、安全不变量和硬件证据记录在 [`architecture.md`](architecture.md)；reference machine 的可行性边界见 [`docs/feasibility-16-wf0032TX.md`](docs/feasibility-16-wf0032TX.md)。
+单元测试和静态检查不能替代真实硬件验证。任何新的硬件写入都必须依次经过只读探测、开发命令、8BAB 实机读回验证和安全恢复验证。
 
-## 当前边界
+## 明确不做
 
-- 目前不是通用 OMEN/Victus 控制器，只服务于 8BAB reference platform
-- 风扇当前读回的是实时 RPM/level，不是硬件内部的温度到转速曲线
-- Windows PPM 的细粒度参数保留在 core 和 CLI；精简桌面端只通过配置档提交控制意图
-- Windows OS 级应用调度保留在 core 和 CLI；CPU Sets 用 Windows 拓扑的 efficiency
-  class 区分 P/E 核，Affinity 只作为显式高级选项
-- 电源感知自动调度已实现 `Off` / `BatteryEfficiency` 第一版；默认关闭，当前不持久化，
-  仍需完成 reference machine 的功耗和兼容性 A/B/HIL 验证；设计边界见
-  [`docs/automatic-scheduling-architecture.md`](docs/automatic-scheduling-architecture.md)
-- 不追踪游戏进程，也不提供帧率/帧时间采集；监控范围限定为硬件和 Windows 系统指标
-- MUX 显卡模式切换暂不提供：它需要重启，且不影响当前性能控制闭环；只保留必要的只读状态/能力记录
-- `0x29` CPU 功耗限制仍属于实验性能力，不包含在内置配置档中
-- 自启、托盘、OMEN 键事件桥、悬浮窗和主题设置已从当前桌面产品中移除；如未来确有需求，
-  需重新经过独立的设计与验收
+- 不承诺支持 8BAB 之外的设备。
+- 不直接写 EC。
+- 不提供 MUX 显卡模式切换。
+- 不追踪游戏进程，不采集 FPS 或帧时间。
+- 不把实验性功耗限制包装成稳定功能。
+- 不在没有明确需求时加入主题、热键、悬浮窗或更多控制页面；设置页只保留开机启动，托盘只保留显示/隐藏和退出。
+
+完整架构和硬件证据见 [architecture.md](architecture.md) 与 [8BAB 可行性调研](docs/feasibility-16-wf0032TX.md)。
+
+## License
+
+项目代码使用 MIT 或 Apache-2.0 双许可证。仓库内嵌的第三方 PawnIO 模块及其许可证声明以 `assets/pawnio/COPYING` 为准。

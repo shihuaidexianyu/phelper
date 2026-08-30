@@ -1,4 +1,6 @@
-//! Minimal application shell: one read model, two destinations.
+//! Minimal application shell: one hardware read model and three destinations.
+
+use std::sync::{Arc, Mutex, mpsc};
 
 use gpui::{
     App, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render, Styled,
@@ -12,7 +14,10 @@ use gpui_component::{
 use phelper_core::app::AppState;
 use phelper_core::app::runtime::AppHandle;
 
-use crate::pages::{PageId, dashboard, profiles};
+use crate::{
+    pages::{PageId, dashboard, profiles, settings},
+    resident::{ResidentCommand, ResidentUiState},
+};
 
 fn window_control(
     id: &'static str,
@@ -51,12 +56,20 @@ fn window_control(
 pub struct ShellView {
     pub(crate) app: AppHandle,
     pub(crate) state: AppState,
+    pub(crate) resident_state: Arc<Mutex<ResidentUiState>>,
+    resident_commands: mpsc::Sender<ResidentCommand>,
     pub(crate) page: PageId,
     _app_state_sub: Subscription,
 }
 
 impl ShellView {
-    pub fn new(app: AppHandle, app_state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        app: AppHandle,
+        app_state: Entity<AppState>,
+        resident_state: Arc<Mutex<ResidentUiState>>,
+        resident_commands: mpsc::Sender<ResidentCommand>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         // Do not read the entity again from inside its own observer. The
         // publisher is authoritative and provides a lock-backed snapshot.
         let app_state_sub = cx.observe(&app_state, |this, _, cx| {
@@ -68,9 +81,45 @@ impl ShellView {
         Self {
             app,
             state,
+            resident_state,
+            resident_commands,
             page: PageId::Dashboard,
             _app_state_sub: app_state_sub,
         }
+    }
+
+    pub(crate) fn resident_snapshot(&self) -> ResidentUiState {
+        self.resident_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn set_autostart(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        {
+            let mut state = self
+                .resident_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.autostart_busy {
+                return;
+            }
+            state.autostart_busy = true;
+            state.autostart_error = None;
+        }
+        if self
+            .resident_commands
+            .send(ResidentCommand::SetAutostart(enabled))
+            .is_err()
+        {
+            let mut state = self
+                .resident_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.autostart_busy = false;
+            state.autostart_error = Some("后台服务不可用，请重新启动 phelper".into());
+        }
+        cx.notify();
     }
 }
 
@@ -89,6 +138,7 @@ impl Render for ShellView {
         let content = match self.page {
             PageId::Dashboard => dashboard::render(&self.state, cx).into_any_element(),
             PageId::Profiles => profiles::render(&self.state, &self.app, cx).into_any_element(),
+            PageId::Settings => settings::render(self.resident_snapshot(), cx).into_any_element(),
         };
 
         let theme = cx.theme();

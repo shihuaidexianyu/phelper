@@ -47,7 +47,13 @@ pub fn fan_mode_zh(mode: &FanMode) -> String {
     match mode {
         FanMode::FirmwareAuto => "固件自动".into(),
         FanMode::Max => "最大转速".into(),
-        FanMode::Manual(level) => format!("手动 {} / {} RPM", level.cpu * 100, level.gpu * 100),
+        FanMode::Manual(level) => {
+            format!(
+                "手动 左 {} / 右 {} RPM",
+                level.left * 100,
+                level.right * 100
+            )
+        }
         FanMode::Curve(_) => "温度曲线".into(),
     }
 }

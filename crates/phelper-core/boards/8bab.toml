@@ -16,6 +16,9 @@ power_limits = "experimental"
 
 [fan]
 count = 2
+# HP WMI channel 0 is the chassis-left fan; channel 1 is chassis-right.
+# Firmware calibrates these channels independently, so equal hardware does
+# not imply identical reported RPM at the same operating point.
 # V1 = 100-RPM units (level * 100 = RPM). NEVER send percent to this board
 # (feasibility R2).
 scale = "krpm"

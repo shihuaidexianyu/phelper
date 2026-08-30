@@ -69,7 +69,7 @@ Linux 内核、OmenMon、OmenHwCtl、OmenSuperHub 完全一致：
 | Thermal mode（Balanced 0x30 / Performance 0x31） | WMI 0x1A，payload `{0xFF, mode}` | ✅ **内核在 8BAB 实测** | commit 13fa3aaf02；8BAB 静态使用 V1 值，无需运行时版本探测 |
 | Thermal mode **回读** | EC 偏移 0x59（本板布局） | ⚠️ 决策点 | BIOS 无查询接口（OmenMon 文档明示）；与"不碰 EC"原则冲突——见 §5-4 的处置建议 |
 | Max Fan | WMI 0x27 | ✅ 可行 | 内核使用中；0x26 回读**不可靠**（内核已弃用，改为自追踪状态） |
-| 手动风扇转速 | WMI 0x2E `{cpu_rpm, gpu_rpm}`，**单位 100 RPM，0=释放给固件**；范围用 0x2F 风扇表 clamp | ✅ **内核在 8BAB 实测可控** | 同 commit；社区在 16-wf0xxx 独立逆出同一协议（CachyOS 帖子：type 46 = 0x2E 手动，0 值是固件接管，不是软件温控） |
+| 手动风扇转速 | WMI 0x2E `{channel0, channel1}`，在 8BAB 上呈现为 `{left, right}`；**单位 100 RPM，0=释放给固件**；范围用 0x2F 风扇表 clamp | ✅ **内核在 8BAB 实测可控** | 同 commit；社区在 16-wf0xxx 独立逆出同一协议（CachyOS 帖子：type 46 = 0x2E 手动，0 值是固件接管，不是软件温控） |
 | GPU 平台功耗策略（cTGP/PPAB/dstate） | WMI 0x21/0x22 | ✅ 可行 | 内核 victus_s 路径（8BAB 归属此路径）在 profile 切换时写入；payload 四字节结构确认 |
 | MUX（Hybrid/Discrete/Optimus） | WMI 0x52（读 cmd 0x01 / 写 cmd 0x02），SDD byte7 bit3 能力门控 | ✅ 可行 | 内核 2026-07 加入 + OmenMon/OmenHwCtl 均实现；**需重启，非热切换** |
 | **CPU 功率限制（PL1/PL2/PL4/并发）** | WMI 0x29 | ❓ **最大未验证点** | 内核**从不在此板写显式值**（只在 AC/DC 事件恢复 DEFAULT）；OmenSuperHub/OmenHwCtl 有实现但**字节序互相矛盾**（内核结构 `{pl1,pl2,pl4,cc}` vs OSH 发 `{PL2,PL1,…}`）；OmenMon #37 记录固件在 OGH 退出后把 CPU 锁回 55W。必须按文档 §25 的三步验证法实机实测 |

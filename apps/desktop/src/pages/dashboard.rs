@@ -72,23 +72,25 @@ pub fn render(
             }))
     };
 
-    let cpu_fan = sample(ids::FAN_CPU_RPM);
-    let gpu_fan = sample(ids::FAN_GPU_RPM);
+    let left_fan = sample(ids::FAN_LEFT_RPM);
+    let right_fan = sample(ids::FAN_RIGHT_RPM);
     let fan_value = match (
-        cpu_fan.and_then(|sample| sample.value.as_f64()),
-        gpu_fan.and_then(|sample| sample.value.as_f64()),
+        left_fan.and_then(|sample| sample.value.as_f64()),
+        right_fan.and_then(|sample| sample.value.as_f64()),
     ) {
-        (Some(cpu), Some(gpu)) => format!("{cpu:.0} / {gpu:.0}"),
+        (Some(left), Some(right)) => format!("左 {left:.0} / 右 {right:.0}"),
         _ => "—".into(),
     };
-    let fan_stale = cpu_fan.is_none()
-        || gpu_fan.is_none()
-        || cpu_fan.is_some_and(|sample| sample.timestamp.elapsed() > cadence(ids::FAN_CPU_RPM) * 3)
-        || gpu_fan.is_some_and(|sample| sample.timestamp.elapsed() > cadence(ids::FAN_GPU_RPM) * 3);
-    let fan_quality = if cpu_fan.is_none() || gpu_fan.is_none() {
+    let fan_stale = left_fan.is_none()
+        || right_fan.is_none()
+        || left_fan
+            .is_some_and(|sample| sample.timestamp.elapsed() > cadence(ids::FAN_LEFT_RPM) * 3)
+        || right_fan
+            .is_some_and(|sample| sample.timestamp.elapsed() > cadence(ids::FAN_RIGHT_RPM) * 3);
+    let fan_quality = if left_fan.is_none() || right_fan.is_none() {
         Some(MetricQuality::Unavailable)
     } else {
-        [cpu_fan, gpu_fan]
+        [left_fan, right_fan]
             .into_iter()
             .flatten()
             .map(|sample| sample.quality)

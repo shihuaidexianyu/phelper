@@ -1160,8 +1160,8 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                     firmware_return: None,
                     before: Some(before),
                     after: Some(format!(
-                        "temperature={temp_c:.1}C target_cpu={} target_gpu={} (x100 RPM)",
-                        target.cpu, target.gpu
+                        "temperature={temp_c:.1}C target_left={} target_right={} (x100 RPM)",
+                        target.left, target.right
                     )),
                     verification: Verification::TrustedNoReadback,
                 });
@@ -1208,14 +1208,14 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             std::thread::sleep(self.verify_poll_interval);
             match hp.fan_levels() {
                 Ok(actual) => {
-                    last = format!("cpu={} gpu={} (x100 RPM)", actual.cpu, actual.gpu);
-                    let cpu_ok = target.cpu == 0
-                        || (actual.cpu as i32 - target.cpu as i32).abs()
+                    last = format!("left={} right={} (x100 RPM)", actual.left, actual.right);
+                    let left_ok = target.left == 0
+                        || (actual.left as i32 - target.left as i32).abs()
                             <= FAN_VERIFY_TOLERANCE_LEVEL;
-                    let gpu_ok = target.gpu == 0
-                        || (actual.gpu as i32 - target.gpu as i32).abs()
+                    let right_ok = target.right == 0
+                        || (actual.right as i32 - target.right as i32).abs()
                             <= FAN_VERIFY_TOLERANCE_LEVEL;
-                    if cpu_ok && gpu_ok {
+                    if left_ok && right_ok {
                         return Verification::Verified;
                     }
                 }
@@ -1223,7 +1223,7 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             }
         }
         Verification::Failed {
-            expected: format!("cpu={} gpu={} (x100 RPM)", target.cpu, target.gpu),
+            expected: format!("left={} right={} (x100 RPM)", target.left, target.right),
             actual: last,
         }
     }
@@ -2652,13 +2652,13 @@ impl ThermalFeed for SnapshotFeed {
 
     fn fan_levels(&self) -> Option<(FanLevels, Instant)> {
         let snap = self.telemetry.snapshot();
-        let cpu = snap.samples.get(&ids::FAN_CPU_RPM)?;
-        let gpu = snap.samples.get(&ids::FAN_GPU_RPM)?;
-        let cpu_level = (cpu.value.as_f64()? / 100.0).round() as u16;
-        let gpu_level = (gpu.value.as_f64()? / 100.0).round() as u16;
+        let left = snap.samples.get(&ids::FAN_LEFT_RPM)?;
+        let right = snap.samples.get(&ids::FAN_RIGHT_RPM)?;
+        let left_level = (left.value.as_f64()? / 100.0).round() as u16;
+        let right_level = (right.value.as_f64()? / 100.0).round() as u16;
         // The pair's freshness is its older sample.
-        let at = cpu.timestamp.min(gpu.timestamp);
-        Some((FanLevels::new(cpu_level, gpu_level), at))
+        let at = left.timestamp.min(right.timestamp);
+        Some((FanLevels::new(left_level, right_level), at))
     }
 
     fn power_limits_w(&self) -> Option<(f64, f64, Instant)> {

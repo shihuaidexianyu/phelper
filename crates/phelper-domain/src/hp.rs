@@ -29,8 +29,10 @@ pub struct SystemDesignData {
 /// discrete level/noise table, not a firmware temperature-to-speed curve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FanTableEntry {
-    pub cpu: u8,
-    pub gpu: u8,
+    #[serde(alias = "cpu")]
+    pub left: u8,
+    #[serde(alias = "gpu")]
+    pub right: u8,
     pub noise_db: u8,
 }
 
@@ -54,7 +56,7 @@ impl FanTable {
         let mut lo = u16::MAX;
         let mut hi = 0u16;
         for e in &self.entries {
-            for v in [e.cpu as u16, e.gpu as u16] {
+            for v in [e.left as u16, e.right as u16] {
                 lo = lo.min(v);
                 hi = hi.max(v);
             }

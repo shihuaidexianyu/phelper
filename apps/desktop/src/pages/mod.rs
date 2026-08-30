@@ -3,6 +3,7 @@
 
 pub mod dashboard;
 pub mod profiles;
+pub mod settings;
 
 use gpui_component::IconName;
 use phelper_core::app::{AppState, EngineStatus};
@@ -21,15 +22,17 @@ pub fn control_unavailable_label(state: &AppState) -> &'static str {
 pub enum PageId {
     Dashboard,
     Profiles,
+    Settings,
 }
 
 impl PageId {
-    pub const ALL: [PageId; 2] = [PageId::Dashboard, PageId::Profiles];
+    pub const ALL: [PageId; 3] = [PageId::Dashboard, PageId::Profiles, PageId::Settings];
 
     pub fn label(self) -> &'static str {
         match self {
             PageId::Dashboard => "概览",
             PageId::Profiles => "配置档",
+            PageId::Settings => "设置",
         }
     }
 
@@ -37,6 +40,7 @@ impl PageId {
         match self {
             PageId::Dashboard => IconName::LayoutDashboard,
             PageId::Profiles => IconName::Star,
+            PageId::Settings => IconName::Settings,
         }
     }
 }

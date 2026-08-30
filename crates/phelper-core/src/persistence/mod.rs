@@ -99,7 +99,7 @@ mod tests {
         let path = tmp("invalid");
         std::fs::write(
             &path,
-            "[curve]\npoints = [{ temp_c = 35, cpu = 0, gpu = 20 }, { temp_c = 55, cpu = 26, gpu = 26 }, { temp_c = 72, cpu = 40, gpu = 42 }, { temp_c = 85, cpu = 55, gpu = 55 }]\n",
+            "[curve]\npoints = [{ temp_c = 35, left = 0, right = 20 }, { temp_c = 55, left = 26, right = 26 }, { temp_c = 72, left = 40, right = 42 }, { temp_c = 85, left = 55, right = 55 }]\n",
         )
         .unwrap();
         assert!(load_fan_curve(&path).is_err());

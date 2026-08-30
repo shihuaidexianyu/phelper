@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <title>phelper</title>
+  <rect width="512" height="512" rx="112" fill="#18181B"/>
+  <path d="M256 256
+           C222 196 184 172 148 186
+           C102 204 102 282 148 312
+           C194 342 232 306 256 256
+           C280 206 318 170 364 200
+           C410 230 410 308 364 326
+           C328 340 290 316 256 256 Z"
+        fill="none" stroke="#61AFEF" stroke-width="58"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

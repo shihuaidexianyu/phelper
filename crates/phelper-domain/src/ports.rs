@@ -73,7 +73,7 @@ pub trait HpControl: Send {
     /// 0x1A thermal mode set, payload `{0xFF, mode}` (V1: 0x30/0x31),
     /// outsize=0 (hp-wmi.c `HPWMI_SET_PERFORMANCE_MODE` via HPWMI_GM).
     fn set_thermal_mode(&self, mode: ThermalMode) -> Result<(), HpWmiError>;
-    /// 0x2E manual fan levels `{cpu, gpu}` in 100-RPM units (V1 krpm),
+    /// 0x2E manual fan levels `{left, right}` in 100-RPM units (V1 krpm),
     /// `{0,0}` = firmware automatic, outsize=0 (hp-wmi.c
     /// `HPWMI_VICTUS_S_FAN_SPEED_SET_QUERY`).
     fn set_fan_levels(&self, levels: FanLevels) -> Result<(), HpWmiError>;

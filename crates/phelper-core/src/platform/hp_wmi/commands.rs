@@ -55,7 +55,8 @@ pub(crate) mod cmd {
     pub(crate) const POWER_LIMITS: u8 = 0x29;
     /// Fan levels get (128-byte buffer; per-fan byte * 100 = RPM on V1).
     pub(crate) const FAN_LEVELS_GET: u8 = 0x2D;
-    /// Fan levels set, payload `u8[2] {cpu, gpu}` in 100-RPM units, 0 = auto,
+    /// Fan levels set, payload `u8[2] {channel0, channel1}` in 100-RPM units,
+    /// presented as `{left, right}` on 8BAB; 0 = auto,
     /// outsize=0 (hp-wmi.c HPWMI_VICTUS_S_FAN_SPEED_SET_QUERY).
     #[allow(dead_code)] // call sites live behind `control` (W5)
     pub(crate) const FAN_LEVELS_SET: u8 = 0x2E;
@@ -168,7 +169,7 @@ pub(crate) fn decode_sdd(buf: &[u8]) -> Result<SystemDesignData, HpWmiError> {
 }
 
 /// 0x2F → discrete fan level/noise table: {num_fans, unknown} + 3-byte
-/// entries {cpu, gpu, noise_db} (hp-wmi.c victus fan table). It does not
+/// entries {channel0, channel1, noise_db} (hp-wmi.c victus fan table). It does not
 /// contain firmware temperature thresholds or a temperature-to-speed curve.
 pub(crate) fn decode_fan_table(buf: &[u8]) -> Result<FanTable, HpWmiError> {
     need(buf, 2, "fan table needs >= 2 bytes")?;
@@ -179,8 +180,8 @@ pub(crate) fn decode_fan_table(buf: &[u8]) -> Result<FanTable, HpWmiError> {
         .iter()
         .take_while(|c| !(c[0] == 0 && c[1] == 0 && c[2] == 0)) // stop at padding
         .map(|c| FanTableEntry {
-            cpu: c[0],
-            gpu: c[1],
+            left: c[0],
+            right: c[1],
             noise_db: c[2],
         })
         .collect();
@@ -247,18 +248,19 @@ pub(crate) fn encode_thermal_mode_v1(mode: ThermalMode) -> [u8; 2] {
     [0xFF, v1]
 }
 
-/// 0x2E fan levels set: `u8[2] {cpu, gpu}` in 100-RPM units, 0 = firmware
+/// 0x2E fan levels set: `u8[2] {channel0, channel1}` in 100-RPM units,
+/// presented as left/right on 8BAB; 0 = firmware
 /// automatic (hp-wmi.c HPWMI_VICTUS_S_FAN_SPEED_SET_QUERY, insize=2,
 /// outsize=0). The wire is u8 per channel — anything above 255 krpm-units
 /// cannot be encoded; the safety layer's clamp check runs long before this
 /// guard, and both fail closed rather than truncate.
 #[allow(dead_code)] // call sites live behind `control` (W5); unconditional for tests
 pub(crate) fn encode_fan_levels(levels: FanLevels) -> Result<[u8; 2], HpWmiError> {
-    let cpu =
-        u8::try_from(levels.cpu).map_err(|_| HpWmiError::InvalidInput("cpu fan level > 255"))?;
-    let gpu =
-        u8::try_from(levels.gpu).map_err(|_| HpWmiError::InvalidInput("gpu fan level > 255"))?;
-    Ok([cpu, gpu])
+    let left =
+        u8::try_from(levels.left).map_err(|_| HpWmiError::InvalidInput("left fan level > 255"))?;
+    let right = u8::try_from(levels.right)
+        .map_err(|_| HpWmiError::InvalidInput("right fan level > 255"))?;
+    Ok([left, right])
 }
 
 /// 0x27 max fan set: 4-byte LE `int enabled` (hp-wmi.c
@@ -431,7 +433,7 @@ mod tests {
         let t = decode_fan_table(&buf).unwrap();
         assert_eq!(t.num_fans, 2);
         assert_eq!(t.entries.len(), 3);
-        assert_eq!(t.entries[2].cpu, 55);
+        assert_eq!(t.entries[2].left, 55);
         assert_eq!(t.clamp_range(), Some((5, 55)));
     }
 
@@ -450,8 +452,8 @@ mod tests {
     #[test]
     fn fan_levels_decode_100rpm_units() {
         let l = decode_fan_levels(&[35, 0]).unwrap();
-        assert_eq!(l.cpu, 35);
-        assert_eq!(l.cpu_rpm(), 3500);
+        assert_eq!(l.left, 35);
+        assert_eq!(l.left_rpm(), 3500);
         assert!(FanLevels::AUTO.is_auto());
     }
 

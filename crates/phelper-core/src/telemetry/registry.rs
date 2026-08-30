@@ -289,18 +289,18 @@ pub(crate) const REGISTRY: &[MetricMeta] = &[
          re-pushed ~60 s; GetPowerManagementLimit is NOT_SUPPORTED on AD107)"
     ),
     m!(
-        ids::FAN_CPU_RPM,
+        ids::FAN_LEFT_RPM,
         "RPM",
         MetricSource::HpWmi,
         1000,
-        "0x2D × 100 (V1 krpm). §38: never faster than 1 Hz"
+        "0x2D channel 0 × 100 (8BAB left fan). §38: never faster than 1 Hz"
     ),
     m!(
-        ids::FAN_GPU_RPM,
+        ids::FAN_RIGHT_RPM,
         "RPM",
         MetricSource::HpWmi,
         1000,
-        "0x2D × 100 (V1 krpm). §38: never faster than 1 Hz"
+        "0x2D channel 1 × 100 (8BAB right fan). §38: never faster than 1 Hz"
     ),
     m!(
         ids::POWER_AC_ONLINE,

@@ -51,6 +51,11 @@ gpui-component = { git = "https://github.com/longbridge/gpui-component.git", rev
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
+raw-window-handle = "0.6"
+tray-icon = "0.24.2"
+
+[build-dependencies]
+embed-resource = "3.0.11"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

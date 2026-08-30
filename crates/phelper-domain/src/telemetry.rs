@@ -86,9 +86,11 @@ pub mod ids {
     /// driver reports NOT_SUPPORTED.
     pub const GPU_POWER_LIMIT_W: MetricId = MetricId("gpu.power_limit_w");
 
-    // Fans (HP WMI 0x2D, ≤ 1 Hz — architecture.md section 38 hard rule)
-    pub const FAN_CPU_RPM: MetricId = MetricId("fan.cpu_rpm");
-    pub const FAN_GPU_RPM: MetricId = MetricId("fan.gpu_rpm");
+    // Physical fans (HP WMI 0x2D channels 0/1, ≤ 1 Hz). Upstream code calls
+    // the indexes CPU/GPU fans; phelper maps the 8BAB channels to their more
+    // accurate chassis identities: left/right.
+    pub const FAN_LEFT_RPM: MetricId = MetricId("fan.left_rpm");
+    pub const FAN_RIGHT_RPM: MetricId = MetricId("fan.right_rpm");
 
     // Power source
     pub const POWER_AC_ONLINE: MetricId = MetricId("power.ac_online");

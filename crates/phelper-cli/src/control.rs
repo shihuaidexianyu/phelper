@@ -200,12 +200,12 @@ enum FanCmd {
     },
     /// Manual fan levels (0x2E), RPM multiples of 100.
     Manual {
-        /// CPU fan target RPM (multiple of 100).
-        #[arg(long)]
-        cpu: u16,
-        /// GPU fan target RPM (multiple of 100).
-        #[arg(long)]
-        gpu: u16,
+        /// Left fan target RPM (multiple of 100).
+        #[arg(long, alias = "cpu")]
+        left: u16,
+        /// Right fan target RPM (multiple of 100).
+        #[arg(long, alias = "gpu")]
+        right: u16,
         #[arg(long, default_value_t = 120)]
         hold: u64,
     },
@@ -423,11 +423,11 @@ fn plan(args: &ControlArgs) -> Result<Plan> {
                 }),
                 *hold,
             ),
-            FanCmd::Manual { cpu, gpu, hold } => {
-                if cpu % 100 != 0 || gpu % 100 != 0 {
+            FanCmd::Manual { left, right, hold } => {
+                if left % 100 != 0 || right % 100 != 0 {
                     bail!("fan targets must be multiples of 100 RPM (0x2E wire unit)");
                 }
-                if *cpu == 0 || *gpu == 0 {
+                if *left == 0 || *right == 0 {
                     bail!(
                         "manual levels must be nonzero on both channels \
                          (0 = firmware-auto — use `fan auto`)"
@@ -435,8 +435,8 @@ fn plan(args: &ControlArgs) -> Result<Plan> {
                 }
                 Plan::HpState(
                     ControlCommand::SetFanMode(FanMode::Manual(FanLevels::new(
-                        cpu / 100,
-                        gpu / 100,
+                        left / 100,
+                        right / 100,
                     ))),
                     *hold,
                 )

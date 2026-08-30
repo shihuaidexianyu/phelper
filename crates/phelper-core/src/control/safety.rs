@@ -408,7 +408,7 @@ impl SafetySupervisor {
                 reason: "no fan clamp range known (0x2F table + profile both failed)".into(),
             });
         };
-        for (channel, v) in [("cpu", levels.cpu), ("gpu", levels.gpu)] {
+        for (channel, v) in [("left", levels.left), ("right", levels.right)] {
             if v == 0 {
                 continue; // 0 = leave that channel on firmware auto
             }
@@ -432,7 +432,7 @@ impl SafetySupervisor {
                 reason: reason.into(),
             })?;
         for point in curve.points {
-            self.validate_fan_levels(FanLevels::new(point.cpu, point.gpu), caps)?;
+            self.validate_fan_levels(FanLevels::new(point.left, point.right), caps)?;
         }
         Ok(())
     }

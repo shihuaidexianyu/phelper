@@ -52,27 +52,31 @@ pub enum MuxMode {
 /// unit, so a percent value cannot be constructed for a V1 board (R2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FanLevels {
-    pub cpu: u16,
-    pub gpu: u16,
+    /// HP WMI channel 0 (physically the left fan on the 8BAB chassis).
+    #[serde(alias = "cpu")]
+    pub left: u16,
+    /// HP WMI channel 1 (physically the right fan on the 8BAB chassis).
+    #[serde(alias = "gpu")]
+    pub right: u16,
 }
 
 impl FanLevels {
-    pub const AUTO: Self = Self { cpu: 0, gpu: 0 };
+    pub const AUTO: Self = Self { left: 0, right: 0 };
 
-    pub const fn new(cpu: u16, gpu: u16) -> Self {
-        Self { cpu, gpu }
+    pub const fn new(left: u16, right: u16) -> Self {
+        Self { left, right }
     }
 
     pub fn is_auto(self) -> bool {
-        self.cpu == 0 && self.gpu == 0
+        self.left == 0 && self.right == 0
     }
 
-    pub fn cpu_rpm(self) -> u32 {
-        self.cpu as u32 * 100
+    pub fn left_rpm(self) -> u32 {
+        self.left as u32 * 100
     }
 
-    pub fn gpu_rpm(self) -> u32 {
-        self.gpu as u32 * 100
+    pub fn right_rpm(self) -> u32 {
+        self.right as u32 * 100
     }
 }
 
@@ -90,25 +94,31 @@ pub const FAN_CURVE_MAX_TEMP_C: u8 = 100;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FanCurvePoint {
     pub temp_c: u8,
-    pub cpu: u16,
-    pub gpu: u16,
+    #[serde(alias = "cpu")]
+    pub left: u16,
+    #[serde(alias = "gpu")]
+    pub right: u16,
 }
 
 impl FanCurvePoint {
-    pub const fn new(temp_c: u8, cpu: u16, gpu: u16) -> Self {
-        Self { temp_c, cpu, gpu }
+    pub const fn new(temp_c: u8, left: u16, right: u16) -> Self {
+        Self {
+            temp_c,
+            left,
+            right,
+        }
     }
 
     pub const fn levels(self) -> FanLevels {
-        FanLevels::new(self.cpu, self.gpu)
+        FanLevels::new(self.left, self.right)
     }
 
-    pub const fn cpu_rpm(self) -> u32 {
-        self.cpu as u32 * 100
+    pub const fn left_rpm(self) -> u32 {
+        self.left as u32 * 100
     }
 
-    pub const fn gpu_rpm(self) -> u32 {
-        self.gpu as u32 * 100
+    pub const fn right_rpm(self) -> u32 {
+        self.right as u32 * 100
     }
 }
 
@@ -172,7 +182,7 @@ impl FanCurve {
             if previous_temp.is_some_and(|temp| point.temp_c <= temp) {
                 return Err("curve temperatures must be strictly increasing");
             }
-            if point.cpu == 0 || point.gpu == 0 {
+            if point.left == 0 || point.right == 0 {
                 return Err(
                     "curve fan levels must be positive; use automatic mode to allow fan-stop",
                 );
@@ -201,8 +211,8 @@ impl FanCurve {
                 let span = (right.temp_c - left.temp_c) as f64;
                 let ratio = (temp_c - left.temp_c as f64) / span;
                 return FanLevels::new(
-                    interpolate_level(left.cpu, right.cpu, ratio),
-                    interpolate_level(left.gpu, right.gpu, ratio),
+                    interpolate_level(left.left, right.left, ratio),
+                    interpolate_level(left.right, right.right, ratio),
                 );
             }
         }
@@ -420,7 +430,7 @@ mod tests {
                 curve
                     .points
                     .iter()
-                    .all(|point| point.cpu > 0 && point.gpu > 0)
+                    .all(|point| point.left > 0 && point.right > 0)
             );
         }
     }

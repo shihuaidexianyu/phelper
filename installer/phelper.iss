@@ -1,7 +1,7 @@
 ; phelper Windows installer.
 ;
-; The installer contains one release executable.  PawnIO modules, the app
-; icon, and GPUI resources are embedded by the application build; no assets
+; The installer contains one release executable. The application icon,
+; PawnIO modules, and GPUI resources are embedded by the build; no assets
 ; directory is installed beside the exe.
 
 #ifndef MyAppVersion
@@ -49,6 +49,11 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDi
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
+
+[UninstallRun]
+; Remove only phelper's fixed current-user logon task. Failure is harmless
+; when the user never enabled autostart or already disabled it from the tray.
+Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /F /TN phelper-user-logon"; Flags: runhidden
 
 ; User settings, profiles, journals, and logs live under %LOCALAPPDATA%\phelper
 ; and are intentionally preserved by uninstall.

@@ -583,7 +583,7 @@ impl<H: HpPlatform + Sync> Collector for HpFanCollector<H> {
     }
 
     fn cadence(&self) -> Duration {
-        registry::meta(ids::FAN_CPU_RPM)
+        registry::meta(ids::FAN_LEFT_RPM)
             .expect("registry entry")
             .cadence
     }
@@ -604,8 +604,15 @@ impl<H: HpPlatform + Sync> Collector for HpFanCollector<H> {
                 self.status = ProviderStatus::Ok;
                 let src = MetricSource::HpWmi;
                 vec![
-                    fresh(ids::FAN_CPU_RPM, f64::from(levels.cpu_rpm()).into(), src),
-                    fresh(ids::FAN_GPU_RPM, f64::from(levels.gpu_rpm()).into(), src),
+                    // The domain fields retain the upstream CPU/GPU wire
+                    // names for compatibility. On 8BAB, channel 0/1 are
+                    // presented to the user as the physical left/right fans.
+                    fresh(ids::FAN_LEFT_RPM, f64::from(levels.left_rpm()).into(), src),
+                    fresh(
+                        ids::FAN_RIGHT_RPM,
+                        f64::from(levels.right_rpm()).into(),
+                        src,
+                    ),
                 ]
             }
             Err(e) => {

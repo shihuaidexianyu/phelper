@@ -69,8 +69,8 @@ impl FanCurveController {
         let target = curve.target_at(smoothed);
 
         let changed_enough = self.last_target.is_none_or(|last| {
-            level_delta(last.cpu, target.cpu) >= MIN_LEVEL_CHANGE
-                || level_delta(last.gpu, target.gpu) >= MIN_LEVEL_CHANGE
+            level_delta(last.left, target.left) >= MIN_LEVEL_CHANGE
+                || level_delta(last.right, target.right) >= MIN_LEVEL_CHANGE
         });
         if !changed_enough
             || self

@@ -286,7 +286,7 @@ mod tests {
 description = "测试档"
 
 thermal_mode = "performance"
-fan = { manual = { cpu = 25, gpu = 30 } }
+fan = { manual = { left = 25, right = 30 } }
 
 [cpu]
 epp_ac = 80
@@ -353,8 +353,25 @@ gpu_preference = "high_performance"
         );
         // And it serializes back to parseable TOML.
         let out = to_toml(&p).expect("serialize");
+        assert!(out.contains("left = 25"));
+        assert!(out.contains("right = 30"));
+        assert!(!out.contains("cpu = 25"));
+        assert!(!out.contains("gpu = 30"));
         let q: PerformanceProfile = toml::from_str(&out).expect("re-parse");
         assert_eq!(p, q);
+    }
+
+    #[test]
+    fn legacy_cpu_gpu_fan_names_remain_readable() {
+        let text = r#"
+description = "旧配置"
+fan = { manual = { cpu = 25, gpu = 30 } }
+"#;
+        let profile: PerformanceProfile = toml::from_str(text).expect("parse legacy fan names");
+        assert_eq!(profile.fan, Some(FanMode::Manual(FanLevels::new(25, 30))));
+        let out = to_toml(&profile).expect("serialize canonical fan names");
+        assert!(out.contains("left = 25"));
+        assert!(out.contains("right = 30"));
     }
 
     #[test]

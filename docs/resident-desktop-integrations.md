@@ -1,17 +1,17 @@
 # phelper 常驻桌面集成架构
 
-状态：已审查，Phase A～E 已实现；实机 HIL 待完成
-日期：2026-08-28
-> 历史设计文档：自启、OMEN 键映射和悬浮窗实现已从当前精简桌面端移除。
-> 本文仅保留设计证据，不代表当前产品具备这些功能；重新引入必须重新评审和验收。
+状态：托盘与开机自启已实现，实机 HIL 待完成
+日期：2026-08-30
+> 当前实现范围只有常驻托盘和开机自启。OMEN 键映射与悬浮窗仍是历史设计，
+> 没有进入当前代码或 UI；下文相关章节只保留设计证据，不代表产品能力。
 
 适用平台：Windows 11，reference platform = OMEN 16-wf0032TX / board 8BAB
 
-本文设计三项用户能力：
+本文最初设计三项用户能力：
 
-1. 开机自启；
-2. OMEN 实体键的特殊映射；
-3. 不打开主窗口即可查看关键数据的悬浮窗。
+1. 开机自启（已实现）；
+2. OMEN 实体键的特殊映射（未实现）；
+3. 不打开主窗口即可查看关键数据的悬浮窗（未实现）。
 
 本文是实现和验收契约。实现必须满足本文的状态、权限、单实例、失败和验收约束。
 
@@ -52,27 +52,26 @@ phelper 在托盘运行
 
 ## 3. 当前基础与缺口
 
-### 3.1 已有基础
+### 3.1 当前已实现
 
 当前仓库已经具备：
 
-- `AppHandle::start_fast()`：引擎在 app-pump 后台启动，UI 可以先显示结构；
+- `AppHandle::start_with_publisher()`：引擎由 app-pump 后台启动；
 - `AppHandle::state()`：所有页面读取同一个 `AppState` 快照；
 - `TelemetrySnapshot`：CPU、GPU、风扇、电源和 Windows 指标已经有统一来源；
 - `ControlCoordinator`：所有硬件写操作的单写者；
-- profile 应用路径：OMEN 键切 profile 必须复用这条路径；
-- Windows 单实例、管理员权限和托盘生命周期；
-- `%LOCALAPPDATA%\phelper\settings.toml`：现有 UI 设置持久化入口。
+- profile 应用路径：所有配置档切换都复用这条路径；
+- Windows 单实例、已有窗口唤醒、管理员权限和托盘生命周期；
+- 固定名称的当前用户登录任务，支持异步查询、创建和删除。
 
-### 3.2 本次新增前的缺口（已补齐）
+### 3.2 保留但尚未实现的设计
 
-本次实现前桌面端还没有：
+当前桌面端仍未实现：
 
-- Task Scheduler 自启安装、查询和删除；
 - OMEN 事件源能力探测和事件转发；
 - OMEN 键动作解析器；
 - 独立的 topmost / no-activate / click-through 浮窗；
-- 这三项能力的持久化设置和最小 UI。
+- OMEN 键与悬浮窗相关设置。
 
 ## 4. 开源参考的结论
 
@@ -190,12 +189,13 @@ core 不负责创建窗口，也不直接操作用户界面。
 
 ### 6.4 `apps/desktop`
 
-负责：
+当前实现负责：
 
-- 设置页的三个最小入口；
-- 托盘菜单的“显示悬浮窗”；
-- 悬浮窗绘制和状态刷新；
-- 将 OMEN 键动作映射到 `AppHandle` 或 overlay controller。
+- 设置页的开机启动入口及错误状态；
+- 托盘菜单的主窗口显示/隐藏和显式退出；
+- 单实例唤醒与 `--background` 窗口生命周期。
+
+OMEN 键、事件桥和悬浮窗仍是未来设计，不属于当前实现。
 
 页面不得自己枚举进程、打开硬件句柄或写 Windows/HP 参数。
 
@@ -219,7 +219,7 @@ core 不负责创建窗口，也不直接操作用户界面。
 首版只创建一个当前用户登录任务：
 
 ```text
-Task name       phelperUserLogon
+Task name       phelper-user-logon
 Trigger         At logon, current user
 Run level       Highest
 Logon type      Interactive token
@@ -240,13 +240,13 @@ Power/timeout   no phelper-specific restriction; verify on reference machine
 
 启用时：
 
-1. 只操作固定的 `phelperUserLogon`；
+1. 只操作固定的 `phelper-user-logon`；
 2. 通过 `schtasks /Create /F` 幂等地创建或更新自己的任务；
-3. 创建/删除命令返回失败时，将原因写入 `ResidentSnapshot`；
+3. 创建/删除命令返回失败时，恢复真实勾选状态并显示可执行的错误；
 4. 不扫描、不修改其他任务；
-5. 将结果写入 `ResidentSnapshot`。
+5. 创建或删除后重新查询任务，确认实际状态与请求一致。
 
-禁用时只删除 `phelperUserLogon`，绝不删除其他任务、注册表启动项或 HP 任务。
+禁用时只删除 `phelper-user-logon`，绝不删除其他任务、注册表启动项或 HP 任务。
 
 exe 路径必须使用当前正在运行的绝对路径，不能写入相对路径、临时目录或开发构建目录的猜测值。
 
@@ -259,18 +259,18 @@ OMEN 事件 consumer 由 `LocalSystem` 执行，因此它比普通自启有更�
 ### 7.4 启动顺序
 
 ```text
-解析启动参数（普通 / `--background` / signal-only）
+解析启动参数（普通 / `--background`）
   →
-ensure_elevated
-  → single_instance_guard
-  → load UI/resident settings
-  → start_fast app-pump
+先尝试唤醒已有实例（避免重复 UAC）
+  → ensure_elevated
+  → single_instance_guard + show event
+  → start_with_publisher app-pump
   → install tray
-  → asynchronously reconcile autostart and OMEN event bridge
+  → asynchronously query autostart
   → 普通启动创建主窗口；background 启动创建隐藏窗口维持消息泵
 ```
 
-自启设置和事件桥不能阻塞首屏，也不能在 UI 线程同步等待 WMI/Task Scheduler。
+自启查询不能阻塞首屏，也不能在 UI 线程同步等待 Task Scheduler。
 
 ## 8. OMEN 键特殊映射
 
@@ -451,9 +451,10 @@ screen = "primary"
 
 配置缺失使用默认值；未知字段按现有设置策略告警并回退，不执行未知动作。
 
-## 10. 设置页与托盘入口
+## 10. 设置页与托盘入口（历史设计）
 
-设置页只增加一个“常驻”卡片，三组即可：
+当前设置页只保留“开机启动”。以下 OMEN 键和悬浮窗设置是尚未实现的原始方案，
+不作为当前能力：
 
 ```text
 开机启动       [开关]
@@ -461,7 +462,7 @@ OMEN 键        [动作选择]
 悬浮窗         [启动时显示/隐藏]  [左上 / 右上]
 ```
 
-悬浮窗当前是否显示不做成常驻大卡片；托盘菜单直接提供“显示/隐藏悬浮窗”。
+当前托盘只提供“显示/隐藏 phelper”和“退出”。开机启动只在设置页配置；悬浮窗入口不存在。
 
 OMEN 键动作选择只有动作名和当前值，不解释 WMI、pipe、Task Scheduler 等实现细节。能力不可用时整行禁用，并给出一句真正有用的原因。
 
@@ -470,30 +471,28 @@ OMEN 键动作选择只有动作名和当前值，不解释 WMI、pipe、Task Sc
 ### 11.1 正常启动
 
 ```text
-解析启动参数（普通 / `--background` / signal-only）
+解析启动参数（普通 / `--background`）
   →
-提权/单实例
-  → 读取设置
-  → 快速启动 app-pump
+先唤醒已有实例；不存在时提权并取得单实例互斥量
+  → 启动 app-pump
   → 创建托盘
   → 普通启动创建主窗口；background 启动创建隐藏窗口维持消息泵
-  → 后台探测并同步自启/OMEN 事件桥
-  → 第一份 snapshot 到达后允许浮窗显示数据
+  → 后台查询开机启动任务
 ```
 
-自启任务或 OMEN 事件桥的慢操作不能挡住主窗口的骨架渲染。
+任务计划程序的慢操作不能挡住主窗口的骨架渲染。
 
 ### 11.2 正常退出
 
 ```text
-隐藏并释放浮窗
-  → 停止 OMEN 事件桥
+用户在托盘中明确选择“退出”，或 Windows 注销/关闭
   → AppHandle::shutdown()
   → ControlCoordinator / KeepAliveService 恢复安全状态
   → 进程退出
 ```
 
-自启任务不会在退出时删除；用户关闭自启才删除。退出恢复仍由现有 AR-12 路径负责。
+窗口关闭按钮只隐藏主窗口，不触发退出或恢复。自启任务不会在退出时删除；用户关闭
+自启或卸载程序时才删除。退出恢复仍由现有 AR-12 路径负责。
 
 ### 11.3 崩溃与断线
 
@@ -513,39 +512,39 @@ OMEN 键动作选择只有动作名和当前值，不解释 WMI、pipe、Task Sc
 
 ## 12. 实现阶段与状态
 
-### Phase A — 只读探测与领域模型（已实现）
+### Phase A — 常驻生命周期（已实现，HIL 待完成）
 
-- 增加 `ResidentSettings`、`OmenKeyAction`、`OverlaySettings`；
-- 为配置补充 round-trip、未知动作和默认值测试；
-- 实现 OMEN event provider 的只读 capability probe；
-- 记录当前 8BAB 的真实结果，不因参考项目存在就标记支持。
+- `--background` 创建隐藏主窗口并保持 GPUI/托盘消息泵；
+- 关闭按钮隐藏到托盘，托盘显式退出复用 AR-12 恢复路径；
+- 第二次启动先唤醒已有实例，不创建第二个硬件写者；
+- Windows 注销/关闭进入同一恢复路径；
+- `tray-icon` 的 Windows 实现负责 Explorer 重启后的托盘图标重建。
 
 ### Phase B — 开机自启（已实现）
 
 - 实现只属于 phelper 的 Task Scheduler 任务创建/更新/删除；
-- 接入启动后的异步 reconcile；
-- 增加启动参数和“任务不存在不误判权限错误”的单元测试；
+- 启动后异步查询实际任务状态，操作完成后再次读回验证；
+- 增加启动参数与带空格 exe 路径的单元测试；
 - 登录后无重复进程、无额外 UAC 弹窗仍待真实机器验证。
 
-### Phase C — 悬浮窗（已实现）
+### Phase C — 悬浮窗（未实现，不在当前范围）
 
 - 先做独立窗口生命周期和 HWND 样式；
 - 复用 `AppState`，不增加硬件采集路径；
 - 只展示 §9.3 的必要数据；
 - DPI、多屏、全屏程序、焦点和点击穿透仍待 HIL 验证。
 
-### Phase D — OMEN 键事件桥（已实现；实机 HIL 待完成）
+### Phase D — OMEN 键事件桥（未实现，不在当前范围）
 
 - 在 capability probe 有证据后安装事件转发；
 - 通过固定 `OmenKeyPressed` 事件接入 action resolver；
 - 先实现 ToggleOverlay，再实现 NextProfile 和 SendShortcut；
 - 对未支持设备隐藏/禁用配置，不做假成功。
 
-### Phase E — UI 与整机验收（代码已实现；HIL 待完成）
+### Phase E — 整机验收（待完成）
 
-- 设置页只接入三个必要入口；
-- 托盘菜单接入浮窗显示；
-- 做冷启动、登录、自启关闭、OMEN 键、profile、退出恢复的 HIL 测试；
+- 设置页接入开机启动；托盘只接入显示/隐藏和退出；
+- 做冷启动、登录、自启关闭、单实例唤醒、Explorer 重启和退出恢复的 HIL 测试；
 - 更新 README 和当前能力表。
 
 ## 13. 验收标准
@@ -558,7 +557,7 @@ OMEN 键动作选择只有动作名和当前值，不解释 WMI、pipe、Task Sc
 - 关闭“开机启动”后任务被删除，其他任务不受影响；
 - exe 移动或升级后再次启用能修正任务路径。
 
-### OMEN 键
+### OMEN 键（未来验收目标，当前未实现）
 
 - 当前机器只有在真实事件能力探测成功后才显示可用；
 - 连按 20 次不会出现明显重复触发或漏触发；
@@ -567,7 +566,7 @@ OMEN 键动作选择只有动作名和当前值，不解释 WMI、pipe、Task Sc
 - `Default` 不会误发送快捷键；
 - 事件桥停止后 core 仍能正常控制和退出恢复。
 
-### 悬浮窗
+### 悬浮窗（未来验收目标，当前未实现）
 
 - 打开速度不依赖重新初始化硬件 provider；
 - 不抢焦点、不出现在任务栏、不拦截鼠标和键盘；
