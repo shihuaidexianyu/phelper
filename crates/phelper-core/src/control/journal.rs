@@ -46,6 +46,12 @@ pub struct ControlJournal {
     bios_version: String,
 }
 
+/// Rotate at open once the journal outgrows this. The old file becomes
+/// `<name>.1.jsonl` (exactly one generation kept) and a fresh file
+/// starts. Long-running sessions also checkpoint before truncating the
+/// active file; its previous contents remain durable in the backup.
+const MAX_JOURNAL_BYTES: u64 = 8 * 1024 * 1024;
+
 impl ControlJournal {
     /// Default location: `<data_dir>/state/control-journal.jsonl`.
     pub fn default_path() -> PathBuf {
@@ -59,6 +65,14 @@ impl ControlJournal {
             std::fs::create_dir_all(parent).map_err(|e| {
                 EngineError::Persistence(format!("create {}: {e}", parent.display()))
             })?;
+        }
+        if let Ok(meta) = std::fs::metadata(path)
+            && meta.len() >= MAX_JOURNAL_BYTES
+        {
+            // One generation of history is enough for a single-machine
+            // tool. If the rename fails the file is opened in append mode
+            // anyway — keeping evidence beats keeping tidy.
+            let _ = std::fs::rename(path, path.with_extension("1.jsonl"));
         }
         let file = OpenOptions::new()
             .create(true)
@@ -93,12 +107,65 @@ impl ControlJournal {
     pub fn append(&mut self, entry: &JournalEntry) -> Result<(), EngineError> {
         let line = serde_json::to_string(entry)
             .map_err(|e| EngineError::Persistence(format!("journal serialize: {e}")))?;
+        if self
+            .file
+            .metadata()
+            .is_ok_and(|m| m.len() >= MAX_JOURNAL_BYTES)
+        {
+            let backup = self.path.with_extension("1.jsonl");
+            // Do not truncate if any checkpoint operation fails.
+            std::fs::copy(&self.path, &backup)
+                .and_then(|_| OpenOptions::new().write(true).open(backup)?.sync_all())
+                .and_then(|_| self.file.set_len(0))
+                .map_err(|e| EngineError::Persistence(format!("journal checkpoint: {e}")))?;
+        }
         self.file
             .write_all(line.as_bytes())
             .and_then(|()| self.file.write_all(b"\n"))
             .and_then(|()| self.file.flush())
             .and_then(|()| self.file.sync_data())
             .map_err(|e| EngineError::Persistence(format!("append {}: {e}", self.path.display())))
+    }
+}
+
+/// Bounded evidence export. An incomplete first/last JSONL record is
+/// reported as a parse error rather than represented as a completed write.
+pub fn diagnostic_tail(path: &Path) -> serde_json::Value {
+    use std::io::{Read, Seek, SeekFrom};
+    let read = || -> std::io::Result<String> {
+        let mut file = std::fs::File::open(path)?;
+        let length = file.metadata()?.len();
+        let start = length.saturating_sub(512 * 1024);
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::new();
+        file.take(512 * 1024).read_to_end(&mut bytes)?;
+        if start != 0 {
+            if let Some(end) = bytes.iter().position(|b| *b == b'\n') {
+                bytes.drain(..=end);
+            } else {
+                bytes.clear();
+            }
+        }
+        String::from_utf8(bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    };
+    match read() {
+        Ok(text) => {
+            let mut entries: Vec<serde_json::Value> = text
+                .lines()
+                .rev()
+                .take(100)
+                .map(|line| {
+                    serde_json::from_str::<JournalEntry>(line)
+                        .and_then(serde_json::to_value)
+                        .unwrap_or_else(|e| serde_json::json!({"parse_error": e.to_string()}))
+                })
+                .collect();
+            entries.reverse();
+            serde_json::json!(entries)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!([]),
+        Err(e) => serde_json::json!({"read_error": e.to_string()}),
     }
 }
 
@@ -169,5 +236,46 @@ mod tests {
         .unwrap();
         assert_eq!(v.before, None);
         assert_eq!(v.after, None);
+    }
+
+    #[test]
+    fn oversized_journal_rotates_at_open() {
+        let dir =
+            std::env::temp_dir().join(format!("phelper-journal-rotate-{}", std::process::id()));
+        let path = dir.join("control-journal.jsonl");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, vec![b'x'; (MAX_JOURNAL_BYTES + 1) as usize]).unwrap();
+        {
+            let mut j = ControlJournal::open(&path, "8BAB", "F.30").unwrap();
+            let e = j.new_entry(JournalOrigin::User, sample_outcome());
+            j.append(&e).unwrap();
+        }
+        // The old content moved aside intact; the new file holds exactly
+        // the fresh entry.
+        let rotated = path.with_extension("1.jsonl");
+        assert_eq!(
+            std::fs::metadata(&rotated).unwrap().len(),
+            MAX_JOURNAL_BYTES + 1
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undersized_journal_is_not_rotated() {
+        let dir =
+            std::env::temp_dir().join(format!("phelper-journal-norotate-{}", std::process::id()));
+        let path = dir.join("control-journal.jsonl");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, b"{\"old\":true}\n").unwrap();
+        {
+            let _j = ControlJournal::open(&path, "8BAB", "F.30").unwrap();
+        }
+        assert!(!path.with_extension("1.jsonl").exists());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"old\":true}\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

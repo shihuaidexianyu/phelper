@@ -40,21 +40,22 @@ impl MetricCard {
                 skeleton: false,
             };
         };
-        let quality = if s.value.as_f64().is_some() {
-            s.quality
-        } else {
-            MetricQuality::Unavailable
-        };
+        // MetricValue::as_f64 is total (every variant converts), so a
+        // PRESENT sample always has a displayable value; quality comes
+        // straight from the collector. Absent samples took the early
+        // return above (2026-09 audit: the old remap here was dead code).
+        let quality = s.quality;
         let stale = s.timestamp.elapsed() > cadence * 3
             || matches!(
                 quality,
                 MetricQuality::Stale | MetricQuality::Unavailable | MetricQuality::Unsupported
             );
-        let value = s
-            .value
-            .as_f64()
-            .map(|v| format!("{v:.decimals$}"))
-            .unwrap_or_else(|| "—".into());
+        let value = match s.value.as_f64() {
+            Some(v) => format!("{v:.decimals$}"),
+            // Unreachable today (as_f64 is total); kept panic-free in case
+            // a future MetricValue variant stops converting.
+            None => "—".into(),
+        };
         Self {
             title: title.into(),
             value: value.into(),

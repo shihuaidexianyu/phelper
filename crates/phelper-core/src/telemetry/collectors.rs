@@ -7,8 +7,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use phelper_domain::ports::{GpuTelemetry, HpPlatform, PowerStatus, SystemCounters};
-use phelper_domain::telemetry::{MetricQuality, MetricSample, MetricSource, ProviderStatus, ids};
+use phelper_domain::ports::{HpPlatform, PowerStatus, SystemCounters};
+use phelper_domain::telemetry::{MetricSample, MetricSource, ProviderStatus, ids};
+#[cfg(feature = "nvidia")]
+use phelper_domain::{ports::GpuTelemetry, telemetry::MetricQuality};
 use tracing::{debug, warn};
 
 use super::registry;
@@ -115,7 +117,20 @@ impl Collector for PawnioCollector {
         use crate::platform::pawnio as p;
         let src = MetricSource::PawnIoMsr;
         let mut out = Vec::with_capacity(12);
-        let mut degraded = None;
+        // Accumulate failures within one round — the last error must not
+        // hide the first (a partially failing provider should report all
+        // broken channels).
+        let mut degraded: Option<String> = None;
+        macro_rules! note_fail {
+            ($msg:expr) => {
+                if let Some(d) = degraded.as_mut() {
+                    d.push_str("; ");
+                    d.push_str($msg);
+                } else {
+                    degraded = Some($msg.to_string());
+                }
+            };
+        }
         let now = Instant::now();
         self.ticks = self.ticks.wrapping_add(1);
 
@@ -133,7 +148,7 @@ impl Collector for PawnioCollector {
             }
             Err(e) => {
                 debug!(%e, "pkg therm read failed");
-                degraded = Some(format!("therm read: {e}"));
+                note_fail!(&format!("therm read: {e}"));
             }
         }
 
@@ -152,12 +167,14 @@ impl Collector for PawnioCollector {
             }
             Err(e) => {
                 debug!(%e, "rapl read failed");
-                degraded = Some(format!("rapl read: {e}"));
+                note_fail!(&format!("rapl read: {e}"));
             }
         }
 
         // Effective clock (ΔAPERF/ΔMPERF; migration outliers discarded).
-        match (read(p::MSR_MPERF), read(p::MSR_APERF)) {
+        let mperf = read(p::MSR_MPERF);
+        let aperf = read(p::MSR_APERF);
+        match (mperf, aperf) {
             (Ok(mperf), Ok(aperf)) => {
                 if let Some(prev) = self.prev_perf
                     && let Some(mhz) = p::effective_clock_mhz(self.tsc_mhz, prev, (mperf, aperf))
@@ -166,9 +183,13 @@ impl Collector for PawnioCollector {
                 }
                 self.prev_perf = Some((mperf, aperf));
             }
-            _ => {
-                debug!("mperf/aperf read failed");
-                degraded = Some("mperf/aperf read failed".into());
+            (Err(e), _) => {
+                debug!(%e, "mperf read failed");
+                note_fail!(&format!("mperf read: {e}"));
+            }
+            (_, Err(e)) => {
+                debug!(%e, "aperf read failed");
+                note_fail!(&format!("aperf read: {e}"));
             }
         }
 
@@ -190,7 +211,7 @@ impl Collector for PawnioCollector {
             }
             Err(e) => {
                 debug!(%e, "0x610 power-limit read failed");
-                degraded = Some(format!("0x610 read: {e}"));
+                note_fail!(&format!("0x610 read: {e}"));
             }
         }
 
@@ -598,12 +619,12 @@ impl<H: HpPlatform + Sync> Collector for HpFanCollector<H> {
             // sensor-freeze watchdog used by manual fan control.
             return Vec::new();
         }
-        match self.hp.fan_levels() {
-            Ok(levels) => {
-                self.last = Some((Instant::now(), levels));
+        match self.hp.fan_levels_sample() {
+            Ok((levels, at)) => {
+                self.last = Some((at, levels));
                 self.status = ProviderStatus::Ok;
                 let src = MetricSource::HpWmi;
-                vec![
+                let mut samples = vec![
                     // The domain fields retain the upstream CPU/GPU wire
                     // names for compatibility. On 8BAB, channel 0/1 are
                     // presented to the user as the physical left/right fans.
@@ -613,7 +634,11 @@ impl<H: HpPlatform + Sync> Collector for HpFanCollector<H> {
                         f64::from(levels.right_rpm()).into(),
                         src,
                     ),
-                ]
+                ];
+                for sample in &mut samples {
+                    sample.timestamp = at;
+                }
+                samples
             }
             Err(e) => {
                 warn!(%e, "fan levels read failed");

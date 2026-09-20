@@ -1,5 +1,6 @@
 //! Serialization and bounded Busy retry for the profile-only write surface.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use phelper_domain::command::{ControlCommand, ControlReceipt};
@@ -12,7 +13,7 @@ pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 struct Slot {
-    pending: Option<ControlCommand>,
+    pending: VecDeque<(KnobId, ControlCommand)>,
     in_flight: Option<ControlReceipt>,
     next_attempt_at: Option<Instant>,
     busy_since: Option<Instant>,
@@ -64,8 +65,8 @@ impl Coalescer {
     /// The latest click wins if one arrives before dispatch. Once a profile
     /// is in flight, the next click remains pending until it completes.
     pub fn enqueue(&mut self, knob: KnobId, command: ControlCommand) -> bool {
-        debug_assert_eq!(knob, KnobId::Profile);
-        self.slot.pending = Some(command);
+        self.slot.pending.retain(|(key, _)| *key != knob);
+        self.slot.pending.push_back((knob, command));
         true
     }
 
@@ -76,13 +77,13 @@ impl Coalescer {
         }
         self.slot
             .pending
-            .take()
-            .map(|command| vec![(KnobId::Profile, command)])
+            .pop_front()
+            .map(|command| vec![command])
             .unwrap_or_default()
     }
 
     pub fn has_work(&self) -> bool {
-        self.slot.pending.is_some() || self.slot.in_flight.is_some()
+        !self.slot.pending.is_empty() || self.slot.in_flight.is_some()
     }
 
     pub fn note_dispatched(
@@ -92,7 +93,7 @@ impl Coalescer {
         receipt: ControlReceipt,
         now: Instant,
     ) {
-        debug_assert_eq!(knob, KnobId::Profile);
+        let _ = knob;
         self.slot.in_flight = Some(receipt);
         self.slot.next_attempt_at = Some(now + self.min_interval);
         self.slot.busy_since = None;
@@ -104,25 +105,25 @@ impl Coalescer {
         command: ControlCommand,
         now: Instant,
     ) -> BusyVerdict {
-        debug_assert_eq!(knob, KnobId::Profile);
+        let _ = knob;
         let since = *self.slot.busy_since.get_or_insert(now);
         if now.duration_since(since) >= self.busy_timeout {
-            self.slot.pending = None;
+            self.slot.pending.retain(|(key, _)| *key != knob);
             self.slot.busy_since = None;
             return BusyVerdict::TimedOut;
         }
-        self.slot.pending = Some(command);
+        self.slot.pending.push_front((knob, command));
         self.slot.next_attempt_at = Some(now + self.busy_backoff);
         BusyVerdict::Retry
     }
 
     pub fn note_dispatch_error(&mut self, knob: KnobId) {
-        debug_assert_eq!(knob, KnobId::Profile);
+        let _ = knob;
         self.slot.busy_since = None;
     }
 
     pub fn note_completed(&mut self, knob: KnobId) {
-        debug_assert_eq!(knob, KnobId::Profile);
+        let _ = knob;
         self.slot.in_flight = None;
         self.slot.busy_since = None;
     }
@@ -153,6 +154,19 @@ mod tests {
         assert!(queue.poll(now).is_empty());
         queue.note_completed(KnobId::Profile);
         assert_eq!(queue.poll(now).len(), 1);
+    }
+
+    #[test]
+    fn replacing_one_knob_preserves_other_pending_commands() {
+        let now = Instant::now();
+        let mut queue =
+            Coalescer::with_intervals(Duration::ZERO, Duration::ZERO, Duration::from_secs(1));
+        queue.enqueue(KnobId::Cpu, profile("old-cpu"));
+        queue.enqueue(KnobId::Fan, profile("fan"));
+        queue.enqueue(KnobId::Cpu, profile("new-cpu"));
+        assert_eq!(queue.poll(now), vec![(KnobId::Fan, profile("fan"))]);
+        assert_eq!(queue.poll(now), vec![(KnobId::Cpu, profile("new-cpu"))]);
+        assert!(queue.poll(now).is_empty());
     }
 
     #[test]

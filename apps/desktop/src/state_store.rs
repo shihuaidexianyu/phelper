@@ -22,25 +22,32 @@ impl GpuiStatePublisher {
             wake_rx,
         )
     }
+
+    /// Poisoned-read recovery: keep the LAST snapshot instead of flashing
+    /// back to a default AppState (engine = Starting, empty telemetry) —
+    /// a UI that briefly shows "starting up" mid-session misleads triage.
+    /// Same soundness argument as the telemetry store: a panic under the
+    /// guard can only have LOST updates in this plain-data state.
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, AppState> {
+        self.state.read().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 impl StatePublisher for GpuiStatePublisher {
     fn update(&self, apply: Box<dyn FnOnce(&mut AppState) + Send>) {
-        let updated = self
-            .state
-            .write()
-            .map(|mut state| apply(&mut state))
-            .is_ok();
-        if updated && let Ok(mut tx) = self.wake_tx.lock() {
+        // Poisoned-write recovery, same rule: recover the inner state and
+        // apply — at worst one stale field, never a silently dropped wake
+        // (the UI would freeze on pre-update data).
+        let mut guard = self.state.write().unwrap_or_else(|e| e.into_inner());
+        apply(&mut guard);
+        drop(guard);
+        if let Ok(mut tx) = self.wake_tx.lock() {
             let _ = tx.try_send(());
         }
     }
 
     fn snapshot(&self) -> AppState {
-        self.state
-            .read()
-            .map(|state| state.clone())
-            .unwrap_or_default()
+        self.read().clone()
     }
 }
 

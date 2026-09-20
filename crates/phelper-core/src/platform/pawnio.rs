@@ -53,10 +53,15 @@ impl PawnIo {
         }
         .map_err(|e| PlatformError::Driver(format!("PawnIO device open failed: {e}")))?;
 
+        // Park the raw handle in the PawnIo wrapper immediately: its Drop
+        // impl owns CloseHandle, so the module-load error path below cannot
+        // leak the device handle.
+        let io = Self { handle };
+
         let mut returned: u32 = 0;
         unsafe {
             DeviceIoControl(
-                handle,
+                io.handle,
                 IOCTL_LOAD_BINARY,
                 Some(module_image.as_ptr().cast()),
                 module_image.len() as u32,
@@ -68,7 +73,7 @@ impl PawnIo {
         }
         .map_err(|e| PlatformError::Driver(format!("module load failed: {e}")))?;
 
-        Ok(Self { handle })
+        Ok(io)
     }
 
     /// Execute a module function. Input/output are i64 lanes (LE).
@@ -102,6 +107,18 @@ impl PawnIo {
             )
         }
         .map_err(|e| PlatformError::Driver(format!("execute {func}: {e}")))?;
+
+        // The execute contract returns exactly output.len() * 8 bytes, and
+        // every opcode used in this crate has a fixed-width output. A short
+        // return must NOT be published: the unwritten lanes would stay zeroed
+        // and upstream telemetry would report them as real 0 values (e.g.
+        // PL1/PL2 = 0 W) — fail instead of fabricating data.
+        let expected = out_bytes.len();
+        if (returned as usize) < expected {
+            return Err(PlatformError::Driver(format!(
+                "execute {func}: short return ({returned} of {expected} bytes)"
+            )));
+        }
 
         let lanes = (returned as usize / 8).min(output.len());
         for (i, slot) in output.iter_mut().enumerate().take(lanes) {

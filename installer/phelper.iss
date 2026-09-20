@@ -1,15 +1,22 @@
 ; phelper Windows installer.
 ;
-; The installer contains one release executable. The application icon,
-; PawnIO modules, and GPUI resources are embedded by the build; no assets
-; directory is installed beside the exe.
+; The application icon, PawnIO modules, and GPUI resources are embedded.
+; PresentMon is a pinned portable console, installed with its license.
 
 #ifndef MyAppVersion
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.2.0"
 #endif
 
 #ifndef BuildDir
 #define BuildDir "..\target\release"
+#endif
+
+#ifndef ToolsDir
+#define ToolsDir "..\target\installer-support\tools"
+#endif
+
+#ifndef VCRuntimeDir
+#error VCRuntimeDir must point to the Visual Studio x64 CRT redistributable directory
 #endif
 
 #define MyAppName "phelper"
@@ -35,6 +42,8 @@ WizardStyle=modern
 SetupIconFile=..\apps\desktop\assets\phelper.ico
 CloseApplications=no
 RestartApplications=no
+; Let the user exit from the tray so hardware cleanup can finish first.
+AppMutex=Global\phelper-desktop-8bab-single-instance,Global\phelper-desktop-8bab-single-instance-read-only,Global\Phelper.HardwareControl.8BAB.v1
 UninstallDisplayName={#MyAppName}
 UninstallDisplayIcon={app}\{#MyAppExeName}
 
@@ -43,6 +52,10 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 
 [Files]
 Source: "{#BuildDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#VCRuntimeDir}\vcruntime140.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#ToolsDir}\PresentMon-2.5.1-x64.exe"; DestDir: "{app}\tools"; Flags: ignoreversion
+Source: "licenses\PresentMon-LICENSE.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
+Source: "..\assets\pawnio\COPYING"; DestDir: "{app}\licenses"; DestName: "PawnIO-COPYING.txt"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Comment: "HP OMEN performance control"

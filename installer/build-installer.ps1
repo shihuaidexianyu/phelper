@@ -1,6 +1,7 @@
 param(
     [string]$BuildDir = "",
-    [string]$Version = "0.1.0",
+    [string]$Version = "0.2.0",
+    [string]$VCRuntimeDir = "",
     [switch]$SkipBuild
 )
 
@@ -17,7 +18,7 @@ if ([string]::IsNullOrWhiteSpace($BuildDir)) {
 if (-not $SkipBuild) {
     Push-Location $repoRoot
     try {
-        cargo build -p phelper-desktop --release
+        cargo build -p phelper-desktop --release --locked
         if ($LASTEXITCODE -ne 0) {
             throw "release build failed with exit code $LASTEXITCODE"
         }
@@ -42,11 +43,33 @@ if ([string]::IsNullOrWhiteSpace($iscc)) {
     throw "ISCC.exe not found; install Inno Setup 6 first"
 }
 
+$toolsDir = Join-Path $repoRoot "target\installer-support\tools"
+& (Join-Path $repoRoot "scripts\install-presentmon.ps1") -ToolsDir $toolsDir
+
+# Deploy the release CRT app-locally from Visual Studio's redistributable
+# directory; do not copy system DLLs or install a machine-wide runtime.
+if ([string]::IsNullOrWhiteSpace($VCRuntimeDir)) {
+    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (Test-Path -LiteralPath $vswhere) {
+        $vsPath = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        if ($vsPath) {
+            $redist = Get-ChildItem -Path "$vsPath\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT\vcruntime140.dll" |
+                Sort-Object { [version]$_.VersionInfo.FileVersion } -Descending | Select-Object -First 1
+            if ($redist) { $VCRuntimeDir = $redist.DirectoryName }
+        }
+    }
+}
+if ([string]::IsNullOrWhiteSpace($VCRuntimeDir) -or
+    -not (Test-Path -LiteralPath (Join-Path $VCRuntimeDir "vcruntime140.dll") -PathType Leaf)) {
+    throw "Visual C++ x64 redistributable DLL not found; specify -VCRuntimeDir from Visual Studio's VC\Redist directory"
+}
+$VCRuntimeDir = (Resolve-Path -LiteralPath $VCRuntimeDir).Path
+
 $distDir = Join-Path $repoRoot "dist"
 New-Item -ItemType Directory -Path $distDir -Force | Out-Null
 Push-Location $repoRoot
 try {
-    & $iscc "/Qp" "/DMyAppVersion=$Version" "/DBuildDir=$BuildDir" $issPath
+    & $iscc "/Qp" "/DMyAppVersion=$Version" "/DBuildDir=$BuildDir" "/DToolsDir=$toolsDir" "/DVCRuntimeDir=$VCRuntimeDir" $issPath
     if ($LASTEXITCODE -ne 0) {
         throw "Inno Setup compilation failed with exit code $LASTEXITCODE"
     }
@@ -55,5 +78,12 @@ try {
 }
 
 $installerPath = Join-Path $distDir "phelper-Setup-$Version.exe"
-Get-Item -LiteralPath $installerPath | Select-Object FullName, Length, LastWriteTime
-Get-FileHash -LiteralPath $installerPath -Algorithm SHA256 | Select-Object Algorithm, Hash, Path
+$hash = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+"$hash  $([IO.Path]::GetFileName($installerPath))" |
+    Set-Content -LiteralPath "$installerPath.sha256" -Encoding ascii
+[pscustomobject]@{
+    Installer = $installerPath
+    Bytes = (Get-Item -LiteralPath $installerPath).Length
+    SHA256 = $hash
+    VCRuntime = $VCRuntimeDir
+} | Format-List

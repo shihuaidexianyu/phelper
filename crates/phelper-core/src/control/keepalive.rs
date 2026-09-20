@@ -101,7 +101,8 @@ impl KeepAliveService {
     pub fn reschedule_tracked(&mut self, tracked: &[ReAssert], now: Instant) {
         if tracked.is_empty() {
             self.next_due = None;
-        } else {
+            self.consecutive_failures = 0;
+        } else if self.next_due.is_none() {
             self.next_due = Some(now + self.period);
         }
     }
@@ -223,6 +224,21 @@ mod tests {
             Duration::from_secs(3600)
         );
         assert!(!ka.is_due(t0 + PERIOD));
+    }
+
+    #[test]
+    fn unrelated_commands_cannot_postpone_heartbeat_or_failure_retry() {
+        let mut ka = KeepAliveService::new();
+        let start = Instant::now();
+        let tracked = [ReAssert::MaxFan];
+        ka.reschedule_tracked(&tracked, start);
+        for seconds in 1..=60 {
+            ka.reschedule_tracked(&tracked, start + Duration::from_secs(seconds));
+        }
+        assert!(ka.is_due(start + PERIOD));
+        assert!(!ka.record_failure(start + PERIOD));
+        ka.reschedule_tracked(&tracked, start + PERIOD + Duration::from_secs(4));
+        assert!(ka.is_due(start + PERIOD + RETRY_DELAY));
     }
 
     #[test]

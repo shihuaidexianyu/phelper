@@ -38,6 +38,14 @@ pub struct ControlArgs {
 enum ControlCmd {
     /// Capability surface + observed state + OGH findings + journal tail.
     Status,
+    /// Restore owned hardware fields or an unfinished previous session.
+    Restore,
+    /// Development validation only. Persists a request; never reboots Windows.
+    #[cfg(feature = "experimental-mux")]
+    Mux {
+        #[arg(value_parser = ["hybrid", "discrete"])]
+        mode: String,
+    },
     /// Set CPU Energy Performance Preference (0-100; 0 = max performance).
     Epp {
         /// AC value (percent).
@@ -277,9 +285,23 @@ enum Plan {
 fn plan(args: &ControlArgs) -> Result<Plan> {
     let planned = match &args.cmd {
         ControlCmd::Status => Plan::Status,
+        ControlCmd::Restore => Plan::Change(ControlCommand::RestoreSession),
+        #[cfg(feature = "experimental-mux")]
+        ControlCmd::Mux { mode } => Plan::Change(ControlCommand::SetMuxMode(if mode == "hybrid" {
+            phelper_core::domain::policy::MuxMode::Hybrid
+        } else {
+            phelper_core::domain::policy::MuxMode::Discrete
+        })),
         ControlCmd::Epp { ac, dc } => {
             if ac.is_none() && dc.is_none() {
                 bail!("nothing to do: pass --ac and/or --dc");
+            }
+            for (side, v) in [("ac", *ac), ("dc", *dc)] {
+                if let Some(epp) = v
+                    && epp > 100
+                {
+                    bail!("--{side}: EPP {epp} out of range 0..=100");
+                }
             }
             Plan::Change(ControlCommand::SetCpuPolicy(CpuPolicy {
                 epp_ac: *ac,
@@ -290,6 +312,13 @@ fn plan(args: &ControlArgs) -> Result<Plan> {
         ControlCmd::Epp1 { ac, dc } => {
             if ac.is_none() && dc.is_none() {
                 bail!("nothing to do: pass --ac and/or --dc");
+            }
+            for (side, v) in [("ac", *ac), ("dc", *dc)] {
+                if let Some(epp) = v
+                    && epp > 100
+                {
+                    bail!("--{side}: EPP1 {epp} out of range 0..=100");
+                }
             }
             Plan::Change(ControlCommand::SetCpuPolicy(CpuPolicy {
                 epp1_ac: *ac,
@@ -319,6 +348,13 @@ fn plan(args: &ControlArgs) -> Result<Plan> {
             if ac.is_none() && dc.is_none() {
                 bail!("nothing to do: pass --ac and/or --dc");
             }
+            for (side, v) in [("ac", *ac), ("dc", *dc)] {
+                if let Some(pct) = v
+                    && pct > 100
+                {
+                    bail!("--{side}: minimum performance {pct}% out of range 0..=100");
+                }
+            }
             Plan::Change(ControlCommand::SetCpuPolicy(CpuPolicy {
                 min_performance_ac: *ac,
                 min_performance_dc: *dc,
@@ -328,6 +364,13 @@ fn plan(args: &ControlArgs) -> Result<Plan> {
         ControlCmd::MaxPerf { ac, dc } => {
             if ac.is_none() && dc.is_none() {
                 bail!("nothing to do: pass --ac and/or --dc");
+            }
+            for (side, v) in [("ac", *ac), ("dc", *dc)] {
+                if let Some(pct) = v
+                    && pct > 100
+                {
+                    bail!("--{side}: maximum performance {pct}% out of range 0..=100");
+                }
             }
             Plan::Change(ControlCommand::SetCpuPolicy(CpuPolicy {
                 max_performance_ac: *ac,
@@ -357,29 +400,18 @@ fn plan(args: &ControlArgs) -> Result<Plan> {
             pl4,
             hold,
         } => {
-            if !(15..=130).contains(pl1) {
-                bail!("--pl1: {pl1}W out of 13900HX envelope 15..=130");
-            }
-            if !(15..=157).contains(pl2) {
-                bail!("--pl2: {pl2}W out of 13900HX envelope 15..=157");
-            }
-            if pl2 < pl1 {
-                bail!("--pl2 must be >= --pl1 (kernel-validated invariant)");
-            }
-            if let Some(p4) = pl4
-                && !(30..=200).contains(p4)
-            {
-                bail!("--pl4: {p4}W outside envelope 30..=200 (factory ceiling, SDD byte5)");
-            }
-            Plan::HpState(
-                ControlCommand::SetPowerLimits(phelper_core::domain::policy::CpuPowerLimits {
-                    pl1_w: *pl1,
-                    pl2_w: *pl2,
-                    pl4_w: pl4.unwrap_or(0),
-                    cpu_gpu_concurrent_w: 0,
-                }),
-                *hold,
-            )
+            let limits = phelper_core::domain::policy::CpuPowerLimits {
+                pl1_w: *pl1,
+                pl2_w: *pl2,
+                pl4_w: pl4.unwrap_or(0),
+                cpu_gpu_concurrent_w: 0,
+            };
+            // Shared envelope check (domain) — the desktop form runs the
+            // same function; core safety re-validates after engine start.
+            limits
+                .validate()
+                .map_err(|e| anyhow::anyhow!("--power-limits rejected: {e}"))?;
+            Plan::HpState(ControlCommand::SetPowerLimits(limits), *hold)
         }
         ControlCmd::GpuPolicy {
             ctgp,
@@ -721,6 +753,7 @@ fn print_observed(obs: &ObservedState) {
     println!("  max_perf_dc:  {}", fmt_obs(&obs.max_performance_dc));
     println!("  gpu_policy:   {}", fmt_obs(&obs.gpu_platform_policy));
     println!("  mux:          {}", fmt_obs(&obs.mux));
+    println!("  mux lifecycle: {}", obs.mux_status);
     println!("  power_limits: {}", fmt_obs(&obs.power_limits));
 }
 
@@ -801,16 +834,54 @@ fn fmt_verification(v: &Verification) -> String {
 
 fn print_journal_tail(n: usize) {
     let path = ControlJournal::default_path();
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        println!("  (no journal yet at {})", path.display());
-        return;
+    // Read only the tail of the file (2026-09 audit): the journal can be
+    // up to the 8 MiB rotation threshold, and `control status` must not
+    // pay a full read + UTF-8 validation just to show 10 rows.
+    const TAIL_BYTES: u64 = 256 * 1024;
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(_) => {
+            println!("  (no journal yet at {})", path.display());
+            return;
+        }
     };
-    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-    let start = lines.len().saturating_sub(n);
-    if start > 0 {
-        println!("  ({} earlier entries omitted)", start);
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(TAIL_BYTES);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        println!("  (journal at {} is not seekable)", path.display());
+        return;
     }
-    for line in &lines[start..] {
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).is_err() {
+        println!("  (journal at {} is not readable)", path.display());
+        return;
+    }
+    // A mid-file seek can land inside a JSONL row; drop the partial first
+    // line so every printed row is a complete entry.
+    let bytes = if start > 0 {
+        match buf.iter().position(|&b| b == b'\n') {
+            Some(i) => &buf[i + 1..],
+            None => &buf[..0],
+        }
+    } else {
+        &buf[..]
+    };
+    let text = String::from_utf8_lossy(bytes);
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let omitted = if start > 0 {
+        " (oldest entries not read)"
+    } else {
+        ""
+    };
+    let start_idx = lines.len().saturating_sub(n);
+    if start_idx > 0 || start > 0 {
+        println!(
+            "  (showing last {} of the tail entries{omitted})",
+            lines.len() - start_idx
+        );
+    }
+    for line in &lines[start_idx..] {
         // Journal lines are self-contained JSONL (§56) — print raw.
         println!("  {line}");
     }

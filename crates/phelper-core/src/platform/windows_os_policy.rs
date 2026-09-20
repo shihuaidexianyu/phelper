@@ -249,7 +249,9 @@ impl OsPolicyHandle {
     ) -> Result<ApplyOwnedResult, PlatformError> {
         policy.validate_for(&target).map_err(PlatformError::Os)?;
         if matches!(target, OsPolicyTarget::Process { pid } if pid == std::process::id()) {
-            return Err(PlatformError::Os("拒绝修改 phelper 自身的调度策略".into()));
+            return Err(PlatformError::Os(
+                "refusing to modify phelper's own scheduling policy".into(),
+            ));
         }
 
         let mut inner = self.lock()?;
@@ -286,7 +288,7 @@ impl OsPolicyHandle {
             && !same_target_identity(existing, &before)
         {
             return Err(PlatformError::Os(
-                "目标 PID/TID 已被另一个可执行文件复用，拒绝覆盖原策略".into(),
+                "target PID/TID was reused by another executable — refusing to overwrite the existing policy".into(),
             ));
         }
         if unchanged {
@@ -333,7 +335,7 @@ impl OsPolicyHandle {
                 );
                 inner.recovery_pending.insert(target);
                 return Err(PlatformError::Os(format!(
-                    "{error}; 回滚失败，已保留恢复任务：{rollback_error}"
+                    "{error}; rollback failed, recovery task retained: {rollback_error}"
                 )));
             }
             if !had_baseline {
@@ -589,55 +591,60 @@ fn require_capture_for_policy(
     baseline: &Baseline,
     policy: &OsSchedulingPolicy,
 ) -> Result<(), PlatformError> {
-    let unavailable =
-        |what: &str| PlatformError::Os(format!("无法读取 {what} 的原状态，拒绝执行不可恢复的写入"));
+    let unavailable = |what: &str| {
+        PlatformError::Os(format!(
+            "could not read the current {what} — refusing an unrestorable write"
+        ))
+    };
     match baseline {
         Baseline::Process(b) => {
             if b.executable.is_none() || b.creation_time.is_none() {
-                return Err(unavailable("进程身份（路径/创建时间）"));
+                return Err(unavailable("process identity (path/creation time)"));
             }
             if policy.cpu_placement.is_some() && !b.cpu_sets.available {
-                return Err(unavailable("进程 CPU Sets"));
+                return Err(unavailable("process CPU Sets"));
             }
             if policy.affinity.is_some() && !b.affinity.available {
-                return Err(unavailable("进程 Affinity"));
+                return Err(unavailable("process affinity"));
             }
             if policy.qos.is_some() && !b.qos.available {
-                return Err(unavailable("进程 QoS"));
+                return Err(unavailable("process QoS"));
             }
             if policy.process_priority.is_some() && !b.priority.available {
-                return Err(unavailable("进程优先级"));
+                return Err(unavailable("process priority"));
             }
             if policy.memory_priority.is_some() && !b.memory_priority.available {
-                return Err(unavailable("进程内存优先级"));
+                return Err(unavailable("process memory priority"));
             }
             if policy.gpu_preference.is_some()
                 && (b.executable.is_none() || !b.gpu_preference.available)
             {
-                return Err(unavailable("可执行文件 GPU 首选项"));
+                return Err(unavailable("executable GPU preference"));
             }
         }
         Baseline::Thread(b) => {
             if b.owner_executable.is_none() || b.owner_creation_time.is_none() {
-                return Err(unavailable("线程所属进程身份（路径/创建时间）"));
+                return Err(unavailable(
+                    "thread owner process identity (path/creation time)",
+                ));
             }
             if policy.cpu_placement.is_some() && !b.cpu_sets.available {
-                return Err(unavailable("线程 CPU Sets"));
+                return Err(unavailable("thread CPU Sets"));
             }
             if policy.affinity.is_some() && !b.group_affinity.available {
-                return Err(unavailable("线程 Group Affinity"));
+                return Err(unavailable("thread group affinity"));
             }
             if policy.qos.is_some() && !b.qos.available {
-                return Err(unavailable("线程 QoS"));
+                return Err(unavailable("thread QoS"));
             }
             if policy.thread_priority.is_some() && !b.priority.available {
-                return Err(unavailable("线程优先级"));
+                return Err(unavailable("thread priority"));
             }
             if policy.memory_priority.is_some() && !b.memory_priority.available {
-                return Err(unavailable("线程内存优先级"));
+                return Err(unavailable("thread memory priority"));
             }
             if policy.ideal_processor.is_some() && !b.ideal_processor.available {
-                return Err(unavailable("线程理想处理器"));
+                return Err(unavailable("thread ideal processor"));
             }
         }
     }
@@ -657,7 +664,7 @@ fn validate_ideal_processor(
         .any(|cpu| cpu.group == processor.group && cpu.logical_processor_index == processor.number)
     {
         return Err(PlatformError::Os(format!(
-            "理想处理器 G{}:{} 不存在",
+            "ideal processor G{}:{} does not exist",
             processor.group, processor.number
         )));
     }
@@ -683,13 +690,15 @@ fn resolve_cpu_placement(
                 .map(|cpu| cpu.id)
                 .collect::<Vec<_>>();
             if let Some(id) = ids.iter().find(|id| !known.contains(id)) {
-                return Err(PlatformError::Os(format!("CPU Set ID {id} 不存在")));
+                return Err(PlatformError::Os(format!("CPU Set ID {id} does not exist")));
             }
             ids.clone()
         }
     };
     if ids.is_empty() && !matches!(placement, CpuPlacement::All) {
-        return Err(PlatformError::Os("当前系统没有可用的目标 CPU Set".into()));
+        return Err(PlatformError::Os(
+            "no target CPU Set available on this system".into(),
+        ));
     }
     Ok(Some(ids))
 }
@@ -734,13 +743,30 @@ fn query_topology() -> Result<CpuTopology, PlatformError> {
         return Err(last_error("GetSystemCpuSetInformation"));
     }
 
+    let packed = unsafe {
+        std::slice::from_raw_parts(buffer.as_ptr() as *const u8, buffer.len() * item_size)
+    };
+    parse_cpu_sets(packed, returned as usize)
+}
+
+/// Parse the packed SYSTEM_CPU_SET_INFORMATION buffer from
+/// GetSystemCpuSetInformation into the classified topology.  Split out of
+/// `query_topology` so the walk is unit-testable against synthetic buffers
+/// (a truncated tail is exactly the regression case the guard covers).
+fn parse_cpu_sets(buffer: &[u8], returned: usize) -> Result<CpuTopology, PlatformError> {
+    // Defensive clamp: a kernel `returned` never exceeds the buffer in
+    // practice, but a bogus claim must not widen the read window.
+    let returned = returned.min(buffer.len());
     let mut cpu_sets = Vec::new();
     let mut offset = 0usize;
-    while offset + size_of::<u32>() <= returned as usize {
+    // The kernel returns a packed array of variable-length records.  Only
+    // read a record once the WHOLE struct fits inside the returned buffer —
+    // guarding just the Size field (4 bytes) would let a truncated buffer
+    // read out of bounds.  Advancing by the record's own Size field is the
+    // documented walk for this API.
+    while offset + size_of::<SYSTEM_CPU_SET_INFORMATION>() <= returned {
         let info = unsafe {
-            read_unaligned(
-                (buffer.as_ptr() as *const u8).add(offset) as *const SYSTEM_CPU_SET_INFORMATION
-            )
+            read_unaligned(buffer.as_ptr().add(offset) as *const SYSTEM_CPU_SET_INFORMATION)
         };
         if info.Size == 0 {
             break;
@@ -1370,11 +1396,12 @@ fn apply_process(
             let groups = query_process_groups(handle)?;
             if groups.len() != 1 || groups[0] != affinity.group {
                 return Err(PlatformError::Os(
-                    "进程 Affinity 只支持目标当前所在的单一处理器组".into(),
+                    "process affinity only supports the single processor group the target currently occupies".into(),
                 ));
             }
-            let mask = usize::try_from(affinity.mask)
-                .map_err(|_| PlatformError::Os("Affinity mask 超出当前平台位宽".into()))?;
+            let mask = usize::try_from(affinity.mask).map_err(|_| {
+                PlatformError::Os("affinity mask exceeds the platform's pointer width".into())
+            })?;
             unsafe { SetProcessAffinityMask(handle, mask) }
                 .map_err(|e| os_error("SetProcessAffinityMask", e))?;
         }
@@ -1390,7 +1417,9 @@ fn apply_process(
         }
         if let Some(gpu) = policy.gpu_preference {
             let path = query_path(handle)?.ok_or_else(|| {
-                PlatformError::Os("无法取得目标进程路径，不能设置 GPU 首选项".into())
+                PlatformError::Os(
+                    "could not query the target process path — GPU preference cannot be set".into(),
+                )
             })?;
             apply_gpu_preference(&path, gpu)?;
         }
@@ -1415,8 +1444,9 @@ fn apply_thread(
         }
         if let Some(affinity) = policy.affinity {
             let group_affinity = GROUP_AFFINITY {
-                Mask: usize::try_from(affinity.mask)
-                    .map_err(|_| PlatformError::Os("Affinity mask 超出当前平台位宽".into()))?,
+                Mask: usize::try_from(affinity.mask).map_err(|_| {
+                    PlatformError::Os("affinity mask exceeds the platform's pointer width".into())
+                })?,
                 Group: affinity.group,
                 Reserved: [0; 3],
             };
@@ -1584,7 +1614,9 @@ fn restore_baseline(
             let result = (|| {
                 let owner = unsafe { GetProcessIdOfThread(handle) };
                 if owner != b.owner_pid {
-                    return Err(PlatformError::Os("线程所属进程已变化，跳过恢复".into()));
+                    return Err(PlatformError::Os(
+                        "thread's owning process changed — skipping restore".into(),
+                    ));
                 }
                 let path = query_process_path(owner)?;
                 let creation = query_process_creation_time(owner);
@@ -1595,7 +1627,7 @@ fn restore_baseline(
                     b.owner_creation_time,
                 ) {
                     return Err(PlatformError::Os(
-                        "线程所属可执行文件已变化，跳过恢复".into(),
+                        "thread's owning executable changed — skipping restore".into(),
                     ));
                 }
                 restore_thread_handle(handle, b)
@@ -1604,7 +1636,7 @@ fn restore_baseline(
             result
         }
         _ => Err(PlatformError::Os(
-            "OS policy target 类型与基线不匹配".into(),
+            "OS policy target type does not match the baseline".into(),
         )),
     }
 }
@@ -1626,21 +1658,26 @@ fn verify_process_identity(
 ) -> Result<(), PlatformError> {
     let Some(expected) = expected else {
         return Err(PlatformError::Os(
-            "无法验证目标进程身份，跳过恢复以避免 PID 复用误操作".into(),
+            "cannot verify the target process identity — skipping restore to avoid PID-reuse mistakes".into(),
         ));
     };
     let actual = query_path(handle)?.ok_or_else(|| {
-        PlatformError::Os("无法读取目标进程路径，跳过恢复以避免 PID 复用误操作".into())
+        PlatformError::Os(
+            "cannot read the target process path — skipping restore to avoid PID-reuse mistakes"
+                .into(),
+        )
     })?;
     if !same_path(expected, &actual) {
         return Err(PlatformError::Os(
-            "目标进程已被另一个可执行文件复用，跳过恢复".into(),
+            "target process was reused by another executable — skipping restore".into(),
         ));
     }
     if let Some(expected) = expected_creation_time
         && query_creation_time(handle).ok() != Some(expected)
     {
-        return Err(PlatformError::Os("目标进程创建身份已变化，跳过恢复".into()));
+        return Err(PlatformError::Os(
+            "target process creation identity changed — skipping restore".into(),
+        ));
     }
     Ok(())
 }
@@ -1806,4 +1843,193 @@ fn restore_thread_handle(handle: HANDLE, b: &ThreadBaseline) -> Result<(), Platf
         }
     }
     first_error.map_or(Ok(()), Err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::System::SystemInformation::{
+        CPU_SET_INFORMATION_TYPE, SYSTEM_CPU_SET_INFORMATION_0,
+    };
+
+    fn cpu_set_record(
+        id: u32,
+        group: u16,
+        lp_index: u8,
+        core_index: u8,
+        efficiency_class: u8,
+        parked: bool,
+    ) -> SYSTEM_CPU_SET_INFORMATION {
+        let mut cpu = SYSTEM_CPU_SET_INFORMATION_0_0 {
+            Id: id,
+            Group: group,
+            LogicalProcessorIndex: lp_index,
+            CoreIndex: core_index,
+            EfficiencyClass: efficiency_class,
+            ..Default::default()
+        };
+        cpu.Anonymous1.AllFlags = u8::from(parked);
+        SYSTEM_CPU_SET_INFORMATION {
+            Size: size_of::<SYSTEM_CPU_SET_INFORMATION>() as u32,
+            Type: CpuSetInformation,
+            Anonymous: SYSTEM_CPU_SET_INFORMATION_0 { CpuSet: cpu },
+        }
+    }
+
+    fn record_bytes(record: &SYSTEM_CPU_SET_INFORMATION) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                record as *const _ as *const u8,
+                size_of::<SYSTEM_CPU_SET_INFORMATION>(),
+            )
+        }
+    }
+
+    fn pack(records: &[SYSTEM_CPU_SET_INFORMATION]) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        for record in records {
+            buffer.extend_from_slice(record_bytes(record));
+        }
+        buffer
+    }
+
+    #[test]
+    fn parse_cpu_sets_classifies_efficiency_classes() {
+        // E-core first on the wire: the parser must sort by id, not trust order.
+        let e_core = cpu_set_record(0x101, 0, 1, 1, 0, false);
+        let p_core = cpu_set_record(0x100, 0, 0, 8, 1, false);
+        let buffer = pack(&[e_core, p_core]);
+        let topology = parse_cpu_sets(&buffer, buffer.len()).expect("two records parse");
+        assert_eq!(topology.cpu_sets.len(), 2);
+        assert_eq!(topology.cpu_sets[0].id, 0x100);
+        assert_eq!(topology.cpu_sets[0].core_index, 8);
+        assert_eq!(topology.performance_ids, vec![0x100]);
+        assert_eq!(topology.efficiency_ids, vec![0x101]);
+    }
+
+    #[test]
+    fn parse_cpu_sets_ignores_truncated_tail() {
+        let record = cpu_set_record(0x100, 0, 0, 0, 0, false);
+        let buffer = pack(&[record, record]);
+        // The kernel "returned" one whole record plus 4 dangling bytes.  The
+        // old Size-field-only guard would have read out of bounds here; the
+        // whole-struct guard must drop the tail instead.
+        let returned = size_of::<SYSTEM_CPU_SET_INFORMATION>() + 4;
+        let topology = parse_cpu_sets(&buffer, returned).expect("truncated tail is ignored");
+        assert_eq!(topology.cpu_sets.len(), 1);
+    }
+
+    #[test]
+    fn parse_cpu_sets_clamps_returned_to_buffer() {
+        let record = cpu_set_record(0x100, 0, 0, 0, 0, false);
+        let buffer = pack(&[record]);
+        // A bogus kernel claim larger than the buffer must not widen the walk.
+        let topology = parse_cpu_sets(&buffer, buffer.len() * 4).expect("clamped");
+        assert_eq!(topology.cpu_sets.len(), 1);
+    }
+
+    #[test]
+    fn parse_cpu_sets_stops_at_zero_size_record() {
+        let mut record = cpu_set_record(0x100, 0, 0, 0, 0, false);
+        record.Size = 0;
+        let buffer = pack(&[record]);
+        let error = parse_cpu_sets(&buffer, buffer.len()).unwrap_err();
+        assert!(matches!(error, PlatformError::Data(_)));
+    }
+
+    #[test]
+    fn parse_cpu_sets_skips_non_cpuset_records() {
+        let mut other = cpu_set_record(0x999, 0, 9, 9, 0, false);
+        other.Type = CPU_SET_INFORMATION_TYPE(7);
+        let record = cpu_set_record(0x100, 0, 0, 0, 0, false);
+        let buffer = pack(&[other, record]);
+        let topology = parse_cpu_sets(&buffer, buffer.len()).expect("foreign record skipped");
+        assert_eq!(topology.cpu_sets.len(), 1);
+        assert_eq!(topology.cpu_sets[0].id, 0x100);
+    }
+
+    #[test]
+    fn parse_cpu_sets_advances_by_record_size() {
+        let mut wide = cpu_set_record(0x100, 0, 0, 0, 0, false);
+        wide.Size = (size_of::<SYSTEM_CPU_SET_INFORMATION>() + 8) as u32;
+        let next = cpu_set_record(0x101, 0, 1, 1, 0, false);
+        let mut buffer = pack(&[wide]);
+        buffer.extend_from_slice(&[0xAB; 8]); // padding covered by the larger Size
+        buffer.extend_from_slice(record_bytes(&next));
+        let topology = parse_cpu_sets(&buffer, buffer.len()).expect("padded records parse");
+        assert_eq!(topology.cpu_sets.len(), 2);
+        assert_eq!(topology.cpu_sets[1].id, 0x101);
+    }
+
+    #[test]
+    fn parse_cpu_sets_surfaces_parked_without_dropping_the_set() {
+        let record = cpu_set_record(0x100, 0, 0, 0, 0, true);
+        let buffer = pack(&[record]);
+        let topology = parse_cpu_sets(&buffer, buffer.len()).expect("parked set kept");
+        assert!(topology.cpu_sets[0].parked);
+        // Parked is a power state, not a topology class — the set still
+        // classifies into a selectable group (see the comment in the parser).
+        assert_eq!(topology.efficiency_ids, vec![0x100]);
+    }
+
+    #[test]
+    fn gpu_path_key_normalizes_separators_and_case() {
+        assert_eq!(gpu_path_key("C:/Games/FOO.exe"), "c:\\games\\foo.exe");
+    }
+
+    #[test]
+    fn same_path_is_case_insensitive() {
+        assert!(same_path("C:\\A\\b.exe", "c:\\a\\B.EXE"));
+        assert!(!same_path("a.exe", "b.exe"));
+    }
+
+    #[test]
+    fn utf16z_stops_at_first_nul() {
+        assert_eq!(utf16z(&[0x0041, 0x0042, 0, 0x0043]), "AB");
+        assert_eq!(utf16z(&[0, 0x0041]), "");
+    }
+
+    fn process_baseline(path: Option<&str>, created: Option<u64>) -> Baseline {
+        Baseline::Process(ProcessBaseline {
+            executable: path.map(str::to_string),
+            creation_time: created,
+            affinity: Captured::unavailable(),
+            cpu_sets: Captured::unavailable(),
+            qos: Captured::unavailable(),
+            priority: Captured::unavailable(),
+            memory_priority: Captured::unavailable(),
+            gpu_preference: Captured::unavailable(),
+        })
+    }
+
+    #[test]
+    fn same_target_identity_process_matches_path_and_time() {
+        let a = process_baseline(Some("C:\\app.exe"), Some(42));
+        let same = process_baseline(Some("c:\\APP.exe"), Some(42));
+        let other_time = process_baseline(Some("C:\\app.exe"), Some(43));
+        let no_path = process_baseline(None, Some(42));
+        assert!(same_target_identity(&a, &same));
+        assert!(!same_target_identity(&a, &other_time));
+        assert!(!same_target_identity(&a, &no_path));
+        // A missing timestamp on either side cannot disprove identity.
+        let no_time = process_baseline(Some("C:\\app.exe"), None);
+        assert!(same_target_identity(&a, &no_time));
+    }
+
+    #[test]
+    fn same_target_identity_rejects_cross_kind() {
+        let process = process_baseline(Some("C:\\app.exe"), Some(42));
+        let thread = Baseline::Thread(ThreadBaseline {
+            owner_pid: 7,
+            owner_executable: Some("C:\\app.exe".into()),
+            owner_creation_time: Some(42),
+            group_affinity: Captured::unavailable(),
+            cpu_sets: Captured::unavailable(),
+            qos: Captured::unavailable(),
+            priority: Captured::unavailable(),
+            memory_priority: Captured::unavailable(),
+            ideal_processor: Captured::unavailable(),
+        });
+        assert!(!same_target_identity(&process, &thread));
+    }
 }

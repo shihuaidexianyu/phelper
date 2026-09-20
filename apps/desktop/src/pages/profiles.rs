@@ -46,7 +46,7 @@ fn summary(name: &str, description: &str) -> String {
 
 pub fn render(state: &AppState, app: &AppHandle, cx: &mut Context<ShellView>) -> impl IntoElement {
     let theme = cx.theme();
-    let active = state.desired.profile.as_deref();
+    let active = state.observed.active_profile.as_deref();
     let busy = matches!(
         state.knob_status(KnobId::Profile),
         KnobStatus::Pending | KnobStatus::InFlight(_)
@@ -60,8 +60,12 @@ pub fn render(state: &AppState, app: &AppHandle, cx: &mut Context<ShellView>) ->
                 None
             }
         }
+        // Honest semantics: a Partial means the coordinator stopped at the
+        // first failing step and LEFT the already-written steps in effect —
+        // there is no rollback (coordinator.rs, M2 decision). Never imply a
+        // restore happened.
         KnobStatus::Partial { .. } => Some((
-            "配置档只完成了部分步骤，硬件已恢复到安全状态。".to_string(),
+            "配置档只完成了部分步骤：已写入的设置保持生效，其余步骤未执行。".to_string(),
             theme.warning,
         )),
         KnobStatus::Failed { error, .. } => Some((
@@ -82,9 +86,9 @@ pub fn render(state: &AppState, app: &AppHandle, cx: &mut Context<ShellView>) ->
         let profile_name = profile.name.clone();
         let app = app.clone();
         let button = Button::new(("profile-apply", index))
-            .label(if is_active { "当前" } else { "应用" })
+            .label(if is_active { "重新应用" } else { "应用" })
             .outline()
-            .disabled(is_active || busy || gate.is_some())
+            .disabled(busy || gate.is_some())
             .on_click(cx.listener(
                 move |_: &mut ShellView, _: &ClickEvent, _: &mut Window, _| {
                     app.dispatch(
@@ -164,6 +168,9 @@ pub fn render(state: &AppState, app: &AppHandle, cx: &mut Context<ShellView>) ->
             .gap_3()
             .p_4()
             .w_full()
+            .when_some(state.observed.control_notice.clone(), |content, notice| {
+                content.child(div().text_sm().text_color(theme.warning).child(notice))
+            })
             .when_some(outcome, |content, (message, color)| {
                 content.child(
                     div()

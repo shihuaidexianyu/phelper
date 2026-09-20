@@ -2,11 +2,15 @@
 //! safety supervisor + keep-alive. See architecture.md §30-34, §43-45.
 
 mod coordinator;
+mod drift;
 mod fan_curve;
 pub mod journal;
 pub mod keepalive;
+pub(crate) mod lease;
+mod mux;
+mod recovery;
 pub mod safety;
+mod verification;
 
 pub use coordinator::ControlHandle;
-#[allow(unused_imports)] // wired in W15 (engine)
 pub(crate) use coordinator::{ControlConfig, ControlCoordinator, SnapshotFeed};

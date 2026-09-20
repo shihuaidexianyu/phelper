@@ -326,3 +326,51 @@ pub fn meta(id: MetricId) -> Option<&'static MetricMeta> {
 pub fn all() -> &'static [MetricMeta] {
     REGISTRY
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use phelper_domain::telemetry::ids;
+
+    /// Every declared id must have a REGISTRY entry. A missing entry panics
+    /// the collector's `cadence()` lookup — with the unwind guard that
+    /// surfaces as a dead provider row, and this test catches it before it
+    /// ships.
+    #[test]
+    fn every_declared_id_is_registered() {
+        for id in ids::ALL {
+            assert!(
+                meta(*id).is_some(),
+                "metric id {:?} is declared in ids but has no REGISTRY entry",
+                id.0
+            );
+        }
+    }
+
+    /// The reverse direction: a REGISTRY entry for an id that was never
+    /// declared (hand-typed string) is dead weight — nothing can produce it.
+    #[test]
+    fn every_registered_id_is_declared() {
+        for entry in REGISTRY {
+            assert!(
+                ids::ALL.contains(&entry.id),
+                "REGISTRY entry {:?} is not declared in ids::ALL",
+                entry.id.0
+            );
+        }
+    }
+
+    /// No duplicate rows — two entries for one id would make `meta()` order
+    /// dependent (first match wins).
+    #[test]
+    fn registry_ids_are_unique() {
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in REGISTRY {
+            assert!(
+                seen.insert(entry.id),
+                "duplicate REGISTRY entry for {:?}",
+                entry.id.0
+            );
+        }
+    }
+}

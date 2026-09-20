@@ -6,14 +6,9 @@ use std::path::{Path, PathBuf};
 use super::ProbeReport;
 
 pub fn write_snapshot(report: &ProbeReport, path: &Path) -> Result<(), EngineError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| EngineError::Persistence(format!("create {}: {e}", parent.display())))?;
-    }
     let json = serde_json::to_string_pretty(report)
         .map_err(|e| EngineError::Persistence(format!("serialize snapshot: {e}")))?;
-    std::fs::write(path, json)
-        .map_err(|e| EngineError::Persistence(format!("write {}: {e}", path.display())))
+    crate::persistence::write_text(path, &json)
 }
 
 /// Default snapshot path under ./probe-out/ with epoch-millis name.

@@ -3,6 +3,7 @@
 //! locks, no handles, no hardware types. The pump owns the mutable copy;
 //! the UI receives one clone per tick.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use phelper_domain::capability::CapabilitySet;
@@ -29,6 +30,12 @@ pub enum EngineStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum KnobId {
     Profile,
+    Cpu,
+    Fan,
+    Gpu,
+    Power,
+    Recovery,
+    Mux,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -54,27 +61,54 @@ pub enum KnobStatus {
 
 /// Display snapshot of one registry profile (the UI never holds the
 /// registry itself).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProfileSummary {
     pub name: String,
     pub description: String,
+    pub profile: phelper_domain::profile::PerformanceProfile,
+    pub builtin: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct AppState {
     pub engine: EngineStatus,
+    pub identity: Option<phelper_domain::identity::DeviceIdentity>,
+    pub hardware: crate::hardware_status::HardwareStatus,
+    pub capture_running: bool,
+    pub capture_notice: Option<String>,
+    pub capture_report: Option<Arc<crate::measurements::CaptureReport>>,
+    pub capture_baseline: Option<Arc<crate::measurements::CaptureReport>>,
+    pub diagnostic_path: Option<String>,
     pub telemetry: Option<Arc<TelemetrySnapshot>>,
     pub caps: Option<CapabilitySet>,
     pub desired: DesiredState,
     pub observed: ObservedState,
     pub profiles: Vec<ProfileSummary>,
     pub profile_status: KnobStatus,
+    pub knobs: BTreeMap<KnobId, KnobStatus>,
+    pub last_outcome: Option<Arc<ControlOutcome>>,
+    pub windows_ppm: Option<phelper_domain::policy::WindowsPpmState>,
+    pub profile_notice: Option<String>,
+    #[cfg(feature = "control")]
+    pub automation: crate::automation::AutomationSnapshot,
 }
 
 impl AppState {
+    pub fn diagnostic_json(&self) -> serde_json::Value {
+        let metrics: std::collections::BTreeMap<_, _> = self.telemetry.as_ref().map(|t| t.samples.iter().map(|(id, sample)|
+            (id.0, serde_json::json!({"value": sample.value.as_f64(), "age_ms": sample.timestamp.elapsed().as_millis(), "source": format!("{:?}", sample.source), "quality": format!("{:?}", sample.quality)}))).collect()).unwrap_or_default();
+        serde_json::json!({"schema_version": 1, "identity": self.identity, "capabilities": self.caps,
+            "desired": self.desired, "observed": self.observed, "windows_ppm": self.windows_ppm,
+            "last_outcome": self.last_outcome.as_deref(), "metrics": metrics,
+            "hardware": self.hardware, "engine": format!("{:?}", self.engine)})
+    }
+
     pub fn knob_status(&self, knob: KnobId) -> &KnobStatus {
-        debug_assert_eq!(knob, KnobId::Profile);
-        &self.profile_status
+        if knob == KnobId::Profile {
+            &self.profile_status
+        } else {
+            self.knobs.get(&knob).unwrap_or(&KnobStatus::Idle)
+        }
     }
 
     /// Write controls exist only when the coordinator is running.
@@ -89,8 +123,11 @@ impl AppState {
     }
 
     pub fn set_knob(&mut self, knob: KnobId, status: KnobStatus) {
-        debug_assert_eq!(knob, KnobId::Profile);
-        self.profile_status = status;
+        if knob == KnobId::Profile {
+            self.profile_status = status;
+        } else {
+            self.knobs.insert(knob, status);
+        }
     }
 
     /// Reduce a finished command to the status the remaining profile page
@@ -118,15 +155,18 @@ impl AppState {
             ControlStatus::Partial => KnobStatus::Partial { at_epoch_ms: at },
         };
         self.set_knob(knob, status);
+        self.last_outcome = Some(Arc::new(outcome));
     }
 
     /// Display summaries from a registry snapshot (built-ins + user files).
     pub fn set_profiles(&mut self, registry: &crate::profiles::ProfileRegistry) {
         self.profiles = registry
             .iter()
-            .map(|(name, p, _)| ProfileSummary {
+            .map(|(name, p, builtin)| ProfileSummary {
                 name: name.to_string(),
                 description: p.description.clone(),
+                profile: p.clone(),
+                builtin,
             })
             .collect();
     }

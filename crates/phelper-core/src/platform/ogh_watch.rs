@@ -149,15 +149,15 @@ fn scan_appx(out: &mut Vec<OghFinding>) {
         HKEY, KEY_READ, RegCloseKey, RegEnumKeyExW, RegOpenKeyExW,
     };
     // Per-user package repository: SOFTWARE\Classes\Local Settings\Software\
-    // Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages (HKCU).
-    // HKLM equivalent covers system-staged packages. Either is sufficient
-    // evidence of "OGH is installed".
+    // Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages (HKCU —
+    // store apps install per-user). The HKLM equivalent for system-staged
+    // packages is NOT read; the WindowsApps directory listing below is the
+    // fallback that covers staged-but-not-registered cases.
     let subkey: Vec<u16> = "SOFTWARE\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppModel\\Repository\\Packages\0"
         .encode_utf16()
         .collect();
     unsafe {
         let mut key = HKEY::default();
-        // HKCU first (store apps install per-user).
         let status = RegOpenKeyExW(
             windows::Win32::System::Registry::HKEY_CURRENT_USER,
             windows::core::PCWSTR(subkey.as_ptr()),

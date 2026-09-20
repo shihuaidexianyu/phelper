@@ -29,25 +29,34 @@ pub struct Engine {
     hp: Option<Arc<HpHandle>>,
     /// Second-writer scan results from startup (§33.1 supplement).
     ogh_findings: Vec<crate::platform::ogh_watch::OghFinding>,
+    probe: crate::capability::ProbeReport,
+    control_unavailable_reason: Option<String>,
     #[cfg(feature = "control")]
     control: Option<crate::control::ControlHandle>,
+    #[cfg(feature = "control")]
+    _control_lease: Option<crate::control::lease::ControlLease>,
 }
 
 impl Engine {
     /// Probe identity, load the board profile, spawn providers and the
     /// telemetry coordinator.
     pub fn start() -> Result<Self, EngineError> {
-        Self::start_inner(true)
+        Self::start_inner(true, true)
     }
 
     /// UI startup variant: OGH detection is diagnostic-only and is completed
     /// by the app pump after the engine is available. It must not delay the
     /// first usable telemetry/control state.
+    #[allow(dead_code)] // called by the app pump (app::runtime), which is behind the `control` feature
     pub(crate) fn start_without_ogh_scan() -> Result<Self, EngineError> {
-        Self::start_inner(false)
+        Self::start_inner(false, true)
     }
 
-    fn start_inner(scan_ogh: bool) -> Result<Self, EngineError> {
+    pub fn start_read_only() -> Result<Self, EngineError> {
+        Self::start_inner(false, false)
+    }
+
+    fn start_inner(scan_ogh: bool, writes: bool) -> Result<Self, EngineError> {
         let identity = probe_identity()?;
         let board = load_board_profile(&identity.board_id).ok_or_else(|| {
             EngineError::Config(format!(
@@ -124,24 +133,40 @@ impl Engine {
         };
 
         let telemetry = TelemetryCoordinator::start(collectors, unavailable)?;
+        let report = crate::capability::CapabilityService::probe_runtime(
+            identity.clone(),
+            Some(&board),
+            hp.as_deref()
+                .map(|h| h as &dyn phelper_domain::ports::HpPlatform),
+        );
+        #[allow(unused_mut)]
+        let mut control_unavailable_reason = (!writes).then(|| "只读预览模式".into());
 
         // M2: capability probe THROUGH the running actor (never a second
         // WMI connection — R1), then the single-writer control coordinator.
         // A failure here downgrades to telemetry-only; it never aborts.
         #[cfg(feature = "control")]
-        let control = {
-            let report = crate::capability::CapabilityService::probe_runtime(
-                identity.clone(),
-                Some(&board),
-                hp.as_deref()
-                    .map(|h| h as &dyn phelper_domain::ports::HpPlatform),
-            );
+        let control_lease = if writes {
+            crate::control::lease::ControlLease::acquire()
+                .map_err(|e| {
+                    warn!(%e, "hardware control disabled");
+                    control_unavailable_reason = Some(e.to_string());
+                    e
+                })
+                .ok()
+        } else {
+            None
+        };
+        #[cfg(not(feature = "control"))]
+        let _ = writes;
+        #[cfg(feature = "control")]
+        let control = if control_lease.is_some() {
             for note in &report.capabilities.notes {
                 info!(note = %note, "capability note");
             }
             match crate::control::ControlCoordinator::start({
                 let mut cfg = crate::control::ControlConfig::new(
-                    report.capabilities,
+                    report.capabilities.clone(),
                     identity.clone(),
                     hp.as_deref().cloned(),
                     crate::platform::windows_ppm::PpmBackend,
@@ -166,9 +191,12 @@ impl Engine {
                 Ok(h) => Some(h),
                 Err(e) => {
                     warn!(%e, "control coordinator unavailable — telemetry-only");
+                    control_unavailable_reason = Some(e.to_string());
                     None
                 }
             }
+        } else {
+            None
         };
 
         Ok(Self {
@@ -177,13 +205,23 @@ impl Engine {
             telemetry,
             hp,
             ogh_findings,
+            probe: report,
+            control_unavailable_reason,
             #[cfg(feature = "control")]
             control,
+            #[cfg(feature = "control")]
+            _control_lease: control_lease,
         })
     }
 
     pub fn identity(&self) -> &DeviceIdentity {
         &self.identity
+    }
+    pub fn capability_report(&self) -> &crate::capability::ProbeReport {
+        &self.probe
+    }
+    pub fn control_unavailable_reason(&self) -> Option<&str> {
+        self.control_unavailable_reason.as_deref()
     }
 
     pub fn board(&self) -> &BoardProfile {
@@ -221,6 +259,8 @@ impl Engine {
                 "shutdown stage: control coordinator done"
             );
         }
+        #[cfg(not(feature = "control"))]
+        let _ = t;
         let t = std::time::Instant::now();
         self.telemetry.shutdown();
         info!(

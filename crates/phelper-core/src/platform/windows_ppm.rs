@@ -253,6 +253,7 @@ fn known_scheme_name(guid: &GUID) -> &'static str {
 /// EPP values in percent (0 = max performance, 100 = max efficiency),
 /// split by power source as Windows stores them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // constructed by EPP reads behind the `control` feature
 pub(crate) struct EppReading {
     pub ac: u8,
     pub dc: u8,
@@ -315,6 +316,7 @@ fn read_index(
 
 /// Read current EPP from the active power scheme. Works unelevated (reads
 /// are not privileged; only writes are).
+#[allow(dead_code)] // callers live behind the `control` feature (PpmBackend)
 pub(crate) fn read_epp() -> Result<EppReading, PlatformError> {
     let scheme = active_scheme()?;
     let ac = read_index(true, &scheme, &SUB_PROCESSOR, &PERFEPP)?;
@@ -329,6 +331,7 @@ pub(crate) fn read_epp() -> Result<EppReading, PlatformError> {
 }
 
 /// Read the class-1 (E-core) EPP (PERFEPP1) from the active power scheme.
+#[allow(dead_code)] // callers live behind the `control` feature (PpmBackend)
 pub(crate) fn read_epp1() -> Result<EppReading, PlatformError> {
     let scheme = active_scheme()?;
     let ac = read_index(true, &scheme, &SUB_PROCESSOR, &PERFEPP1)?;
@@ -343,6 +346,7 @@ pub(crate) fn read_epp1() -> Result<EppReading, PlatformError> {
 }
 
 /// Read the max-frequency ceiling on both rails (AC, DC).
+#[allow(dead_code)] // callers live behind the `control` feature (PpmBackend)
 pub(crate) fn read_max_freq_mhz_acdc() -> Result<(u32, u32), PlatformError> {
     let scheme = active_scheme()?;
     let ac = read_index(true, &scheme, &SUB_PROCESSOR, &PROCFREQMAX)?;
@@ -351,7 +355,7 @@ pub(crate) fn read_max_freq_mhz_acdc() -> Result<(u32, u32), PlatformError> {
 }
 
 /// Read PERFBOOSTMODE on both rails (AC, DC).
-#[allow(dead_code)] // wired in W11 (PpmBackend reads)
+#[allow(dead_code)] // callers live behind the `control` feature (PpmBackend + coordinator)
 pub(crate) fn read_boost_policy() -> Result<(BoostPolicy, BoostPolicy), PlatformError> {
     let scheme = active_scheme()?;
     let ac = read_index(true, &scheme, &SUB_PROCESSOR, &PERFBOOSTMODE)?;
@@ -366,6 +370,7 @@ pub(crate) fn read_boost_policy() -> Result<(BoostPolicy, BoostPolicy), Platform
 }
 
 /// Read PROCTHROTTLEMIN on both rails (0..=100%).
+#[allow(dead_code)] // callers live behind the `control` feature (PpmBackend)
 pub(crate) fn read_min_performance() -> Result<(u8, u8), PlatformError> {
     let scheme = active_scheme()?;
     let ac = read_index(true, &scheme, &SUB_PROCESSOR, &PROCTHROTTLEMIN)?;
@@ -382,6 +387,7 @@ pub(crate) fn read_min_performance() -> Result<(u8, u8), PlatformError> {
 }
 
 /// Read PROCTHROTTLEMAX on both rails (0..=100%).
+#[allow(dead_code)] // callers live behind the `control` feature (PpmBackend)
 pub(crate) fn read_max_performance() -> Result<(u8, u8), PlatformError> {
     let scheme = active_scheme()?;
     let ac = read_index(true, &scheme, &SUB_PROCESSOR, &PROCTHROTTLEMAX)?;
@@ -430,7 +436,6 @@ pub(crate) fn read_windows_ppm_state() -> Result<WindowsPpmState, PlatformError>
 }
 
 #[cfg(feature = "control")]
-#[allow(dead_code)] // wired in W11 (ControlCoordinator's PpmBackend)
 fn write_index(
     ac: bool,
     scheme: &GUID,
@@ -476,7 +481,6 @@ fn write_index(
 /// store). Reusing the same GUID avoids committing a different scheme if
 /// Windows changes the active scheme between the write and the commit.
 #[cfg(feature = "control")]
-#[allow(dead_code)] // wired in W11 (ControlCoordinator's PpmBackend)
 fn commit_active_scheme(scheme: &GUID) -> Result<(), PlatformError> {
     unsafe {
         let rc = PowerSetActiveScheme(None, Some(scheme));
@@ -490,11 +494,29 @@ fn commit_active_scheme(scheme: &GUID) -> Result<(), PlatformError> {
     }
 }
 
+/// The AC/DC write pattern every CpuPolicyBackend setter shares: resolve
+/// the ACTIVE scheme once (the user may switch schemes between commands),
+/// write whichever rails are `Some`, and commit only when something was
+/// actually written (AR-08: PowrProf only; 2026-09 dedup).
+#[cfg(feature = "control")]
+fn write_acdc(setting: &GUID, ac: Option<u32>, dc: Option<u32>) -> Result<(), PlatformError> {
+    let scheme = active_scheme()?;
+    if let Some(v) = ac {
+        write_index(true, &scheme, &SUB_PROCESSOR, setting, v)?;
+    }
+    if let Some(v) = dc {
+        write_index(false, &scheme, &SUB_PROCESSOR, setting, v)?;
+    }
+    if ac.is_some() || dc.is_some() {
+        commit_active_scheme(&scheme)?;
+    }
+    Ok(())
+}
+
 /// PowrProf implementation of the domain `CpuPolicyBackend` port (M2 write
 /// path). Stateless — every call re-resolves the ACTIVE scheme (the user
 /// may switch schemes between commands; we always act on what is active).
 #[cfg(feature = "control")]
-#[allow(dead_code)] // constructed by the ControlCoordinator (W11)
 pub(crate) struct PpmBackend;
 
 #[cfg(feature = "control")]
@@ -526,45 +548,15 @@ impl phelper_domain::ports::CpuPolicyBackend for PpmBackend {
     }
 
     fn write_epp(&self, ac: Option<u8>, dc: Option<u8>) -> Result<(), PlatformError> {
-        let scheme = active_scheme()?;
-        if let Some(v) = ac {
-            write_index(true, &scheme, &SUB_PROCESSOR, &PERFEPP, v as u32)?;
-        }
-        if let Some(v) = dc {
-            write_index(false, &scheme, &SUB_PROCESSOR, &PERFEPP, v as u32)?;
-        }
-        if ac.is_some() || dc.is_some() {
-            commit_active_scheme(&scheme)?;
-        }
-        Ok(())
+        write_acdc(&PERFEPP, ac.map(u32::from), dc.map(u32::from))
     }
 
     fn write_epp1(&self, ac: Option<u8>, dc: Option<u8>) -> Result<(), PlatformError> {
-        let scheme = active_scheme()?;
-        if let Some(v) = ac {
-            write_index(true, &scheme, &SUB_PROCESSOR, &PERFEPP1, v as u32)?;
-        }
-        if let Some(v) = dc {
-            write_index(false, &scheme, &SUB_PROCESSOR, &PERFEPP1, v as u32)?;
-        }
-        if ac.is_some() || dc.is_some() {
-            commit_active_scheme(&scheme)?;
-        }
-        Ok(())
+        write_acdc(&PERFEPP1, ac.map(u32::from), dc.map(u32::from))
     }
 
     fn write_max_freq_mhz(&self, ac: Option<u32>, dc: Option<u32>) -> Result<(), PlatformError> {
-        let scheme = active_scheme()?;
-        if let Some(v) = ac {
-            write_index(true, &scheme, &SUB_PROCESSOR, &PROCFREQMAX, v)?;
-        }
-        if let Some(v) = dc {
-            write_index(false, &scheme, &SUB_PROCESSOR, &PROCFREQMAX, v)?;
-        }
-        if ac.is_some() || dc.is_some() {
-            commit_active_scheme(&scheme)?;
-        }
-        Ok(())
+        write_acdc(&PROCFREQMAX, ac, dc)
     }
 
     fn write_boost_policy(
@@ -572,57 +564,19 @@ impl phelper_domain::ports::CpuPolicyBackend for PpmBackend {
         ac: Option<BoostPolicy>,
         dc: Option<BoostPolicy>,
     ) -> Result<(), PlatformError> {
-        let scheme = active_scheme()?;
-        if let Some(mode) = ac {
-            write_index(
-                true,
-                &scheme,
-                &SUB_PROCESSOR,
-                &PERFBOOSTMODE,
-                u8::from(mode) as u32,
-            )?;
-        }
-        if let Some(mode) = dc {
-            write_index(
-                false,
-                &scheme,
-                &SUB_PROCESSOR,
-                &PERFBOOSTMODE,
-                u8::from(mode) as u32,
-            )?;
-        }
-        if ac.is_some() || dc.is_some() {
-            commit_active_scheme(&scheme)?;
-        }
-        Ok(())
+        write_acdc(
+            &PERFBOOSTMODE,
+            ac.map(|m| u8::from(m) as u32),
+            dc.map(|m| u8::from(m) as u32),
+        )
     }
 
     fn write_min_performance(&self, ac: Option<u8>, dc: Option<u8>) -> Result<(), PlatformError> {
-        let scheme = active_scheme()?;
-        if let Some(v) = ac {
-            write_index(true, &scheme, &SUB_PROCESSOR, &PROCTHROTTLEMIN, v as u32)?;
-        }
-        if let Some(v) = dc {
-            write_index(false, &scheme, &SUB_PROCESSOR, &PROCTHROTTLEMIN, v as u32)?;
-        }
-        if ac.is_some() || dc.is_some() {
-            commit_active_scheme(&scheme)?;
-        }
-        Ok(())
+        write_acdc(&PROCTHROTTLEMIN, ac.map(u32::from), dc.map(u32::from))
     }
 
     fn write_max_performance(&self, ac: Option<u8>, dc: Option<u8>) -> Result<(), PlatformError> {
-        let scheme = active_scheme()?;
-        if let Some(v) = ac {
-            write_index(true, &scheme, &SUB_PROCESSOR, &PROCTHROTTLEMAX, v as u32)?;
-        }
-        if let Some(v) = dc {
-            write_index(false, &scheme, &SUB_PROCESSOR, &PROCTHROTTLEMAX, v as u32)?;
-        }
-        if ac.is_some() || dc.is_some() {
-            commit_active_scheme(&scheme)?;
-        }
-        Ok(())
+        write_acdc(&PROCTHROTTLEMAX, ac.map(u32::from), dc.map(u32::from))
     }
 
     fn read_windows_ppm_state(&self) -> Result<Option<WindowsPpmState>, PlatformError> {

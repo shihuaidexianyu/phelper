@@ -265,6 +265,39 @@ pub struct CpuPowerLimits {
     pub cpu_gpu_concurrent_w: u8,
 }
 
+impl CpuPowerLimits {
+    /// Pure envelope check, shared by the CLI pre-flight, the desktop form
+    /// and the core safety layer (defense in depth — those layers add the
+    /// capability/feature gating this pure function cannot express).
+    ///
+    /// Envelope facts (settled on 8BAB / i9-13900HX, architecture.md §25):
+    /// - PL1 15..=130 W, PL2 15..=157 W, PL2 >= PL1 (kernel invariant).
+    /// - PL4 30..=200 W — the ceiling is the factory default (SDD byte5)
+    ///   and must never be raised; 0 = not requested (wire NO_CHANGE).
+    /// - `cpu_gpu_concurrent_w` has no readback channel and no restore
+    ///   semantics — 0 (= NO_CHANGE) is the only accepted value.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !(15..=130).contains(&self.pl1_w) {
+            return Err("PL1 outside the 13900HX envelope 15..=130 W");
+        }
+        if !(15..=157).contains(&self.pl2_w) {
+            return Err("PL2 outside the 13900HX envelope 15..=157 W");
+        }
+        if self.pl2_w < self.pl1_w {
+            return Err("PL2 must be >= PL1 (kernel-validated invariant)");
+        }
+        if self.pl4_w != 0 && !(30..=200).contains(&self.pl4_w) {
+            return Err("PL4 outside the envelope 30..=200 W (factory ceiling, never raised)");
+        }
+        if self.cpu_gpu_concurrent_w != 0 {
+            return Err(
+                "cpu_gpu_concurrent has no readback/restore semantics — 0 (NO_CHANGE) only",
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Windows turbo boost policy (PERFBOOSTMODE, GUID
 /// be337238-0d82-4146-a960-4f3749d470c7). Wire values match winnt.h
 /// `PO_BOOST_*` 0..=6. MS PERFBOOSTMODE doc notes 3/4 alias 1/2 on

@@ -8,6 +8,7 @@
 //! requirement (R9). The 0x64F core-0 view comes from the pinned
 //! telemetry thread, not from here.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, RwLock};
@@ -34,7 +35,9 @@ use crate::telemetry::TelemetryHandle;
 use super::fan_curve::{FanCurveController, effective_temperature};
 use super::journal::{ControlJournal, JournalOrigin};
 use super::keepalive::{KeepAliveService, ReAssert};
+use super::recovery::{RecoveryRecord, RecoveryStore, ScopedSession};
 use super::safety::{SafetyAction, SafetySupervisor, ThermalFeed};
+use super::verification::{PendingVerification, Target as VerificationTarget};
 
 /// Queue depth. A full queue rejects with Busy — the Application layer
 /// coalesces slider spam before it ever gets here (AR-03).
@@ -51,7 +54,19 @@ const SAFETY_TICK: Duration = Duration::from_secs(1);
 /// ramps from auto converge in ~4 s and exit early, so the extra polls cost
 /// nothing there.
 const FAN_VERIFY_POLLS: u32 = 8;
-const FAN_VERIFY_TOLERANCE_LEVEL: i32 = 10;
+struct ActivePlan {
+    receipt: ControlReceipt,
+    command: ControlCommand,
+    plan: Vec<ControlCommand>,
+    index: usize,
+    steps: Vec<StepOutcome>,
+    weakest: Verification,
+    waiting: Option<PendingVerification>,
+    started: Instant,
+    epoch: u64,
+    restore_scope_steps: usize,
+    reply: mpsc::Sender<ControlOutcome>,
+}
 
 enum ControlRequest {
     Dispatch {
@@ -67,7 +82,7 @@ enum ControlRequest {
     /// Replace the profile registry without restarting the coordinator.
     /// Profile files are user-editable state and the UI can refresh them
     /// while the engine is already running.
-    ReplaceProfiles(crate::profiles::ProfileRegistry),
+    ReplaceProfiles(crate::profiles::ProfileRegistry, mpsc::Sender<bool>),
     Shutdown(mpsc::Sender<()>),
 }
 
@@ -128,6 +143,7 @@ impl<H, P, F> ControlConfig<H, P, F> {
 pub struct ControlHandle {
     tx: SyncSender<ControlRequest>,
     receipt_next: Arc<AtomicU64>,
+    manual_generation: Arc<AtomicU64>,
     caps: Arc<CapabilitySet>,
     desired: Arc<RwLock<DesiredState>>,
     observed: Arc<RwLock<ObservedState>>,
@@ -140,6 +156,7 @@ impl Clone for ControlHandle {
         Self {
             tx: self.tx.clone(),
             receipt_next: Arc::clone(&self.receipt_next),
+            manual_generation: Arc::clone(&self.manual_generation),
             caps: Arc::clone(&self.caps),
             desired: Arc::clone(&self.desired),
             observed: Arc::clone(&self.observed),
@@ -156,6 +173,10 @@ impl ControlHandle {
         &self,
         cmd: ControlCommand,
     ) -> Result<(ControlReceipt, Receiver<ControlOutcome>), ControlError> {
+        let manual = !matches!(
+            cmd,
+            ControlCommand::ApplyScopedProfile { .. } | ControlCommand::RestoreScopedProfile { .. }
+        );
         let receipt = ControlReceipt(self.receipt_next.fetch_add(1, Ordering::Relaxed));
         let (reply_tx, reply_rx) = mpsc::channel();
         self.tx
@@ -170,6 +191,9 @@ impl ControlHandle {
                     what: "control coordinator gone".into(),
                 },
             })?;
+        if manual {
+            self.manual_generation.fetch_add(1, Ordering::Release);
+        }
         Ok((receipt, reply_rx))
     }
 
@@ -186,6 +210,10 @@ impl ControlHandle {
                 what: "control coordinator gone".into(),
             },
         })
+    }
+
+    pub fn manual_generation(&self) -> u64 {
+        self.manual_generation.load(Ordering::Acquire)
     }
 
     pub fn capabilities(&self) -> &CapabilitySet {
@@ -237,7 +265,20 @@ impl ControlHandle {
     /// is temporarily full.  The coordinator is the only owner of the
     /// mutable registry; this send only waits for queue capacity.
     pub fn replace_profiles(&self, profiles: crate::profiles::ProfileRegistry) {
-        let _ = self.tx.send(ControlRequest::ReplaceProfiles(profiles));
+        loop {
+            let (ack, result) = mpsc::channel();
+            if self
+                .tx
+                .send(ControlRequest::ReplaceProfiles(profiles.clone(), ack))
+                .is_err()
+            {
+                return;
+            }
+            match result.recv() {
+                Ok(true) | Err(_) => return,
+                Ok(false) => std::thread::sleep(Duration::from_millis(25)),
+            }
+        }
     }
 
     /// Stop the coordinator; it restores firmware automatic state first
@@ -269,6 +310,12 @@ pub(crate) struct ControlCoordinator<H, P, F> {
     verify_polls: u32,
     verify_poll_interval: Duration,
     safety_tick: Duration,
+    verification_requested: Option<PendingVerification>,
+    control_epoch: u64,
+    recovery: RecoveryStore,
+    previous_recovery: Option<RecoveryRecord>,
+    scoped_session: Option<ScopedSession>,
+    mux_lifecycle: super::mux::MuxLifecycle,
     desired: Arc<RwLock<DesiredState>>,
     observed: Arc<RwLock<ObservedState>>,
     windows_ppm: Arc<RwLock<Option<WindowsPpmState>>>,
@@ -304,11 +351,23 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             &cfg.identity.board_id,
             &cfg.identity.bios_version,
         )?;
+        let (recovery, previous_recovery) = RecoveryStore::open(
+            &cfg.journal_path,
+            &cfg.identity.board_id,
+            &cfg.identity.bios_version,
+        )?;
         let (tx, rx) = mpsc::sync_channel(QUEUE_DEPTH);
         let desired = Arc::new(RwLock::new(DesiredState::default()));
         // 0x21 readback at start: populates ObservedState (Verified, AR-10)
         // AND is the shutdown restore point if this session writes 0x22.
         let gpu_policy_startup = cfg.hp.as_ref().and_then(|hp| hp.gpu_platform_policy().ok());
+        let mux_startup = cfg.hp.as_ref().and_then(|hp| hp.mux_mode().ok());
+        let mux_lifecycle = super::mux::MuxLifecycle::open(
+            &cfg.journal_path,
+            &cfg.identity.board_id,
+            &cfg.identity.bios_version,
+            mux_startup,
+        );
         let windows_ppm_startup = cfg
             .windows_ppm
             .take()
@@ -318,6 +377,22 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             gpu_policy_startup,
             windows_ppm_startup.as_ref(),
         )));
+        if previous_recovery.is_some() {
+            observed.write().expect("observed poisoned").control_notice =
+                Some("检测到上次未完成的控制会话；请先恢复，再应用新设置。".into());
+        }
+        {
+            let mut state = observed.write().expect("observed poisoned");
+            if let Some(value) = mux_startup {
+                state.mux = ObservedValue::Verified {
+                    value,
+                    at: Instant::now(),
+                    source: "hp-wmi 0x52",
+                };
+            }
+            state.mux_status = mux_lifecycle.status.clone();
+            state.mux_write_verified = mux_lifecycle.writable;
+        }
         let windows_ppm = Arc::new(RwLock::new(windows_ppm_startup));
         let last_saved_fan_curve = Arc::new(RwLock::new(match cfg.fan_curve_path.as_deref() {
             Some(path) => match crate::persistence::load_fan_curve(path) {
@@ -333,6 +408,7 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         let handle = ControlHandle {
             tx,
             receipt_next: Arc::new(AtomicU64::new(1)),
+            manual_generation: Arc::new(AtomicU64::new(0)),
             caps: Arc::clone(&caps),
             desired: Arc::clone(&desired),
             observed: Arc::clone(&observed),
@@ -353,6 +429,12 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             verify_polls: cfg.verify_polls,
             verify_poll_interval: cfg.verify_poll_interval,
             safety_tick: cfg.safety_tick,
+            verification_requested: None,
+            control_epoch: 0,
+            recovery,
+            previous_recovery,
+            scoped_session: None,
+            mux_lifecycle,
             desired,
             observed,
             windows_ppm,
@@ -546,34 +628,40 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 .windows_ppm
                 .write()
                 .expect("windows ppm state poisoned") = Some(state);
-        }
-        if let Ok((ac, dc)) = self.ppm.read_epp() {
-            self.set_observed(|o| {
-                o.epp_ac = ObservedValue::Verified {
-                    value: ac,
-                    at: Instant::now(),
-                    source: "powrprof PERFEPP",
-                };
-                o.epp_dc = ObservedValue::Verified {
-                    value: dc,
-                    at: Instant::now(),
-                    source: "powrprof PERFEPP",
-                };
-            });
-        }
-        if let Ok((ac, dc)) = self.ppm.read_epp1() {
-            self.set_observed(|o| {
-                o.epp1_ac = ObservedValue::Verified {
-                    value: ac,
-                    at: Instant::now(),
-                    source: "powrprof PERFEPP1",
-                };
-                o.epp1_dc = ObservedValue::Verified {
-                    value: dc,
-                    at: Instant::now(),
-                    source: "powrprof PERFEPP1",
-                };
-            });
+        } else {
+            // Fallback only (mirrors initial_observed): backends without
+            // the aggregate snapshot — the production PpmBackend always
+            // provides it, the test mock does not — still get their EPP
+            // stamps. Reading these AFTER a successful aggregate snapshot
+            // would just pay the same PowrProf walk twice (2026-09 audit).
+            if let Ok((ac, dc)) = self.ppm.read_epp() {
+                self.set_observed(|o| {
+                    o.epp_ac = ObservedValue::Verified {
+                        value: ac,
+                        at: Instant::now(),
+                        source: "powrprof PERFEPP",
+                    };
+                    o.epp_dc = ObservedValue::Verified {
+                        value: dc,
+                        at: Instant::now(),
+                        source: "powrprof PERFEPP",
+                    };
+                });
+            }
+            if let Ok((ac, dc)) = self.ppm.read_epp1() {
+                self.set_observed(|o| {
+                    o.epp1_ac = ObservedValue::Verified {
+                        value: ac,
+                        at: Instant::now(),
+                        source: "powrprof PERFEPP1",
+                    };
+                    o.epp1_dc = ObservedValue::Verified {
+                        value: dc,
+                        at: Instant::now(),
+                        source: "powrprof PERFEPP1",
+                    };
+                });
+            }
         }
         if let Some(hp) = &self.hp
             && let Ok(p) = hp.gpu_platform_policy()
@@ -588,33 +676,109 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         }
     }
 
+    fn reconcile_profile(&self) {
+        let observed = self.observed();
+        if let Some(profile) = observed
+            .active_profile
+            .as_ref()
+            .and_then(|name| self.profiles.get(name))
+            && !super::drift::matches(profile, &observed)
+        {
+            self.set_observed(|o| {
+                o.active_profile = None;
+                o.control_notice =
+                    Some("读回设置已偏离已应用配置；可能由电源计划、固件或其他软件改变。".into());
+            });
+        }
+    }
+
     fn run(mut self) {
         info!("control coordinator running");
+        let mut next_safety = Instant::now();
+        let mut active: Option<ActivePlan> = None;
+        let mut queued = VecDeque::new();
         loop {
-            let wait = self.compute_wait();
-            match self.rx.recv_timeout(wait) {
+            let now = Instant::now();
+            if now >= next_safety || self.keepalive.is_due(now) {
+                self.tick();
+                // Safety releases may perform a trusted fan write. They do
+                // not steal a user plan's pending verification.
+                self.verification_requested = None;
+                next_safety = Instant::now() + self.safety_tick;
+            }
+            if let Some(plan) = active.take() {
+                active = self.advance_plan(plan);
+            }
+            let mut wait = self
+                .compute_wait()
+                .min(next_safety.saturating_duration_since(Instant::now()));
+            if let Some(plan) = &active {
+                wait = wait.min(plan.waiting.as_ref().map_or(Duration::ZERO, |v| {
+                    v.next_due.saturating_duration_since(Instant::now())
+                }));
+            }
+            let request = if active.is_none() && !queued.is_empty() {
+                Ok(queued.pop_front().expect("nonempty queue"))
+            } else {
+                self.rx.recv_timeout(wait)
+            };
+            match request {
+                Ok(ControlRequest::Shutdown(ack)) => {
+                    if let Some(plan) = active.take() {
+                        self.finish_plan(plan, ControlStatus::Partial);
+                    }
+                    // Pending callers receive Disconnected; no queued writes
+                    // may run once teardown starts.
+                    queued.clear();
+                    self.restore_firmware_auto(JournalOrigin::Shutdown);
+                    let _ = ack.send(());
+                    return;
+                }
+                Ok(request) if active.is_some() => {
+                    if queued.len() < QUEUE_DEPTH {
+                        if let ControlRequest::ReplaceProfiles(_, ack) = &request {
+                            let _ = ack.send(true);
+                        }
+                        queued.push_back(request);
+                    } else if let ControlRequest::Dispatch {
+                        receipt,
+                        cmd,
+                        reply,
+                    } = &request
+                    {
+                        let _ = reply.send(ControlOutcome {
+                            receipt: *receipt,
+                            command: cmd.clone(),
+                            status: ControlStatus::Rejected {
+                                error: ControlError::Busy,
+                            },
+                            steps: Vec::new(),
+                            duration: Duration::ZERO,
+                        });
+                    } else if let ControlRequest::ReplaceProfiles(_, ack) = request {
+                        let _ = ack.send(false);
+                    }
+                }
                 Ok(ControlRequest::Dispatch {
                     receipt,
                     cmd,
                     reply,
                 }) => {
-                    let outcome = self.execute(receipt, cmd);
-                    let _ = reply.send(outcome);
+                    active = self.begin_plan(receipt, cmd, reply);
                 }
-                Ok(ControlRequest::Shutdown(ack)) => {
-                    info!("control coordinator shutting down — restoring firmware auto");
-                    self.restore_firmware_auto(JournalOrigin::Shutdown);
-                    let _ = ack.send(());
-                    return;
+                Ok(ControlRequest::RefreshObserved) => {
+                    self.refresh_observed();
+                    self.reconcile_profile();
                 }
-                Ok(ControlRequest::RefreshObserved) => self.refresh_observed(),
-                Ok(ControlRequest::ReplaceProfiles(profiles)) => {
+                Ok(ControlRequest::ReplaceProfiles(profiles, ack)) => {
                     self.profiles = profiles;
+                    let _ = ack.send(true);
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => self.tick(),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    // All handles dropped without shutdown(): still restore.
-                    warn!("control channel closed without shutdown — restoring firmware auto");
+                    if let Some(plan) = active.take() {
+                        self.finish_plan(plan, ControlStatus::Partial);
+                    }
                     self.restore_firmware_auto(JournalOrigin::Shutdown);
                     return;
                 }
@@ -653,41 +817,131 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
 
     // ------------------------------------------------------------ dispatch
 
-    fn execute(&mut self, receipt: ControlReceipt, cmd: ControlCommand) -> ControlOutcome {
+    fn begin_plan(
+        &mut self,
+        receipt: ControlReceipt,
+        cmd: ControlCommand,
+        reply: mpsc::Sender<ControlOutcome>,
+    ) -> Option<ActivePlan> {
+        if matches!(cmd, ControlCommand::RestoreScopedProfile { .. })
+            && self.scoped_session.is_none()
+        {
+            let outcome = ControlOutcome {
+                receipt,
+                command: cmd,
+                status: ControlStatus::Applied {
+                    verification: Verification::Skipped,
+                },
+                steps: Vec::new(),
+                duration: Duration::ZERO,
+            };
+            let _ = reply.send(outcome);
+            return None;
+        }
         let started = Instant::now();
-        info!(receipt = receipt.0, ?cmd, "control dispatch");
-
-        // 1. Expand into an ordered plan (a single command is a 1-step plan;
-        //    a profile resolves into its concrete Set* sequence). Expansion
-        //    failures (unknown name, unmergeable 0x21) reject pre-write.
-        let plan: Vec<ControlCommand> = match &cmd {
-            ControlCommand::ApplyProfile { profile } => match self.expand_profile(profile) {
-                Ok(p) => p,
-                Err(error) => {
-                    let outcome = ControlOutcome {
-                        receipt,
-                        command: cmd,
-                        status: ControlStatus::Rejected { error },
-                        steps: Vec::new(),
-                        duration: started.elapsed(),
-                    };
-                    self.journal(JournalOrigin::User, &outcome);
-                    return outcome;
+        let mut restore_scope_steps = 0;
+        let mut new_scope = None;
+        let plan = (|| {
+            if self.previous_recovery.is_some() && !matches!(cmd, ControlCommand::RestoreSession) {
+                return Err(ControlError::UnsafeRequest {
+                    reason: "上次会话尚未恢复，请先执行恢复".into(),
+                });
+            }
+            let mut plan = match &cmd {
+                ControlCommand::ApplyScopedProfile {
+                    profile,
+                    session_id,
+                } => {
+                    if self.scoped_session.is_some() {
+                        return Err(ControlError::Busy);
+                    }
+                    let p = self.profiles.get(profile).cloned().ok_or_else(|| {
+                        ControlError::UnknownProfile {
+                            name: profile.clone(),
+                        }
+                    })?;
+                    let baseline = self.capture_scope_baseline(&p)?;
+                    new_scope = Some(ScopedSession {
+                        id: *session_id,
+                        baseline,
+                        previous_profile: self
+                            .desired
+                            .read()
+                            .expect("desired poisoned")
+                            .profile
+                            .clone(),
+                        scheme: self
+                            .ppm
+                            .read_windows_ppm_state()
+                            .ok()
+                            .flatten()
+                            .map(|p| p.active_scheme_guid),
+                    });
+                    self.expand_definition(&p, profile)?
                 }
-            },
-            _ => vec![cmd.clone()],
-        };
-
-        // 2. Validate ALL plan steps upfront (safety layer; capability +
-        //    range + freshness gates). A profile whose any field fails its
-        //    per-command gate is rejected WHOLE — never apply half of a
-        //    rejected intent (AR-11).
-        let observed = self.observed();
-        for step_cmd in &plan {
-            if let Err(error) = self
-                .safety
-                .validate(step_cmd, &self.caps, &self.feed, &observed)
+                ControlCommand::RestoreScopedProfile { session_id } => {
+                    if let Some(scope) = &self.scoped_session {
+                        if scope.id != *session_id {
+                            return Err(ControlError::UnsafeRequest {
+                                reason: "自动会话标识已过期".into(),
+                            });
+                        }
+                        self.validate_scope_scheme()?;
+                        let plan = self.expand_definition(&scope.baseline, "会话恢复")?;
+                        restore_scope_steps = plan.len();
+                        plan
+                    } else {
+                        vec![ControlCommand::SetCpuPolicy(CpuPolicy::default())]
+                    }
+                }
+                ControlCommand::ApplyProfile { profile } => self.expand_profile(profile)?,
+                ControlCommand::ApplyProfileDefinition { profile } => {
+                    self.expand_definition(profile, "编辑中的配置")?
+                }
+                _ => vec![cmd.clone()],
+            };
+            if let Some(scope) = &self.scoped_session
+                && !matches!(
+                    cmd,
+                    ControlCommand::ApplyScopedProfile { .. }
+                        | ControlCommand::RestoreScopedProfile { .. }
+                        | ControlCommand::RestoreSession
+                )
             {
+                self.validate_scope_scheme()?;
+                let mut restore = self.expand_definition(&scope.baseline, "手动接管前恢复")?;
+                restore_scope_steps = restore.len();
+                restore.append(&mut plan);
+                plan = restore;
+            }
+            for step in &plan {
+                self.safety
+                    .validate(step, &self.caps, &self.feed, &self.observed())?;
+            }
+            if let Some(scope) = new_scope.take() {
+                self.scoped_session = Some(scope);
+                if let Err(e) = self.persist_recovery() {
+                    self.scoped_session = None;
+                    return Err(e);
+                }
+            }
+            Ok(plan)
+        })();
+        match plan {
+            Ok(plan) => Some(ActivePlan {
+                receipt,
+                command: cmd,
+                plan,
+                index: 0,
+                steps: Vec::new(),
+                weakest: Verification::Skipped,
+                waiting: None,
+                started,
+                epoch: self.control_epoch,
+                restore_scope_steps,
+                reply,
+            }),
+            Err(error) => {
                 let outcome = ControlOutcome {
                     receipt,
                     command: cmd,
@@ -696,92 +950,274 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                     duration: started.elapsed(),
                 };
                 self.journal(JournalOrigin::User, &outcome);
-                return outcome;
+                let _ = reply.send(outcome);
+                None
             }
         }
+    }
 
-        // 3. Execute + verify in plan order; stop at the first failing step.
-        //    A failure on the FIRST step rejects the whole command (nothing
-        //    applied); a failure later leaves earlier steps applied — Partial
-        //    carries the truth, the journal has the per-step evidence; no
-        //    M2 rollback.
-        let mut steps = Vec::new();
-        let mut weakest = Verification::Skipped;
-        let mut status = ControlStatus::Applied {
-            verification: Verification::Skipped,
+    /// Advance at most one write or one readback. Waiting for firmware never
+    /// prevents absolute-deadline safety/heartbeat work or shutdown requests.
+    fn advance_plan(&mut self, mut plan: ActivePlan) -> Option<ActivePlan> {
+        if plan.epoch != self.control_epoch {
+            self.finish_plan(plan, ControlStatus::Partial);
+            return None;
+        }
+        let command = plan.plan[plan.index].clone();
+        let status = if let Some(mut verification) = plan.waiting.take() {
+            let verdict = if matches!(verification.target, VerificationTarget::Fan(_))
+                && self.safety.override_active()
+            {
+                Some(Verification::Failed {
+                    expected: "requested fan target".into(),
+                    actual: "thermal safety override".into(),
+                })
+            } else {
+                verification.poll(self.hp.as_ref(), &self.feed)
+            };
+            let Some(verdict) = verdict else {
+                plan.waiting = Some(verification);
+                return Some(plan);
+            };
+            if verdict == Verification::Verified {
+                self.stamp_verified(verification.actual_target.unwrap_or(verification.target));
+            }
+            if let Some(step) = plan.steps.last_mut() {
+                step.verification = verdict.clone();
+                step.after = Some(format!(
+                    "{verdict:?}; readback={:?}",
+                    verification.actual_target
+                ));
+            }
+            ControlStatus::Applied {
+                verification: verdict,
+            }
+        } else {
+            // A plan may have spent seconds waiting; recheck temperature and
+            // capability gates immediately before each subsequent mutation.
+            if let Err(error) =
+                self.safety
+                    .validate(&command, &self.caps, &self.feed, &self.observed())
+            {
+                let status = if plan.index == 0 {
+                    ControlStatus::Rejected { error }
+                } else {
+                    ControlStatus::Partial
+                };
+                self.finish_plan(plan, status);
+                return None;
+            }
+            self.verification_requested = None;
+            let status = self.exec_one(&command, &mut plan.steps);
+            if matches!(status, ControlStatus::Applied { .. }) {
+                self.record_desired(&command);
+            }
+            self.keepalive
+                .reschedule_tracked(&self.tracked_set(), Instant::now());
+            if let Some(verification) = self.verification_requested.take() {
+                plan.waiting = Some(verification);
+                return Some(plan);
+            }
+            status
         };
-        for (i, step_cmd) in plan.iter().enumerate() {
-            match self.exec_one(step_cmd, &mut steps) {
-                ControlStatus::Applied {
-                    verification: failed @ Verification::Failed { .. },
-                } => {
-                    // The backend accepted the write, but the hardware did
-                    // not verify the requested state.  Preserve that honest
-                    // Applied+Failed verdict for a one-step command; inside
-                    // a profile it is a failed plan step, so later writes
-                    // must not run and the profile must not be stamped.
-                    status = if i == 0 && plan.len() == 1 {
-                        ControlStatus::Applied {
-                            verification: failed,
-                        }
-                    } else {
-                        ControlStatus::Partial
-                    };
-                    break;
+        match status {
+            ControlStatus::Applied {
+                verification: failed @ Verification::Failed { .. },
+            } => {
+                let status = if plan.index == 0 && plan.plan.len() == 1 {
+                    ControlStatus::Applied {
+                        verification: failed,
+                    }
+                } else {
+                    ControlStatus::Partial
+                };
+                self.finish_plan(plan, status);
+                None
+            }
+            ControlStatus::Applied { verification } => {
+                plan.weakest = weakest_verification(&plan.weakest, &verification);
+                plan.index += 1;
+                if plan.restore_scope_steps != 0 && plan.index == plan.restore_scope_steps {
+                    let previous = self.scoped_session.take().and_then(|s| s.previous_profile);
+                    self.desired.write().expect("desired poisoned").profile = previous.clone();
+                    self.set_observed(|o| o.active_profile = previous);
+                    if let Err(e) = self.persist_recovery() {
+                        self.set_observed(|o| o.control_notice = Some(e.to_string()));
+                    }
                 }
-                ControlStatus::Applied { verification } => {
-                    weakest = weakest_verification(&weakest, &verification);
-                    status = ControlStatus::Applied {
-                        verification: weakest.clone(),
+                if plan.index == plan.plan.len() {
+                    let status = ControlStatus::Applied {
+                        verification: plan.weakest.clone(),
                     };
-                    self.record_desired(step_cmd);
-                }
-                ControlStatus::Rejected { error } => {
-                    status = if i == 0 {
-                        ControlStatus::Rejected { error }
-                    } else {
-                        ControlStatus::Partial
-                    };
-                    break;
-                }
-                ControlStatus::Partial => {
-                    status = ControlStatus::Partial;
-                    break;
+                    self.finish_plan(plan, status);
+                    None
+                } else {
+                    Some(plan)
                 }
             }
+            ControlStatus::Rejected { error } => {
+                let status = if plan.index == 0 {
+                    ControlStatus::Rejected { error }
+                } else {
+                    ControlStatus::Partial
+                };
+                self.finish_plan(plan, status);
+                None
+            }
+            ControlStatus::Partial => {
+                self.clear_profile_stamp();
+                self.finish_plan(plan, ControlStatus::Partial);
+                None
+            }
         }
-        if matches!(status, ControlStatus::Applied { .. })
-            && let ControlCommand::ApplyProfile { profile } = &cmd
-        {
-            self.desired.write().expect("desired poisoned").profile = Some(profile.clone());
-        }
+    }
 
-        // 4. Reschedule keep-alive against the new observed state.
+    fn finish_plan(&mut self, plan: ActivePlan, status: ControlStatus) {
+        if Self::control_status_succeeded(&status) {
+            if let ControlCommand::ApplyProfile { profile }
+            | ControlCommand::ApplyScopedProfile { profile, .. } = &plan.command
+            {
+                self.desired.write().expect("desired poisoned").profile = Some(profile.clone());
+                self.set_observed(|o| {
+                    o.active_profile = Some(profile.clone());
+                    o.control_notice = None;
+                });
+            }
+        } else if !plan.steps.is_empty() {
+            self.set_observed(|o| {
+                o.active_profile = None;
+                o.control_notice = Some("设置未完全生效；请检查读回结果或重新应用。".into());
+            });
+        }
         self.keepalive
             .reschedule_tracked(&self.tracked_set(), Instant::now());
-
+        if let Err(error) = self.persist_recovery() {
+            self.set_observed(|o| o.control_notice = Some(error.to_string()));
+        }
         let outcome = ControlOutcome {
-            receipt,
-            command: cmd,
+            receipt: plan.receipt,
+            command: plan.command,
             status,
-            steps,
-            duration: started.elapsed(),
+            steps: plan.steps,
+            duration: plan.started.elapsed(),
         };
         self.journal(JournalOrigin::User, &outcome);
-        outcome
+        let _ = plan.reply.send(outcome);
+    }
+
+    fn defer_verification(
+        &mut self,
+        target: VerificationTarget,
+        written_at: Instant,
+    ) -> Verification {
+        self.verification_requested = Some(PendingVerification::new(
+            target,
+            written_at,
+            self.verify_polls,
+            self.verify_poll_interval,
+        ));
+        Verification::TrustedNoReadback
+    }
+
+    fn stamp_verified(&self, target: VerificationTarget) {
+        self.set_observed(|o| match target {
+            VerificationTarget::Fan(levels) => {
+                o.fan_mode = ObservedValue::Verified {
+                    value: FanMode::Manual(levels),
+                    at: Instant::now(),
+                    source: "hp-wmi 0x2D",
+                }
+            }
+            VerificationTarget::Gpu(policy, _) => {
+                o.gpu_platform_policy = ObservedValue::Verified {
+                    value: policy,
+                    at: Instant::now(),
+                    source: "hp-wmi 0x21",
+                }
+            }
+            VerificationTarget::Power(limits) => {
+                o.power_limits = ObservedValue::Verified {
+                    value: limits,
+                    at: Instant::now(),
+                    source: "MSR 0x610 / MCHBAR 0x59B0",
+                }
+            }
+        });
     }
 
     /// Per-command execution dispatch (one plan step).
     fn exec_one(&mut self, cmd: &ControlCommand, steps: &mut Vec<StepOutcome>) -> ControlStatus {
         match cmd {
+            ControlCommand::RestoreSession => {
+                if let Some(record) = self.previous_recovery.take() {
+                    if record.board != self.recovery.board || record.bios != self.recovery.bios {
+                        self.previous_recovery = Some(record);
+                        return ControlStatus::Rejected {
+                            error: ControlError::UnsafeRequest {
+                                reason: "恢复记录的主板或 BIOS 与当前设备不同，需要重新核验".into(),
+                            },
+                        };
+                    }
+                    self.scoped_session = record.scoped;
+                    self.fan_control_dirty = record.fan;
+                    self.thermal_mode_dirty = record.thermal;
+                    self.gpu_policy_dirty = record.gpu.is_some();
+                    self.gpu_policy_startup = record.gpu;
+                    self.power_limits_dirty = record.power.is_some();
+                    self.power_limits_baseline = record.power.map(|p| (p.pl1_w, p.pl2_w, p.pl4_w));
+                }
+                self.restore_firmware_auto(JournalOrigin::User);
+                if self.recovery_record().pending() || self.persist_recovery().is_err() {
+                    ControlStatus::Partial
+                } else {
+                    ControlStatus::Applied {
+                        verification: Verification::Verified,
+                    }
+                }
+            }
             ControlCommand::SetThermalMode(mode) => self.exec_thermal(*mode, steps),
             ControlCommand::SetFanMode(mode) => self.exec_fan_mode(*mode, steps),
             ControlCommand::SetCpuPolicy(policy) => self.exec_cpu_policy(policy, steps),
-            ControlCommand::SetGpuPlatformPolicy(p) => self.exec_gpu_policy(*p, steps),
+            ControlCommand::SetGpuPlatformPolicy(p) => self.exec_gpu_policy(*p, steps, true),
             ControlCommand::SetGpuPlatformPolicyPatch(patch) => {
                 self.exec_gpu_policy_patch(*patch, steps)
             }
             ControlCommand::SetPowerLimits(l) => self.exec_power_limits(*l, steps),
+            ControlCommand::SetMuxMode(mode) => {
+                let result = self
+                    .hp
+                    .as_ref()
+                    .ok_or(ControlError::Unsupported)
+                    .and_then(|hp| hp.mux_mode().map_err(map_hp_error))
+                    .and_then(|current| self.mux_lifecycle.prepare(current, *mode));
+                if let Err(error) = result {
+                    return ControlStatus::Rejected { error };
+                }
+                let result = self
+                    .hp
+                    .as_ref()
+                    .expect("checked HP backend")
+                    .set_mux_mode(*mode);
+                self.set_observed(|o| o.mux_status = self.mux_lifecycle.status.clone());
+                // The ledger remains pending even on transport failure: a
+                // firmware mutation can finish after its caller times out.
+                steps.push(StepOutcome {
+                    step: "request_mux_reboot".into(),
+                    backend: "hp-wmi 0x02/0x52".into(),
+                    firmware_return: Some(format!("{result:?}")),
+                    before: Some(format!("{:?}", self.observed().mux)),
+                    after: Some(self.mux_lifecycle.status.clone()),
+                    verification: Verification::Skipped,
+                });
+                match result {
+                    Ok(()) => ControlStatus::Applied {
+                        verification: Verification::Skipped,
+                    },
+                    Err(error) => ControlStatus::Rejected {
+                        error: map_hp_error(error),
+                    },
+                }
+            }
             // validate() rejects these; a plan never contains them.
             _ => ControlStatus::Rejected {
                 error: ControlError::Unsupported,
@@ -801,9 +1237,17 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             .get(name)
             .ok_or_else(|| ControlError::UnknownProfile { name: name.into() })?
             .clone();
+        self.expand_definition(&p, name)
+    }
+
+    fn expand_definition(
+        &self,
+        p: &phelper_domain::profile::PerformanceProfile,
+        name: &str,
+    ) -> Result<Vec<ControlCommand>, ControlError> {
         let mut plan = Vec::new();
         if p.cpu != CpuPolicy::default() {
-            plan.push(ControlCommand::SetCpuPolicy(p.cpu));
+            plan.push(ControlCommand::SetCpuPolicy(p.cpu.clone()));
         }
         if let Some(l) = p.power_limits {
             plan.push(ControlCommand::SetPowerLimits(l));
@@ -848,7 +1292,16 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         // name after its plan completes — see execute().)
         if !matches!(cmd, ControlCommand::ApplyProfile { .. }) {
             d.profile = None;
+            self.set_observed(|o| o.active_profile = None);
         }
+    }
+
+    /// Clear only the profile NAME stamp: some hardware write already
+    /// happened, so whatever a named profile set up no longer describes
+    /// the machine — but the partial intent is not recorded as desired.
+    fn clear_profile_stamp(&mut self) {
+        self.desired.write().expect("desired poisoned").profile = None;
+        self.set_observed(|o| o.active_profile = None);
     }
 
     // ------------------------------------------------------------ thermal
@@ -862,6 +1315,12 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 },
             };
         };
+        let previously_dirty = self.thermal_mode_dirty;
+        self.thermal_mode_dirty = true;
+        if let Err(error) = self.persist_recovery() {
+            self.thermal_mode_dirty = previously_dirty;
+            return ControlStatus::Rejected { error };
+        }
         match hp.set_thermal_mode(mode) {
             Ok(()) => {
                 // No trustworthy readback exists for 0x1A (AR-10): the write
@@ -886,6 +1345,9 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 }
             }
             Err(e) => {
+                if definite_hp_rejection(&e) {
+                    self.thermal_mode_dirty = previously_dirty;
+                }
                 steps.push(failed_step("set_thermal_mode", "hp-wmi 0x1A", &e, before));
                 ControlStatus::Rejected {
                     error: map_hp_error(e),
@@ -909,6 +1371,12 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             "fan_mode={:?} max_fan={:?}",
             current.fan_mode, current.max_fan
         );
+        let previously_dirty = self.fan_control_dirty;
+        self.fan_control_dirty = true;
+        if let Err(error) = self.persist_recovery() {
+            self.fan_control_dirty = previously_dirty;
+            return ControlStatus::Rejected { error };
+        }
         match mode {
             FanMode::FirmwareAuto => {
                 // §27 restore sequence.  Release 0x27 first when max fan is
@@ -1045,7 +1513,8 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 }
                 self.fan_control_dirty = true;
                 // Delayed readback verification (0x2D, 1 Hz — §38 binds).
-                let verification = self.verify_fan_levels(hp, target);
+                let verification =
+                    self.defer_verification(VerificationTarget::Fan(target), Instant::now());
                 let ok = matches!(verification, Verification::Verified);
                 self.set_observed(|o| {
                     o.fan_mode = if ok {
@@ -1200,42 +1669,18 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         }
     }
 
-    /// 0x2D readback after a 0x2E write: up to verify_polls × interval,
-    /// Verified when every non-auto channel sits within ±1000 RPM of target.
-    fn verify_fan_levels(&self, hp: &H, target: FanLevels) -> Verification {
-        let mut last = String::new();
-        for _ in 0..self.verify_polls {
-            std::thread::sleep(self.verify_poll_interval);
-            match hp.fan_levels() {
-                Ok(actual) => {
-                    last = format!("left={} right={} (x100 RPM)", actual.left, actual.right);
-                    let left_ok = target.left == 0
-                        || (actual.left as i32 - target.left as i32).abs()
-                            <= FAN_VERIFY_TOLERANCE_LEVEL;
-                    let right_ok = target.right == 0
-                        || (actual.right as i32 - target.right as i32).abs()
-                            <= FAN_VERIFY_TOLERANCE_LEVEL;
-                    if left_ok && right_ok {
-                        return Verification::Verified;
-                    }
-                }
-                Err(e) => last = format!("readback error: {e}"),
-            }
-        }
-        Verification::Failed {
-            expected: format!("left={} right={} (x100 RPM)", target.left, target.right),
-            actual: last,
-        }
-    }
-
     // ------------------------------------------------------------ GPU policy
 
     /// 0x22 write with 0x21 readback verification (a real readback exists
     /// here, unlike 0x1A/0x27 — so this path is Verified, not TrustedWrite).
+    /// `dstate_requested` tells verification whether the dstate byte was an
+    /// explicit request (full-struct command) or merely merged from the live
+    /// 0x21 read (patch path) — see verify_gpu_policy for why that matters.
     fn exec_gpu_policy(
         &mut self,
         p: GpuPlatformPolicy,
         steps: &mut Vec<StepOutcome>,
+        dstate_requested: bool,
     ) -> ControlStatus {
         let Some(hp) = &self.hp else {
             return ControlStatus::Rejected {
@@ -1244,20 +1689,39 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 },
             };
         };
-        let before = match hp.gpu_platform_policy() {
-            Ok(cur) => format!(
-                "ctgp={} ppab={} dstate={} slowdown={}C",
-                cur.ctgp, cur.ppab, cur.dstate, cur.slowdown_temp_c
-            ),
-            Err(e) => format!("0x21 unreadable: {e}"),
+        let current = match hp.gpu_platform_policy() {
+            Ok(current) => current,
+            Err(error) => {
+                return ControlStatus::Rejected {
+                    error: map_hp_error(error),
+                };
+            }
         };
+        if !self.gpu_policy_dirty {
+            self.gpu_policy_startup = Some(current);
+        }
+        let before = format!(
+            "ctgp={} ppab={} dstate={} slowdown={}C",
+            current.ctgp, current.ppab, current.dstate, current.slowdown_temp_c
+        );
+        // An accepted call can time out while WMI is still executing. Own
+        // the restore obligation BEFORE issuing it, including unknown outcomes.
+        let previously_dirty = self.gpu_policy_dirty;
+        self.gpu_policy_dirty = true;
+        if let Err(error) = self.persist_recovery() {
+            self.gpu_policy_dirty = previously_dirty;
+            return ControlStatus::Rejected { error };
+        }
         match hp.set_gpu_platform_policy(p) {
             Ok(()) => {
                 // A successful write must enter the shutdown ledger even if
                 // the readback channel later fails.  Verification describes
                 // what we know; it must not decide whether a write happened.
                 self.gpu_policy_dirty = true;
-                let verification = self.verify_gpu_policy(hp, p);
+                let verification = self.defer_verification(
+                    VerificationTarget::Gpu(p, dstate_requested),
+                    Instant::now(),
+                );
                 let ok = matches!(verification, Verification::Verified);
                 self.set_observed(|o| {
                     o.gpu_platform_policy = if ok {
@@ -1292,6 +1756,9 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 }
             }
             Err(e) => {
+                if definite_hp_rejection(&e) {
+                    self.gpu_policy_dirty = previously_dirty;
+                }
                 steps.push(failed_step("set gpu policy", "hp-wmi 0x22", &e, before));
                 ControlStatus::Rejected {
                     error: map_hp_error(e),
@@ -1336,8 +1803,11 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             }
         };
         let merged = patch.apply(current);
-        let status = self.exec_gpu_policy(merged, steps);
-        if Self::control_status_succeeded(&status) {
+        // dstate joins the verification verdict only when the patch asked
+        // for it; merged-from-live dstate drifts on its own (M5) and would
+        // otherwise produce spurious Failed verdicts.
+        let status = self.exec_gpu_policy(merged, steps, patch.dstate.is_some());
+        if matches!(status, ControlStatus::Applied { .. }) {
             // record_desired() can't fill this in — the merged value only
             // exists here — so the patch arm stamps desired itself.
             self.desired
@@ -1346,33 +1816,6 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 .gpu_platform_policy = Some(merged);
         }
         status
-    }
-
-    /// 0x21 readback after a 0x22 write: all four bytes must match.
-    fn verify_gpu_policy(&self, hp: &H, target: GpuPlatformPolicy) -> Verification {
-        let mut last = String::new();
-        for _ in 0..self.verify_polls {
-            std::thread::sleep(self.verify_poll_interval);
-            match hp.gpu_platform_policy() {
-                Ok(actual) => {
-                    last = format!(
-                        "ctgp={} ppab={} dstate={} slowdown={}C",
-                        actual.ctgp, actual.ppab, actual.dstate, actual.slowdown_temp_c
-                    );
-                    if actual == target {
-                        return Verification::Verified;
-                    }
-                }
-                Err(e) => last = format!("readback error: {e}"),
-            }
-        }
-        Verification::Failed {
-            expected: format!(
-                "ctgp={} ppab={} dstate={} slowdown={}C",
-                target.ctgp, target.ppab, target.dstate, target.slowdown_temp_c
-            ),
-            actual: last,
-        }
     }
 
     // ------------------------------------------------------------ power limits
@@ -1409,11 +1852,36 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 at.elapsed().as_secs_f64()
             ));
         }
-        if self.power_limits_baseline.is_none()
-            && let Some((p1, p2, _)) = self.feed.power_limits_w()
-        {
+        if self.power_limits_baseline.is_none() {
+            // The baseline IS the shutdown-restore obligation: the firmware
+            // DEFAULT write {0,0,FF,FF} was observed not to take effect on
+            // 8BAB, and there is no 0x29 clawback (M3). safety.validate
+            // already required a fresh 0x610 sample; if the feed died in
+            // the meantime, refuse the write rather than leave an
+            // unrestorable experimental limit behind (AR-12, fail closed).
+            let Some((p1, p2, _)) = self.feed.power_limits_w() else {
+                steps.push(StepOutcome {
+                    step: "capture power-limits baseline (MSR 0x610)".into(),
+                    backend: "pawnio telemetry feed".into(),
+                    firmware_return: None,
+                    before: Some(before.clone()),
+                    after: Some("readback feed lost before first write — write refused".into()),
+                    verification: Verification::Skipped,
+                });
+                return ControlStatus::Rejected {
+                    error: ControlError::BackendUnavailable {
+                        what: "0x610 readback feed (baseline capture)".into(),
+                    },
+                };
+            };
             let p4 = self.feed.pl4_w().map(|(v, _)| v.round() as u8).unwrap_or(0);
             self.power_limits_baseline = Some((p1.round() as u8, p2.round() as u8, p4));
+        }
+        let previously_dirty = self.power_limits_dirty;
+        self.power_limits_dirty = true;
+        if let Err(error) = self.persist_recovery() {
+            self.power_limits_dirty = previously_dirty;
+            return ControlStatus::Rejected { error };
         }
         let written_at = Instant::now();
         match hp.set_power_limits(l) {
@@ -1423,7 +1891,8 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 // converges; otherwise an unverified but real write would
                 // survive process shutdown.
                 self.power_limits_dirty = true;
-                let verification = self.verify_power_limits(l, written_at);
+                let verification =
+                    self.defer_verification(VerificationTarget::Power(l), written_at);
                 let ok = matches!(verification, Verification::Verified);
                 self.set_observed(|o| {
                     o.power_limits = if ok {
@@ -1462,6 +1931,9 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 }
             }
             Err(e) => {
+                if definite_hp_rejection(&e) {
+                    self.power_limits_dirty = previously_dirty;
+                }
                 steps.push(failed_step("set power limits", "hp-wmi 0x29", &e, before));
                 ControlStatus::Rejected {
                     error: map_hp_error(e),
@@ -1470,58 +1942,68 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         }
     }
 
-    /// Runbook step 2: poll the 0x610 telemetry feed (250 ms cadence) until
-    /// a sample TAKEN AFTER the write sits within ±1 W of the targets. PL4
-    /// joins the verdict only when the write requested it (pl4_w != 0); a
-    /// missing MCHBAR channel then never converges — honest Failed, not a
-    /// silent skip of byte2.
-    fn verify_power_limits(&self, l: CpuPowerLimits, written_at: Instant) -> Verification {
-        let mut last = String::new();
-        for _ in 0..self.verify_polls {
-            std::thread::sleep(self.verify_poll_interval);
-            match self.feed.power_limits_w() {
-                Some((p1, p2, at)) => {
-                    last = format!("pl1={p1:.1}W pl2={p2:.1}W");
-                    if at < written_at {
-                        last.push_str(" (pre-write sample)");
-                        continue;
-                    }
-                    let pl12_ok = (p1 - f64::from(l.pl1_w)).abs() <= 1.0
-                        && (p2 - f64::from(l.pl2_w)).abs() <= 1.0;
-                    if l.pl4_w == 0 {
-                        if pl12_ok {
-                            return Verification::Verified;
-                        }
-                        continue;
-                    }
-                    match self.feed.pl4_w() {
-                        Some((p4, p4_at)) => {
-                            last.push_str(&format!(" pl4={p4:.1}W"));
-                            if p4_at < written_at {
-                                last.push_str(" (pre-write pl4 sample)");
-                                continue;
+    // ------------------------------------------------------------ CPU policy
+
+    /// One AC/DC PowrProf knob in the §32 batch: before-read → write →
+    /// immediate readback-verify → Verified observed stamp, pushing step
+    /// evidence either way (2026-09 dedup: the six knobs differ only in
+    /// method pair, label, unit, value type, and stamp target). Returns
+    /// (applied, failed): a knob whose write SUCCEEDED counts as applied
+    /// even when its readback verification failed — the hardware was
+    /// touched, so the batch is at least Partial, never a clean Rejected.
+    #[allow(clippy::too_many_arguments)]
+    fn exec_ppm_knob<T: Copy + PartialEq + std::fmt::Debug>(
+        &mut self,
+        step: &'static str,
+        backend: &'static str,
+        label: &'static str,
+        unit: &'static str,
+        req_ac: Option<T>,
+        req_dc: Option<T>,
+        read: impl Fn(&P) -> Result<(T, T), PlatformError>,
+        write: impl Fn(&P, Option<T>, Option<T>) -> Result<(), PlatformError>,
+        stamp: impl Fn(&mut ObservedState, T, T),
+        steps: &mut Vec<StepOutcome>,
+    ) -> (bool, bool) {
+        let before = read(&self.ppm)
+            .map(|(ac, dc)| format!("{label} ac={ac:?}{unit} dc={dc:?}{unit}"))
+            .unwrap_or_else(|e| format!("{label} unreadable: {e}"));
+        match write(&self.ppm, req_ac, req_dc) {
+            Ok(()) => {
+                let verification = match read(&self.ppm) {
+                    Ok((ac, dc)) => {
+                        if req_ac.is_none_or(|v| v == ac) && req_dc.is_none_or(|v| v == dc) {
+                            self.set_observed(|o| stamp(o, ac, dc));
+                            Verification::Verified
+                        } else {
+                            Verification::Failed {
+                                expected: format!("ac={req_ac:?} dc={req_dc:?}"),
+                                actual: format!("ac={ac:?} dc={dc:?}"),
                             }
-                            if pl12_ok && (p4 - f64::from(l.pl4_w)).abs() <= 1.0 {
-                                return Verification::Verified;
-                            }
                         }
-                        None => last.push_str(" pl4 feed unavailable"),
                     }
-                }
-                None => last = "0x610 feed unavailable".into(),
+                    Err(e) => Verification::Failed {
+                        expected: format!("ac={req_ac:?} dc={req_dc:?}"),
+                        actual: format!("readback error: {e}"),
+                    },
+                };
+                let verified = matches!(verification, Verification::Verified);
+                steps.push(StepOutcome {
+                    step: step.into(),
+                    backend: backend.into(),
+                    firmware_return: Some("ok".into()),
+                    before: Some(before),
+                    after: Some(format!("{verification:?}")),
+                    verification,
+                });
+                (true, !verified)
+            }
+            Err(e) => {
+                steps.push(platform_failed_step(step, backend, &e, before));
+                (false, true)
             }
         }
-        Verification::Failed {
-            expected: if l.pl4_w != 0 {
-                format!("pl1={}W pl2={}W pl4={}W", l.pl1_w, l.pl2_w, l.pl4_w)
-            } else {
-                format!("pl1={}W pl2={}W", l.pl1_w, l.pl2_w)
-            },
-            actual: last,
-        }
     }
-
-    // ------------------------------------------------------------ CPU policy
 
     /// §32 order: EPP → EPP1 → max-freq → performance bounds → boost. Steps are independent
     /// settings — a later failure leaves earlier steps applied (Partial; no
@@ -1531,412 +2013,181 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         let mut failed = false;
 
         if p.epp_ac.is_some() || p.epp_dc.is_some() {
-            let before = self
-                .ppm
-                .read_epp()
-                .map(|(ac, dc)| format!("epp ac={ac} dc={dc}"))
-                .unwrap_or_else(|e| format!("epp unreadable: {e}"));
-            match self.ppm.write_epp(p.epp_ac, p.epp_dc) {
-                Ok(()) => {
-                    let verification = match self.ppm.read_epp() {
-                        Ok((ac, dc)) => {
-                            let ac_ok = p.epp_ac.is_none_or(|v| v == ac);
-                            let dc_ok = p.epp_dc.is_none_or(|v| v == dc);
-                            if ac_ok && dc_ok {
-                                self.set_observed(|o| {
-                                    o.epp_ac = ObservedValue::Verified {
-                                        value: ac,
-                                        at: Instant::now(),
-                                        source: "powrprof PERFEPP",
-                                    };
-                                    o.epp_dc = ObservedValue::Verified {
-                                        value: dc,
-                                        at: Instant::now(),
-                                        source: "powrprof PERFEPP",
-                                    };
-                                });
-                                Verification::Verified
-                            } else {
-                                Verification::Failed {
-                                    expected: format!("ac={:?} dc={:?}", p.epp_ac, p.epp_dc),
-                                    actual: format!("ac={ac} dc={dc}"),
-                                }
-                            }
-                        }
-                        Err(e) => Verification::Failed {
-                            expected: format!("ac={:?} dc={:?}", p.epp_ac, p.epp_dc),
-                            actual: format!("readback error: {e}"),
-                        },
+            let (a, f) = self.exec_ppm_knob(
+                "write EPP",
+                "powrprof PERFEPP",
+                "epp",
+                "",
+                p.epp_ac,
+                p.epp_dc,
+                P::read_epp,
+                P::write_epp,
+                |o, ac, dc| {
+                    o.epp_ac = ObservedValue::Verified {
+                        value: ac,
+                        at: Instant::now(),
+                        source: "powrprof PERFEPP",
                     };
-                    if !matches!(verification, Verification::Verified) {
-                        failed = true;
-                    }
-                    steps.push(StepOutcome {
-                        step: "write EPP".into(),
-                        backend: "powrprof PERFEPP".into(),
-                        firmware_return: Some("ok".into()),
-                        before: Some(before),
-                        after: Some(format!("{verification:?}")),
-                        verification,
-                    });
-                    applied = true;
-                }
-                Err(e) => {
-                    failed = true;
-                    steps.push(platform_failed_step(
-                        "write EPP",
-                        "powrprof PERFEPP",
-                        &e,
-                        before,
-                    ));
-                }
-            }
+                    o.epp_dc = ObservedValue::Verified {
+                        value: dc,
+                        at: Instant::now(),
+                        source: "powrprof PERFEPP",
+                    };
+                },
+                steps,
+            );
+            applied |= a;
+            failed |= f;
         }
 
         if p.epp1_ac.is_some() || p.epp1_dc.is_some() {
-            let before = self
-                .ppm
-                .read_epp1()
-                .map(|(ac, dc)| format!("epp1 ac={ac} dc={dc}"))
-                .unwrap_or_else(|e| format!("epp1 unreadable: {e}"));
-            match self.ppm.write_epp1(p.epp1_ac, p.epp1_dc) {
-                Ok(()) => {
-                    let verification = match self.ppm.read_epp1() {
-                        Ok((ac, dc)) => {
-                            let ac_ok = p.epp1_ac.is_none_or(|v| v == ac);
-                            let dc_ok = p.epp1_dc.is_none_or(|v| v == dc);
-                            if ac_ok && dc_ok {
-                                self.set_observed(|o| {
-                                    o.epp1_ac = ObservedValue::Verified {
-                                        value: ac,
-                                        at: Instant::now(),
-                                        source: "powrprof PERFEPP1",
-                                    };
-                                    o.epp1_dc = ObservedValue::Verified {
-                                        value: dc,
-                                        at: Instant::now(),
-                                        source: "powrprof PERFEPP1",
-                                    };
-                                });
-                                Verification::Verified
-                            } else {
-                                Verification::Failed {
-                                    expected: format!("ac={:?} dc={:?}", p.epp1_ac, p.epp1_dc),
-                                    actual: format!("ac={ac} dc={dc}"),
-                                }
-                            }
-                        }
-                        Err(e) => Verification::Failed {
-                            expected: format!("ac={:?} dc={:?}", p.epp1_ac, p.epp1_dc),
-                            actual: format!("readback error: {e}"),
-                        },
+            let (a, f) = self.exec_ppm_knob(
+                "write EPP1 (class-1)",
+                "powrprof PERFEPP1",
+                "epp1",
+                "",
+                p.epp1_ac,
+                p.epp1_dc,
+                P::read_epp1,
+                P::write_epp1,
+                |o, ac, dc| {
+                    o.epp1_ac = ObservedValue::Verified {
+                        value: ac,
+                        at: Instant::now(),
+                        source: "powrprof PERFEPP1",
                     };
-                    if !matches!(verification, Verification::Verified) {
-                        failed = true;
-                    }
-                    steps.push(StepOutcome {
-                        step: "write EPP1 (class-1)".into(),
-                        backend: "powrprof PERFEPP1".into(),
-                        firmware_return: Some("ok".into()),
-                        before: Some(before),
-                        after: Some(format!("{verification:?}")),
-                        verification,
-                    });
-                    applied = true;
-                }
-                Err(e) => {
-                    failed = true;
-                    steps.push(platform_failed_step(
-                        "write EPP1 (class-1)",
-                        "powrprof PERFEPP1",
-                        &e,
-                        before,
-                    ));
-                }
-            }
+                    o.epp1_dc = ObservedValue::Verified {
+                        value: dc,
+                        at: Instant::now(),
+                        source: "powrprof PERFEPP1",
+                    };
+                },
+                steps,
+            );
+            applied |= a;
+            failed |= f;
         }
 
         if p.max_freq_mhz_ac.is_some() || p.max_freq_mhz_dc.is_some() {
-            let before = self
-                .ppm
-                .read_max_freq_mhz()
-                .map(|(ac, dc)| format!("maxfreq ac={ac} dc={dc}"))
-                .unwrap_or_else(|e| format!("maxfreq unreadable: {e}"));
-            match self
-                .ppm
-                .write_max_freq_mhz(p.max_freq_mhz_ac, p.max_freq_mhz_dc)
-            {
-                Ok(()) => {
-                    let verification = match self.ppm.read_max_freq_mhz() {
-                        Ok((ac, dc)) => {
-                            let ac_ok = p.max_freq_mhz_ac.is_none_or(|v| v == ac);
-                            let dc_ok = p.max_freq_mhz_dc.is_none_or(|v| v == dc);
-                            if ac_ok && dc_ok {
-                                self.set_observed(|o| {
-                                    o.max_freq_ac = ObservedValue::Verified {
-                                        value: ac,
-                                        at: Instant::now(),
-                                        source: "powrprof PROCFREQMAX",
-                                    };
-                                    o.max_freq_dc = ObservedValue::Verified {
-                                        value: dc,
-                                        at: Instant::now(),
-                                        source: "powrprof PROCFREQMAX",
-                                    };
-                                });
-                                Verification::Verified
-                            } else {
-                                Verification::Failed {
-                                    expected: format!(
-                                        "ac={:?} dc={:?}",
-                                        p.max_freq_mhz_ac, p.max_freq_mhz_dc
-                                    ),
-                                    actual: format!("ac={ac} dc={dc}"),
-                                }
-                            }
-                        }
-                        Err(e) => Verification::Failed {
-                            expected: format!(
-                                "ac={:?} dc={:?}",
-                                p.max_freq_mhz_ac, p.max_freq_mhz_dc
-                            ),
-                            actual: format!("readback error: {e}"),
-                        },
+            let (a, f) = self.exec_ppm_knob(
+                "write max frequency",
+                "powrprof PROCFREQMAX",
+                "maxfreq",
+                "",
+                p.max_freq_mhz_ac,
+                p.max_freq_mhz_dc,
+                P::read_max_freq_mhz,
+                P::write_max_freq_mhz,
+                |o, ac, dc| {
+                    o.max_freq_ac = ObservedValue::Verified {
+                        value: ac,
+                        at: Instant::now(),
+                        source: "powrprof PROCFREQMAX",
                     };
-                    if !matches!(verification, Verification::Verified) {
-                        failed = true;
-                    }
-                    steps.push(StepOutcome {
-                        step: "write max frequency".into(),
-                        backend: "powrprof PROCFREQMAX".into(),
-                        firmware_return: Some("ok".into()),
-                        before: Some(before),
-                        after: Some(format!("{verification:?}")),
-                        verification,
-                    });
-                    applied = true;
-                }
-                Err(e) => {
-                    failed = true;
-                    steps.push(platform_failed_step(
-                        "write max frequency",
-                        "powrprof PROCFREQMAX",
-                        &e,
-                        before,
-                    ));
-                }
-            }
+                    o.max_freq_dc = ObservedValue::Verified {
+                        value: dc,
+                        at: Instant::now(),
+                        source: "powrprof PROCFREQMAX",
+                    };
+                },
+                steps,
+            );
+            applied |= a;
+            failed |= f;
         }
 
         if p.min_performance_ac.is_some() || p.min_performance_dc.is_some() {
-            let before = self
-                .ppm
-                .read_min_performance()
-                .map(|(ac, dc)| format!("min-performance ac={ac}% dc={dc}%"))
-                .unwrap_or_else(|e| format!("min-performance unreadable: {e}"));
-            match self
-                .ppm
-                .write_min_performance(p.min_performance_ac, p.min_performance_dc)
-            {
-                Ok(()) => {
-                    let verification = match self.ppm.read_min_performance() {
-                        Ok((ac, dc)) => {
-                            let ac_ok = p.min_performance_ac.is_none_or(|v| v == ac);
-                            let dc_ok = p.min_performance_dc.is_none_or(|v| v == dc);
-                            if ac_ok && dc_ok {
-                                self.set_observed(|o| {
-                                    o.min_performance_ac = ObservedValue::Verified {
-                                        value: ac,
-                                        at: Instant::now(),
-                                        source: "powrprof PROCTHROTTLEMIN",
-                                    };
-                                    o.min_performance_dc = ObservedValue::Verified {
-                                        value: dc,
-                                        at: Instant::now(),
-                                        source: "powrprof PROCTHROTTLEMIN",
-                                    };
-                                });
-                                Verification::Verified
-                            } else {
-                                Verification::Failed {
-                                    expected: format!(
-                                        "ac={:?} dc={:?}",
-                                        p.min_performance_ac, p.min_performance_dc
-                                    ),
-                                    actual: format!("ac={ac} dc={dc}"),
-                                }
-                            }
-                        }
-                        Err(e) => Verification::Failed {
-                            expected: format!(
-                                "ac={:?} dc={:?}",
-                                p.min_performance_ac, p.min_performance_dc
-                            ),
-                            actual: format!("readback error: {e}"),
-                        },
+            let (a, f) = self.exec_ppm_knob(
+                "write minimum performance",
+                "powrprof PROCTHROTTLEMIN",
+                "min-performance",
+                "%",
+                p.min_performance_ac,
+                p.min_performance_dc,
+                P::read_min_performance,
+                P::write_min_performance,
+                |o, ac, dc| {
+                    o.min_performance_ac = ObservedValue::Verified {
+                        value: ac,
+                        at: Instant::now(),
+                        source: "powrprof PROCTHROTTLEMIN",
                     };
-                    if !matches!(verification, Verification::Verified) {
-                        failed = true;
-                    }
-                    steps.push(StepOutcome {
-                        step: "write minimum performance".into(),
-                        backend: "powrprof PROCTHROTTLEMIN".into(),
-                        firmware_return: Some("ok".into()),
-                        before: Some(before),
-                        after: Some(format!("{verification:?}")),
-                        verification,
-                    });
-                    applied = true;
-                }
-                Err(e) => {
-                    failed = true;
-                    steps.push(platform_failed_step(
-                        "write minimum performance",
-                        "powrprof PROCTHROTTLEMIN",
-                        &e,
-                        before,
-                    ));
-                }
-            }
+                    o.min_performance_dc = ObservedValue::Verified {
+                        value: dc,
+                        at: Instant::now(),
+                        source: "powrprof PROCTHROTTLEMIN",
+                    };
+                },
+                steps,
+            );
+            applied |= a;
+            failed |= f;
         }
 
         if p.max_performance_ac.is_some() || p.max_performance_dc.is_some() {
-            let before = self
-                .ppm
-                .read_max_performance()
-                .map(|(ac, dc)| format!("max-performance ac={ac}% dc={dc}%"))
-                .unwrap_or_else(|e| format!("max-performance unreadable: {e}"));
-            match self
-                .ppm
-                .write_max_performance(p.max_performance_ac, p.max_performance_dc)
-            {
-                Ok(()) => {
-                    let verification = match self.ppm.read_max_performance() {
-                        Ok((ac, dc)) => {
-                            let ac_ok = p.max_performance_ac.is_none_or(|v| v == ac);
-                            let dc_ok = p.max_performance_dc.is_none_or(|v| v == dc);
-                            if ac_ok && dc_ok {
-                                self.set_observed(|o| {
-                                    o.max_performance_ac = ObservedValue::Verified {
-                                        value: ac,
-                                        at: Instant::now(),
-                                        source: "powrprof PROCTHROTTLEMAX",
-                                    };
-                                    o.max_performance_dc = ObservedValue::Verified {
-                                        value: dc,
-                                        at: Instant::now(),
-                                        source: "powrprof PROCTHROTTLEMAX",
-                                    };
-                                });
-                                Verification::Verified
-                            } else {
-                                Verification::Failed {
-                                    expected: format!(
-                                        "ac={:?} dc={:?}",
-                                        p.max_performance_ac, p.max_performance_dc
-                                    ),
-                                    actual: format!("ac={ac} dc={dc}"),
-                                }
-                            }
-                        }
-                        Err(e) => Verification::Failed {
-                            expected: format!(
-                                "ac={:?} dc={:?}",
-                                p.max_performance_ac, p.max_performance_dc
-                            ),
-                            actual: format!("readback error: {e}"),
-                        },
+            let (a, f) = self.exec_ppm_knob(
+                "write maximum performance",
+                "powrprof PROCTHROTTLEMAX",
+                "max-performance",
+                "%",
+                p.max_performance_ac,
+                p.max_performance_dc,
+                P::read_max_performance,
+                P::write_max_performance,
+                |o, ac, dc| {
+                    o.max_performance_ac = ObservedValue::Verified {
+                        value: ac,
+                        at: Instant::now(),
+                        source: "powrprof PROCTHROTTLEMAX",
                     };
-                    if !matches!(verification, Verification::Verified) {
-                        failed = true;
-                    }
-                    steps.push(StepOutcome {
-                        step: "write maximum performance".into(),
-                        backend: "powrprof PROCTHROTTLEMAX".into(),
-                        firmware_return: Some("ok".into()),
-                        before: Some(before),
-                        after: Some(format!("{verification:?}")),
-                        verification,
-                    });
-                    applied = true;
-                }
-                Err(e) => {
-                    failed = true;
-                    steps.push(platform_failed_step(
-                        "write maximum performance",
-                        "powrprof PROCTHROTTLEMAX",
-                        &e,
-                        before,
-                    ));
-                }
-            }
+                    o.max_performance_dc = ObservedValue::Verified {
+                        value: dc,
+                        at: Instant::now(),
+                        source: "powrprof PROCTHROTTLEMAX",
+                    };
+                },
+                steps,
+            );
+            applied |= a;
+            failed |= f;
         }
 
+        // Legacy single-rail boost knob still feeds both rails (§36).
         let boost_ac = p.boost_policy_ac.or(p.boost_policy);
         let boost_dc = p.boost_policy_dc.or(p.boost_policy);
         if boost_ac.is_some() || boost_dc.is_some() {
-            let before = self
-                .ppm
-                .read_boost_policy()
-                .map(|(ac, dc)| format!("boost ac={ac:?} dc={dc:?}"))
-                .unwrap_or_else(|e| format!("boost unreadable: {e}"));
-            match self.ppm.write_boost_policy(boost_ac, boost_dc) {
-                Ok(()) => {
-                    let verification = match self.ppm.read_boost_policy() {
-                        Ok((ac, dc))
-                            if boost_ac.is_none_or(|expected| expected == ac)
-                                && boost_dc.is_none_or(|expected| expected == dc) =>
-                        {
-                            self.set_observed(|o| {
-                                if let Some(value) = boost_ac {
-                                    o.boost_ac = ObservedValue::Verified {
-                                        value,
-                                        at: Instant::now(),
-                                        source: "powrprof PERFBOOSTMODE",
-                                    };
-                                }
-                                if let Some(value) = boost_dc {
-                                    o.boost_dc = ObservedValue::Verified {
-                                        value,
-                                        at: Instant::now(),
-                                        source: "powrprof PERFBOOSTMODE",
-                                    };
-                                }
-                            });
-                            Verification::Verified
-                        }
-                        Ok((ac, dc)) => Verification::Failed {
-                            expected: format!("ac={boost_ac:?} dc={boost_dc:?}"),
-                            actual: format!("ac={ac:?} dc={dc:?}"),
-                        },
-                        Err(e) => Verification::Failed {
-                            expected: format!("ac={boost_ac:?} dc={boost_dc:?}"),
-                            actual: format!("readback error: {e}"),
-                        },
-                    };
-                    if !matches!(verification, Verification::Verified) {
-                        failed = true;
+            let (a, f) = self.exec_ppm_knob(
+                "write boost policy",
+                "powrprof PERFBOOSTMODE",
+                "boost",
+                "",
+                boost_ac,
+                boost_dc,
+                P::read_boost_policy,
+                P::write_boost_policy,
+                move |o, _, _| {
+                    // Boost stamps the REQUESTED sides only (verified equal
+                    // to the readback at this point) — an untouched rail
+                    // keeps its previous observed stamp.
+                    if let Some(value) = boost_ac {
+                        o.boost_ac = ObservedValue::Verified {
+                            value,
+                            at: Instant::now(),
+                            source: "powrprof PERFBOOSTMODE",
+                        };
                     }
-                    steps.push(StepOutcome {
-                        step: "write boost policy".into(),
-                        backend: "powrprof PERFBOOSTMODE".into(),
-                        firmware_return: Some("ok".into()),
-                        before: Some(before),
-                        after: Some(format!("{verification:?}")),
-                        verification,
-                    });
-                    applied = true;
-                }
-                Err(e) => {
-                    failed = true;
-                    steps.push(platform_failed_step(
-                        "write boost policy",
-                        "powrprof PERFBOOSTMODE",
-                        &e,
-                        before,
-                    ));
-                }
-            }
+                    if let Some(value) = boost_dc {
+                        o.boost_dc = ObservedValue::Verified {
+                            value,
+                            at: Instant::now(),
+                            source: "powrprof PERFBOOSTMODE",
+                        };
+                    }
+                },
+                steps,
+            );
+            applied |= a;
+            failed |= f;
         }
 
         // Refresh the aggregate snapshot once after the batch. Besides
@@ -2043,6 +2294,10 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         let mut steps = Vec::new();
         match action {
             SafetyAction::ForceMaxFan => {
+                self.set_observed(|o| {
+                    o.active_profile = None;
+                    o.control_notice = Some("温度保护已接管风扇；当前配置发生临时覆盖。".into());
+                });
                 let status = match &self.hp {
                     Some(hp) => {
                         let ok = Self::fan_write(
@@ -2172,7 +2427,7 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
     /// plus coordinator-state items (power limits while dirty).
     fn tracked_set(&self) -> Vec<ReAssert> {
         let mut t = KeepAliveService::tracked(&self.observed());
-        if self.power_limits_dirty {
+        if self.power_limits_dirty && self.observed().power_limits.is_verified() {
             t.push(ReAssert::PowerLimits);
         }
         t
@@ -2265,15 +2520,29 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
     /// restored: they are
     /// Windows-native settings with no firmware-session semantics.
     fn restore_firmware_auto(&mut self, origin: JournalOrigin) {
+        self.control_epoch = self.control_epoch.wrapping_add(1);
+        self.set_observed(|o| {
+            o.active_profile = None;
+            o.control_notice = Some("控制已交还固件；原配置档需要重新应用。".into());
+        });
         let restore_fan = self.fan_control_dirty;
         let restore_thermal = self.thermal_mode_dirty;
         let restore_gpu = self.gpu_policy_dirty;
         let restore_power = self.power_limits_dirty;
         if !restore_fan && !restore_thermal && !restore_gpu && !restore_power {
+            self.restore_scoped_cpu(origin);
+            if let Err(e) = self.persist_recovery() {
+                self.set_observed(|o| o.control_notice = Some(e.to_string()));
+            }
             return;
         }
 
         let started = Instant::now();
+        // One shared verification budget for the whole restore sequence (see
+        // verify_restoration's doc): GPU and Power verification race against
+        // the same wall-clock cap.
+        let verify_deadline =
+            started + self.verify_poll_interval * self.verify_polls.max(1) + Duration::from_secs(5);
         let mut steps = Vec::new();
         let mut fan_auto_ok = !restore_fan;
         let mut max_fan_off_ok =
@@ -2339,14 +2608,18 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             if restore_gpu && let Some(startup) = self.gpu_policy_startup {
                 match hp.set_gpu_platform_policy(startup) {
                     Ok(()) => {
-                        gpu_ok = true;
+                        let verification = self.verify_restoration(
+                            VerificationTarget::Gpu(startup, false),
+                            verify_deadline,
+                        );
+                        gpu_ok = verification == Verification::Verified;
                         steps.push(StepOutcome {
                             step: "restore gpu policy (startup value)".into(),
                             backend: "hp-wmi 0x22".into(),
                             firmware_return: Some("rc=0".into()),
                             before: Some("restore".into()),
                             after: None,
-                            verification: Verification::TrustedNoReadback,
+                            verification,
                         });
                     }
                     Err(e) => {
@@ -2369,7 +2642,11 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 };
                 match hp.set_power_limits(baseline) {
                     Ok(()) => {
-                        power_ok = true;
+                        let verification = self.verify_restoration(
+                            VerificationTarget::Power(baseline),
+                            verify_deadline,
+                        );
+                        power_ok = verification == Verification::Verified;
                         steps.push(StepOutcome {
                             step: "restore power limits (captured baseline)".into(),
                             backend: "hp-wmi 0x29".into(),
@@ -2380,7 +2657,7 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                             } else {
                                 format!("pl1={b1}W pl2={b2}W (pl4 untouched)")
                             }),
-                            verification: Verification::TrustedNoReadback,
+                            verification,
                         });
                     }
                     Err(e) => {
@@ -2420,6 +2697,9 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             }
         }
 
+        // Firmware fan control is released before any potentially lengthy
+        // Windows-plan recovery. A failed scope restore retains its ledger.
+        let scope_ok = self.restore_scoped_cpu(origin);
         let fan_restored = !restore_fan || (fan_auto_ok && max_fan_off_ok);
         self.set_observed(|o| {
             if restore_fan && fan_auto_ok {
@@ -2444,16 +2724,17 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 && gpu_ok
                 && let Some(startup) = self.gpu_policy_startup
             {
-                o.gpu_platform_policy = ObservedValue::TrustedWrite {
-                    value: startup,
+                o.gpu_platform_policy = ObservedValue::Verified {
+                    value: o.gpu_platform_policy.value().copied().unwrap_or(startup),
                     at: Instant::now(),
+                    source: "hp-wmi 0x21 restoration",
                 };
             }
             if restore_power
                 && power_ok
                 && let Some((b1, b2, b4)) = self.power_limits_baseline
             {
-                o.power_limits = ObservedValue::TrustedWrite {
+                o.power_limits = ObservedValue::Verified {
                     value: CpuPowerLimits {
                         pl1_w: b1,
                         pl2_w: b2,
@@ -2461,6 +2742,7 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                         cpu_gpu_concurrent_w: 0,
                     },
                     at: Instant::now(),
+                    source: "MSR 0x610 / MCHBAR 0x59B0 restoration",
                 };
             }
         });
@@ -2483,7 +2765,15 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
         }
         self.keepalive
             .reschedule_tracked(&self.tracked_set(), Instant::now());
-        let restored = fan_restored && thermal_ok && gpu_ok && power_ok;
+        let restored = fan_restored && thermal_ok && gpu_ok && power_ok && scope_ok;
+        if let Err(error) = self.persist_recovery() {
+            self.set_observed(|o| o.control_notice = Some(error.to_string()));
+        }
+        if !restored {
+            self.set_observed(|o| {
+                o.control_notice = Some("恢复尚未完成，记录已保留；请检查设备后重试。".into())
+            });
+        }
         self.journal(
             origin,
             &ControlOutcome {
@@ -2500,6 +2790,221 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 duration: started.elapsed(),
             },
         );
+    }
+
+    fn restore_scoped_cpu(&mut self, origin: JournalOrigin) -> bool {
+        let Some(scope) = self.scoped_session.clone() else {
+            return true;
+        };
+        let started = Instant::now();
+        let mut steps = Vec::new();
+        let status = match self.validate_scope_scheme() {
+            Ok(()) => self.exec_cpu_policy(&scope.baseline.cpu, &mut steps),
+            Err(error) => ControlStatus::Rejected { error },
+        };
+        let ok = Self::control_status_succeeded(&status);
+        if ok {
+            self.scoped_session = None;
+        } else {
+            self.set_observed(|o| {
+                o.control_notice = Some(format!("自动会话恢复未完成：{status:?}"))
+            });
+        }
+        self.journal(
+            origin,
+            &ControlOutcome {
+                receipt: ControlReceipt(0),
+                command: ControlCommand::RestoreSession,
+                status,
+                steps,
+                duration: started.elapsed(),
+            },
+        );
+        ok
+    }
+
+    fn validate_scope_scheme(&self) -> Result<(), ControlError> {
+        if let Some(expected) = self.scoped_session.as_ref().and_then(|s| s.scheme.as_ref()) {
+            let actual = self
+                .ppm
+                .read_windows_ppm_state()
+                .ok()
+                .flatten()
+                .map(|p| p.active_scheme_guid);
+            if actual.as_ref() != Some(expected) {
+                return Err(ControlError::UnsafeRequest {
+                    reason: "Windows 电源计划已改变；请切回接管时的计划后恢复".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn capture_scope_baseline(
+        &self,
+        target: &phelper_domain::profile::PerformanceProfile,
+    ) -> Result<phelper_domain::profile::PerformanceProfile, ControlError> {
+        use phelper_domain::profile::PerformanceProfile;
+        let mut baseline = PerformanceProfile::default();
+        macro_rules! capture {
+            ($ac:ident, $dc:ident, $read:ident) => {
+                if target.cpu.$ac.is_some() || target.cpu.$dc.is_some() {
+                    let (ac, dc) =
+                        self.ppm
+                            .$read()
+                            .map_err(|e| ControlError::BackendUnavailable {
+                                what: e.to_string(),
+                            })?;
+                    baseline.cpu.$ac = target.cpu.$ac.map(|_| ac);
+                    baseline.cpu.$dc = target.cpu.$dc.map(|_| dc);
+                }
+            };
+        }
+        capture!(epp_ac, epp_dc, read_epp);
+        capture!(epp1_ac, epp1_dc, read_epp1);
+        capture!(max_freq_mhz_ac, max_freq_mhz_dc, read_max_freq_mhz);
+        capture!(min_performance_ac, min_performance_dc, read_min_performance);
+        capture!(max_performance_ac, max_performance_dc, read_max_performance);
+        if target.cpu.boost_policy.is_some()
+            || target.cpu.boost_policy_ac.is_some()
+            || target.cpu.boost_policy_dc.is_some()
+        {
+            let (ac, dc) =
+                self.ppm
+                    .read_boost_policy()
+                    .map_err(|e| ControlError::BackendUnavailable {
+                        what: e.to_string(),
+                    })?;
+            baseline.cpu.boost_policy_ac = target
+                .cpu
+                .boost_policy_ac
+                .or(target.cpu.boost_policy)
+                .map(|_| ac);
+            baseline.cpu.boost_policy_dc = target
+                .cpu
+                .boost_policy_dc
+                .or(target.cpu.boost_policy)
+                .map(|_| dc);
+        }
+        let observed = self.observed();
+        baseline.fan = target.fan.map(|_| {
+            observed
+                .fan_mode
+                .value()
+                .copied()
+                .unwrap_or(FanMode::FirmwareAuto)
+        });
+        // Thermal mode has no reliable query. With no previous owned mode,
+        // returning to firmware-balanced is the documented safe fallback.
+        baseline.thermal_mode = target.thermal_mode.map(|_| {
+            observed
+                .thermal_mode
+                .value()
+                .copied()
+                .unwrap_or(ThermalMode::Balanced)
+        });
+        if let Some(patch) = target.gpu_policy {
+            let actual = self
+                .hp
+                .as_ref()
+                .ok_or(ControlError::Unsupported)?
+                .gpu_platform_policy()
+                .map_err(map_hp_error)?;
+            baseline.gpu_policy = Some(GpuPolicyPatch {
+                ctgp: patch.ctgp.map(|_| actual.ctgp),
+                ppab: patch.ppab.map(|_| actual.ppab),
+                dstate: patch.dstate.map(|_| actual.dstate),
+                slowdown_temp_c: patch.slowdown_temp_c.map(|_| actual.slowdown_temp_c),
+            });
+        }
+        if let Some(target) = target.power_limits {
+            let (pl1, pl2, at) = self
+                .feed
+                .power_limits_w()
+                .ok_or(ControlError::Unsupported)?;
+            if at.elapsed() > Duration::from_secs(5) {
+                return Err(ControlError::UnsafeRequest {
+                    reason: "功率基线已过期".into(),
+                });
+            }
+            let pl4 = if target.pl4_w == 0 {
+                0
+            } else {
+                let (value, at) = self.feed.pl4_w().ok_or(ControlError::Unsupported)?;
+                if at.elapsed() > Duration::from_secs(5) {
+                    return Err(ControlError::UnsafeRequest {
+                        reason: "PL4 基线已过期".into(),
+                    });
+                }
+                value.round() as u8
+            };
+            baseline.power_limits = Some(CpuPowerLimits {
+                pl1_w: pl1.round() as u8,
+                pl2_w: pl2.round() as u8,
+                pl4_w: pl4,
+                cpu_gpu_concurrent_w: 0,
+            });
+        }
+        Ok(baseline)
+    }
+
+    fn recovery_record(&self) -> RecoveryRecord {
+        RecoveryRecord {
+            board: self.recovery.board.clone(),
+            bios: self.recovery.bios.clone(),
+            scoped: self.scoped_session.clone(),
+            fan: self.fan_control_dirty,
+            thermal: self.thermal_mode_dirty,
+            gpu: self.gpu_policy_startup.filter(|_| self.gpu_policy_dirty),
+            power: self
+                .power_limits_baseline
+                .filter(|_| self.power_limits_dirty)
+                .map(|(pl1_w, pl2_w, pl4_w)| CpuPowerLimits {
+                    pl1_w,
+                    pl2_w,
+                    pl4_w,
+                    cpu_gpu_concurrent_w: 0,
+                }),
+        }
+    }
+
+    fn persist_recovery(&self) -> Result<(), ControlError> {
+        // A rejected new request must never overwrite a previous session's ledger.
+        self.recovery.save(
+            self.previous_recovery
+                .as_ref()
+                .unwrap_or(&self.recovery_record()),
+        )
+    }
+
+    /// Synchronous restore verification on the control thread. `deadline`
+    /// is SHARED by every restoration in one `restore_firmware_auto` call:
+    /// the total shutdown-path block is bounded by one verification budget
+    /// (polls × interval + slack), not one budget PER verified domain —
+    /// the engine's 40 s shutdown timeout must never be spent here twice.
+    fn verify_restoration(&self, target: VerificationTarget, deadline: Instant) -> Verification {
+        let started = Instant::now();
+        let mut check = PendingVerification::new(
+            target,
+            started,
+            self.verify_polls,
+            self.verify_poll_interval,
+        );
+        loop {
+            std::thread::sleep(check.next_due.saturating_duration_since(Instant::now()));
+            if let Some(result) = check.poll(self.hp.as_ref(), &self.feed) {
+                if result == Verification::Verified {
+                    self.stamp_verified(check.actual_target.unwrap_or(check.target));
+                }
+                return result;
+            }
+            if Instant::now() >= deadline {
+                return Verification::Failed {
+                    expected: format!("{target:?}"),
+                    actual: "restore deadline exceeded".into(),
+                };
+            }
+        }
     }
 
     // ------------------------------------------------------------ helpers
@@ -2566,6 +3071,15 @@ fn weakest_verification(a: &Verification, b: &Verification) -> Verification {
     }
 }
 
+fn definite_hp_rejection(error: &HpWmiError) -> bool {
+    matches!(
+        error,
+        HpWmiError::FirmwareReturnCode { .. }
+            | HpWmiError::InvalidInput(_)
+            | HpWmiError::NotAvailable(_)
+    )
+}
+
 fn map_hp_error(e: HpWmiError) -> ControlError {
     match e {
         HpWmiError::FirmwareReturnCode { code } => ControlError::FirmwareRejected {
@@ -2602,7 +3116,11 @@ fn failed_step(step: &str, backend: &str, e: &HpWmiError, before: String) -> Ste
         backend: backend.into(),
         firmware_return: Some(e.to_string()),
         before: Some(before),
-        after: None,
+        after: Some(if definite_hp_rejection(e) {
+            "接口明确拒绝了该请求".into()
+        } else {
+            "结果未知：调用失败不代表硬件未写入；恢复记录保留，需读回或恢复确认。".into()
+        }),
         verification: Verification::Failed {
             expected: "firmware accept".into(),
             actual: e.to_string(),
@@ -3029,6 +3547,7 @@ mod tests {
     struct TestRig {
         handle: ControlHandle,
         hp: MockHp,
+        ppm: MockPpm,
         journal_path: std::path::PathBuf,
     }
 
@@ -3051,7 +3570,7 @@ mod tests {
                 caps_full(),
                 test_identity(tag),
                 Some(hp.clone()),
-                ppm,
+                ppm.clone(),
                 FreshFeed,
                 journal_path.clone(),
             );
@@ -3064,6 +3583,7 @@ mod tests {
             Self {
                 handle,
                 hp,
+                ppm,
                 journal_path,
             }
         }
@@ -3782,24 +4302,76 @@ mod tests {
 
     #[cfg(feature = "experimental-hp-power-limits")]
     #[test]
-    fn power_limits_pl4_without_mchbar_feed_is_honest_failure() {
-        // The write requests pl4 but the PL4 readback channel is absent:
-        // byte2 can never be verified → honest Failed, never Verified.
+    fn power_limits_pl4_without_mchbar_feed_rejected_pre_write() {
+        // 2026-09 audit: byte2 is judged only via the MCHBAR 0x59B0
+        // channel; without it a pl4 write is unverifiable by construction,
+        // so the safety gate now rejects it BEFORE any hardware write
+        // (previously this landed a guaranteed-Failed write and relied on
+        // the honest verdict — an unverifiable write should never reach
+        // the machine at all).
         let link = std::sync::Arc::new(Mutex::new((55.0_f64, 130.0_f64, 200.0_f64)));
         let (handle, hp) = start_pl_rig("pl4-nofeed", std::sync::Arc::clone(&link), true, false);
         let o = block(&handle, ControlCommand::SetPowerLimits(pl4(45, 90, 150)));
         assert!(matches!(
             o.status,
-            ControlStatus::Applied {
-                verification: Verification::Failed { .. }
+            ControlStatus::Rejected {
+                error: ControlError::UnsafeRequest { .. }
             }
         ));
-        assert!(!handle.observed().power_limits.is_verified());
         handle.shutdown();
-        // The PL4 readback is unavailable, but the write still happened and
-        // PL1/PL2 have a captured baseline. Restore all known fields.
-        assert_eq!(hp.state().power_limits_writes.len(), 2);
-        assert_eq!(hp.state().power_limits_writes[1], pl(55, 130));
+        // Nothing was ever written, so there is also nothing to restore.
+        assert!(hp.state().power_limits_writes.is_empty());
+    }
+
+    #[cfg(feature = "experimental-hp-power-limits")]
+    struct BlindPowerFeed;
+    #[cfg(feature = "experimental-hp-power-limits")]
+    impl ThermalFeed for BlindPowerFeed {
+        fn pkg_temp_c(&self) -> Option<(f64, Instant)> {
+            Some((70.0, Instant::now()))
+        }
+        fn fan_levels(&self) -> Option<(FanLevels, Instant)> {
+            Some((FanLevels::new(30, 30), Instant::now()))
+        }
+        fn power_limits_w(&self) -> Option<(f64, f64, Instant)> {
+            None
+        }
+    }
+
+    #[cfg(feature = "experimental-hp-power-limits")]
+    #[test]
+    fn power_limits_rejected_when_readback_feed_absent() {
+        // 2026-09 audit: the 0x610 telemetry feed is the restore-BASELINE
+        // source and 8BAB has no 0x29 clawback (M3) — a blind write would
+        // be unrestorable. The safety gate rejects pre-write and no
+        // hardware trace is left (AR-11/AR-12).
+        let dir = std::env::temp_dir().join(format!(
+            "phelper-coord-test-pl-blind-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hp = MockHp::default();
+        let mut cfg = ControlConfig::new(
+            caps_full(),
+            test_identity("pl-blind"),
+            Some(hp.clone()),
+            MockPpm::default(),
+            BlindPowerFeed,
+            dir.join("journal.jsonl"),
+        );
+        cfg.verify_poll_interval = Duration::from_millis(5);
+        cfg.keepalive_period = Duration::from_millis(120);
+        cfg.safety_tick = Duration::from_millis(20);
+        let handle = ControlCoordinator::start(cfg).unwrap();
+        let o = block(&handle, ControlCommand::SetPowerLimits(pl(45, 90)));
+        assert!(matches!(
+            o.status,
+            ControlStatus::Rejected {
+                error: ControlError::UnsafeRequest { .. }
+            }
+        ));
+        handle.shutdown();
+        assert!(hp.state().power_limits_writes.is_empty());
     }
 
     #[cfg(feature = "experimental-hp-power-limits")]
@@ -4162,6 +4734,138 @@ mod tests {
         rig.handle.shutdown();
     }
 
+    #[test]
+    fn single_step_profile_failed_verification_not_stamped() {
+        // 2026-09 audit: a one-field profile whose only step fails readback
+        // verification keeps the honest Applied+Failed verdict (it is NOT
+        // rewritten to Partial) — and must NOT wear the profile's name.
+        let hp = MockHp::default();
+        let startup = hp.state().gpu_policy.expect("mock startup policy");
+        hp.state().gpu_policy_pin = Some(startup);
+        let p = PerformanceProfile {
+            gpu_policy: Some(GpuPolicyPatch {
+                ctgp: Some(!startup.ctgp),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let rig = TestRig::start_with("prof-single-fail", hp, registry_with("solo", p));
+        let o = block(
+            &rig.handle,
+            ControlCommand::ApplyProfile {
+                profile: "solo".into(),
+            },
+        );
+        assert!(matches!(
+            o.status,
+            ControlStatus::Applied {
+                verification: Verification::Failed { .. }
+            }
+        ));
+        assert_eq!(rig.handle.desired().profile, None);
+        rig.handle.shutdown();
+    }
+
+    #[test]
+    fn direct_command_failed_verification_clears_stamp_and_records_intent() {
+        // 2026-09 audit: a direct knob change whose write REACHED hardware
+        // (firmware accepted, readback disagreed) must clear the active
+        // profile stamp and record the intent — otherwise DesiredState
+        // claims a state the hardware provably does not have.
+        let hp = MockHp::default();
+        let p = PerformanceProfile {
+            thermal_mode: Some(ThermalMode::Performance),
+            ..Default::default()
+        };
+        let rig = TestRig::start_with("prof-clear-fail", hp, registry_with("t", p));
+        block(
+            &rig.handle,
+            ControlCommand::ApplyProfile {
+                profile: "t".into(),
+            },
+        );
+        assert_eq!(rig.handle.desired().profile.as_deref(), Some("t"));
+        let startup = rig.hp.state().gpu_policy.expect("mock startup policy");
+        rig.hp.state().gpu_policy_pin = Some(startup);
+        let target = GpuPlatformPolicy {
+            ctgp: !startup.ctgp,
+            ..startup
+        };
+        let o = block(&rig.handle, ControlCommand::SetGpuPlatformPolicy(target));
+        assert!(matches!(
+            o.status,
+            ControlStatus::Applied {
+                verification: Verification::Failed { .. }
+            }
+        ));
+        assert_eq!(rig.handle.desired().profile, None);
+        assert_eq!(rig.handle.desired().gpu_platform_policy, Some(target));
+        rig.handle.shutdown();
+    }
+
+    #[test]
+    fn gpu_policy_patch_tolerates_dstate_drift_when_not_requested() {
+        // 2026-09 audit + M5 on-device fact: the 0x21 dstate readback
+        // drifts on its own. A patch that did NOT request dstate must
+        // verify on the remaining bytes instead of failing over firmware
+        // jitter (which used to turn profiles Partial spuriously).
+        let hp = MockHp::default();
+        let startup = hp.state().gpu_policy.expect("mock startup policy");
+        let rig = TestRig::start_with(
+            "gpu-patch-drift",
+            hp,
+            crate::profiles::ProfileRegistry::empty(),
+        );
+        // The requested ctgp change lands, but dstate "drifts" 1→3 on the
+        // readback (the pin bypasses the written state).
+        rig.hp.state().gpu_policy_pin = Some(GpuPlatformPolicy {
+            ctgp: !startup.ctgp,
+            dstate: 3,
+            ..startup
+        });
+        let o = block(
+            &rig.handle,
+            ControlCommand::SetGpuPlatformPolicyPatch(GpuPolicyPatch {
+                ctgp: Some(!startup.ctgp),
+                ..Default::default()
+            }),
+        );
+        assert!(matches!(
+            o.status,
+            ControlStatus::Applied {
+                verification: Verification::Verified
+            }
+        ));
+        rig.handle.shutdown();
+    }
+
+    #[test]
+    fn gpu_policy_full_struct_dstate_stays_strict() {
+        // The counterpart: when dstate WAS requested (full-struct write),
+        // a dstate mismatch is the honest "ineffective on 8BAB" signal
+        // and must keep failing verification. The pin matches the target
+        // on every byte EXCEPT dstate, isolating the strictness.
+        let hp = MockHp::default();
+        let startup = hp.state().gpu_policy.expect("mock startup policy");
+        let rig = TestRig::start_with(
+            "gpu-full-drift",
+            hp,
+            crate::profiles::ProfileRegistry::empty(),
+        );
+        rig.hp.state().gpu_policy_pin = Some(GpuPlatformPolicy {
+            dstate: 3,
+            ..startup
+        });
+        let o = block(&rig.handle, ControlCommand::SetGpuPlatformPolicy(startup));
+        assert!(matches!(
+            o.status,
+            ControlStatus::Applied {
+                verification: Verification::Failed { .. }
+            }
+        ));
+        rig.handle.shutdown();
+    }
+
     /// Stable build: a profile carrying power_limits must reject the WHOLE
     /// profile as Unsupported (the experimental feature is compiled out).
     #[cfg(not(feature = "experimental-hp-power-limits"))]
@@ -4264,5 +4968,219 @@ mod tests {
                 cpu_gpu_concurrent_w: 0,
             })
         );
+    }
+    #[test]
+    fn gpu_baseline_is_captured_when_startup_probe_recovers() {
+        let hp = MockHp::default();
+        hp.state().gpu_policy = None;
+        let rig = TestRig::start_with_hp("late-gpu-baseline", hp.clone());
+        let baseline = GpuPlatformPolicy {
+            ctgp: true,
+            ppab: true,
+            dstate: 3,
+            slowdown_temp_c: 0,
+        };
+        hp.state().gpu_policy = Some(baseline);
+        let outcome = block(
+            &rig.handle,
+            ControlCommand::SetGpuPlatformPolicyPatch(GpuPolicyPatch {
+                ctgp: Some(false),
+                ..Default::default()
+            }),
+        );
+        assert!(matches!(
+            outcome.status,
+            ControlStatus::Applied {
+                verification: Verification::Verified
+            }
+        ));
+        rig.handle.shutdown();
+        assert_eq!(hp.state().gpu_policy_writes.last(), Some(&baseline));
+    }
+
+    #[test]
+    fn failed_gpu_patch_records_intent_and_failed_restore_stays_pending() {
+        let rig = TestRig::start("gpu-patch-intent-recovery");
+        let baseline = rig.hp.state().gpu_policy.unwrap();
+        rig.hp.state().gpu_policy_pin = Some(baseline);
+        let _ = block(
+            &rig.handle,
+            ControlCommand::SetGpuPlatformPolicyPatch(GpuPolicyPatch {
+                ctgp: Some(false),
+                ..Default::default()
+            }),
+        );
+        assert!(!rig.handle.desired().gpu_platform_policy.unwrap().ctgp);
+        rig.hp.state().gpu_policy_pin = Some(GpuPlatformPolicy {
+            ctgp: false,
+            ..baseline
+        });
+        let outcome = block(&rig.handle, ControlCommand::RestoreSession);
+        assert!(matches!(outcome.status, ControlStatus::Partial));
+        let ledger: RecoveryRecord = serde_json::from_str(
+            &std::fs::read_to_string(rig.journal_path.with_extension("recovery.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            ledger.gpu.is_some(),
+            "rc=0 without matching readback cannot clear recovery"
+        );
+        rig.hp.state().gpu_policy_pin = None;
+        rig.handle.shutdown();
+    }
+
+    #[test]
+    fn heartbeat_runs_while_a_gpu_readback_is_waiting() {
+        let hp = MockHp::default();
+        let path = std::env::temp_dir()
+            .join(format!("phelper-async-check-{}", std::process::id()))
+            .join("journal.jsonl");
+        let mut cfg = ControlConfig::new(
+            caps_full(),
+            test_identity("async"),
+            Some(hp.clone()),
+            MockPpm::new(),
+            FreshFeed,
+            path,
+        );
+        cfg.verify_poll_interval = Duration::from_millis(40);
+        cfg.keepalive_period = Duration::from_millis(60);
+        cfg.safety_tick = Duration::from_millis(10);
+        let handle = ControlCoordinator::start(cfg).unwrap();
+        block(
+            &handle,
+            ControlCommand::SetThermalMode(ThermalMode::Performance),
+        );
+        let baseline = hp.state().gpu_policy.unwrap();
+        hp.state().gpu_policy_pin = Some(baseline);
+        let outcome = block(
+            &handle,
+            ControlCommand::SetGpuPlatformPolicyPatch(GpuPolicyPatch {
+                ctgp: Some(false),
+                ..Default::default()
+            }),
+        );
+        assert!(matches!(
+            outcome.status,
+            ControlStatus::Applied {
+                verification: Verification::Failed { .. }
+            }
+        ));
+        assert!(
+            hp.state().fan_count_calls >= 2,
+            "readback polling must not block heartbeats"
+        );
+        hp.state().gpu_policy_pin = None;
+        handle.shutdown();
+    }
+    #[test]
+    fn automatic_profile_restores_only_owned_ppm_fields() {
+        let mut registry = crate::profiles::ProfileRegistry::empty();
+        registry.insert(
+            "auto",
+            PerformanceProfile {
+                cpu: CpuPolicy {
+                    epp_ac: Some(85),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let rig = TestRig::start_with("scoped-ppm", MockHp::default(), registry);
+        let before = rig.handle.observed().epp_ac.value().copied();
+        let outcome = block(
+            &rig.handle,
+            ControlCommand::ApplyScopedProfile {
+                profile: "auto".into(),
+                session_id: 9,
+            },
+        );
+        assert!(matches!(outcome.status, ControlStatus::Applied { .. }));
+        assert_eq!(rig.handle.observed().epp_ac.value(), Some(&85));
+        let outcome = block(
+            &rig.handle,
+            ControlCommand::RestoreScopedProfile { session_id: 9 },
+        );
+        assert!(matches!(outcome.status, ControlStatus::Applied { .. }));
+        assert_eq!(rig.handle.observed().epp_ac.value().copied(), before);
+        rig.handle.shutdown();
+    }
+
+    #[test]
+    fn readback_drift_clears_active_profile_but_preserves_user_intent() {
+        let registry = registry_with(
+            "cpu-only",
+            PerformanceProfile {
+                cpu: CpuPolicy {
+                    epp_ac: Some(85),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let rig = TestRig::start_with("active-profile-drift", MockHp::default(), registry);
+        block(
+            &rig.handle,
+            ControlCommand::ApplyProfile {
+                profile: "cpu-only".into(),
+            },
+        );
+        assert_eq!(
+            rig.handle.observed().active_profile.as_deref(),
+            Some("cpu-only")
+        );
+        rig.ppm.0.lock().unwrap().epp_ac = 30;
+        rig.handle.refresh_observed();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while rig.handle.observed().active_profile.is_some() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(rig.handle.observed().active_profile.is_none());
+        assert_eq!(rig.handle.desired().profile.as_deref(), Some("cpu-only"));
+        rig.handle.shutdown();
+    }
+
+    #[test]
+    fn manual_override_restores_automatic_scope_before_applying() {
+        let mut registry = crate::profiles::ProfileRegistry::empty();
+        registry.insert(
+            "auto",
+            PerformanceProfile {
+                cpu: CpuPolicy {
+                    epp_ac: Some(85),
+                    epp_dc: Some(95),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let rig = TestRig::start_with("scoped-manual", MockHp::default(), registry);
+        let before_dc = rig.handle.observed().epp_dc.value().copied();
+        block(
+            &rig.handle,
+            ControlCommand::ApplyScopedProfile {
+                profile: "auto".into(),
+                session_id: 1,
+            },
+        );
+        block(
+            &rig.handle,
+            ControlCommand::SetCpuPolicy(CpuPolicy {
+                epp_ac: Some(30),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(rig.handle.observed().epp_ac.value(), Some(&30));
+        assert_eq!(rig.handle.observed().epp_dc.value().copied(), before_dc);
+        block(
+            &rig.handle,
+            ControlCommand::RestoreScopedProfile { session_id: 1 },
+        );
+        assert_eq!(
+            rig.handle.observed().epp_ac.value(),
+            Some(&30),
+            "late automatic cleanup must not overwrite manual intent"
+        );
+        rig.handle.shutdown();
     }
 }

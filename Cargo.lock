@@ -5146,7 +5146,7 @@ dependencies = [
 
 [[package]]
 name = "phelper-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -5162,7 +5162,7 @@ dependencies = [
 
 [[package]]
 name = "phelper-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "phelper-domain",
  "serde",
@@ -5176,7 +5176,7 @@ dependencies = [
 
 [[package]]
 name = "phelper-desktop"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "embed-resource",
  "futures",
@@ -5195,7 +5195,7 @@ dependencies = [
 
 [[package]]
 name = "phelper-domain"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "thiserror 2.0.20",

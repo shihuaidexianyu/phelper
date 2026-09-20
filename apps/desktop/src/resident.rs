@@ -23,8 +23,16 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::PCWSTR;
 
-const MUTEX_NAME: &str = "Local\\phelper-desktop-8bab-single-instance";
-const SHOW_EVENT_NAME: &str = "Local\\phelper-desktop-8bab-show-window";
+// Machine-wide (Global\) names, not session-local: two phelper instances
+// mean two ControlCoordinators keepalive-fighting the same fans, and a
+// second SESSION (fast user switch / RDP) is exactly how that happens
+// (2026-09 audit). The app runs elevated, and an elevated token holds
+// SeCreateGlobalPrivilege, so Global\ creation cannot spuriously fail in
+// the supported flow; if it ever does, acquire() errors out fail-closed.
+// A worst-case Global\ side effect — user B's instance exits because user
+// A holds the mutex — is precisely the intended one-writer semantics.
+const MUTEX_NAME: &str = "Global\\phelper-desktop-8bab-single-instance";
+const SHOW_EVENT_NAME: &str = "Global\\phelper-desktop-8bab-show-window";
 const AUTOSTART_TASK_NAME: &str = "phelper-user-logon";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,8 +65,16 @@ fn wide(value: &str) -> Vec<u16> {
 /// Wake an already-running elevated instance before this process asks for
 /// elevation. This keeps clicking the shortcut while phelper is in the tray
 /// from producing a redundant UAC prompt.
+fn instance_name(base: &str) -> String {
+    if std::env::args().any(|arg| arg == "--read-only") {
+        format!("{base}-read-only")
+    } else {
+        base.to_string()
+    }
+}
+
 pub fn signal_existing_instance() -> bool {
-    let name = wide(SHOW_EVENT_NAME);
+    let name = wide(&instance_name(SHOW_EVENT_NAME));
     let Ok(event) =
         (unsafe { OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR::from_raw(name.as_ptr())) })
     else {
@@ -76,7 +92,7 @@ pub struct InstanceGuard {
 
 impl InstanceGuard {
     pub fn acquire() -> Result<Option<Self>, String> {
-        let mutex_name = wide(MUTEX_NAME);
+        let mutex_name = wide(&instance_name(MUTEX_NAME));
         let mutex = unsafe {
             CreateMutexW(None, false, PCWSTR::from_raw(mutex_name.as_ptr()))
                 .map_err(|error| format!("无法创建单实例互斥量：{error}"))?
@@ -87,7 +103,7 @@ impl InstanceGuard {
             return Ok(None);
         }
 
-        let event_name = wide(SHOW_EVENT_NAME);
+        let event_name = wide(&instance_name(SHOW_EVENT_NAME));
         let show_event = match unsafe {
             CreateEventW(None, false, false, PCWSTR::from_raw(event_name.as_ptr()))
         } {

@@ -134,55 +134,61 @@ impl OsSchedulingPolicy {
             && self.gpu_preference.is_none()
     }
 
-    /// Pure validation shared by CLI, UI and the Windows adapter.
+    /// Pure validation shared by CLI, UI and the Windows adapter. Messages
+    /// are English: the domain layer must not pin the user's language —
+    /// zh-CN presentation belongs to the UI boundary (app::fmt).
     pub fn validate_for(&self, target: &OsPolicyTarget) -> Result<(), String> {
         if self.is_empty() {
-            return Err("至少指定一个 OS 调度参数".into());
+            return Err("specify at least one OS scheduling knob".into());
         }
         if let Some(CpuPlacement::Custom(ids)) = &self.cpu_placement {
             if ids.is_empty() {
-                return Err("自定义 CPU Set 不能为空".into());
+                return Err("custom CPU Set list must not be empty".into());
             }
             if ids.len() > 256 {
-                return Err("自定义 CPU Set 最多 256 个 ID".into());
+                return Err("custom CPU Set list may hold at most 256 ids".into());
             }
             let mut sorted = ids.clone();
             sorted.sort_unstable();
             sorted.dedup();
             if sorted.len() != ids.len() {
-                return Err("自定义 CPU Set 不能包含重复 ID".into());
+                return Err("custom CPU Set list must not contain duplicates".into());
             }
         }
         if let Some(affinity) = self.affinity
             && affinity.mask == 0
         {
-            return Err("Affinity mask 不能为 0".into());
+            return Err("affinity mask must not be zero".into());
         }
         if matches!(self.cpu_placement, Some(CpuPlacement::Custom(_))) && self.affinity.is_some() {
-            return Err("自定义 CPU Sets 与 Affinity 不能同时指定".into());
+            return Err("custom CPU Sets and affinity are mutually exclusive".into());
         }
         match target {
             OsPolicyTarget::Process { pid } => {
                 if *pid == 0 {
-                    return Err("进程 PID 不能为 0".into());
+                    return Err("process PID must not be zero".into());
                 }
                 if self.thread_priority.is_some() || self.ideal_processor.is_some() {
-                    return Err("线程优先级和理想处理器只能用于线程目标".into());
+                    return Err(
+                        "thread priority and ideal processor only apply to thread targets".into(),
+                    );
                 }
             }
             OsPolicyTarget::Thread { tid } => {
                 if *tid == 0 {
-                    return Err("线程 TID 不能为 0".into());
+                    return Err("thread TID must not be zero".into());
                 }
                 if self.process_priority.is_some() || self.gpu_preference.is_some() {
-                    return Err("进程优先级和 GPU 首选项只能用于进程目标".into());
+                    return Err(
+                        "process priority and GPU preference only apply to process targets".into(),
+                    );
                 }
             }
         }
         if let Some(cpu) = self.ideal_processor
             && cpu.number >= 64
         {
-            return Err("理想处理器编号必须小于 64".into());
+            return Err("ideal processor number must be below 64".into());
         }
         Ok(())
     }

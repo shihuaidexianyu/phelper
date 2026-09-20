@@ -29,6 +29,27 @@ use phelper_core::app::state::AppState;
 use shell::ShellView;
 use state_store::GpuiStatePublisher;
 
+/// Compile-time embedded assets for GPUI's image cache. The exe icon, tray
+/// icon, and the custom title bar all share the one `assets/phelper.ico`;
+/// the title bar renders it through this source (the .rc file and the tray
+/// have their own embedding paths and do not consult GPUI's AssetSource).
+struct EmbeddedAssets;
+
+impl AssetSource for EmbeddedAssets {
+    fn load(&self, path: &str) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        match path {
+            "assets/phelper.ico" => Ok(Some(std::borrow::Cow::Borrowed(
+                &include_bytes!("../assets/phelper.ico")[..],
+            ))),
+            _ => Ok(None),
+        }
+    }
+
+    fn list(&self, _path: &str) -> Result<Vec<SharedString>> {
+        Ok(vec![])
+    }
+}
+
 fn native_hwnd(window: &Window) -> Option<HWND> {
     let handle = HasWindowHandle::window_handle(window).ok()?.as_raw();
     let RawWindowHandle::Win32(handle) = handle else {
@@ -59,7 +80,12 @@ fn set_window_visible(window: &Window, visible: bool) {
 fn init_logging() -> tracing_appender::non_blocking::WorkerGuard {
     let dir = phelper_core::persistence::data_dir().join("logs");
     let _ = std::fs::create_dir_all(&dir);
-    let file = tracing_appender::rolling::never(dir, "phelper-desktop.log");
+    let name = if std::env::args().any(|arg| arg == "--read-only") {
+        "phelper-desktop-read-only.log"
+    } else {
+        "phelper-desktop.log"
+    };
+    let file = tracing_appender::rolling::never(dir, name);
     let (writer, guard) = tracing_appender::non_blocking(file);
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -140,11 +166,12 @@ fn update_resident_autostart_state(
 }
 
 fn main() {
+    let read_only = std::env::args().any(|arg| arg == "--read-only");
     let launch_mode = resident::LaunchMode::current();
     if resident::signal_existing_instance() {
         return;
     }
-    if !ensure_elevated() {
+    if !read_only && !ensure_elevated() {
         return;
     }
     let _single_instance = match resident::InstanceGuard::acquire() {
@@ -164,53 +191,58 @@ fn main() {
         _single_instance.spawn_show_listener(show_signal_tx, Arc::clone(&shutting_down));
     let shutting_after_run = Arc::clone(&shutting_down);
 
-    gpui_platform::application().run(move |cx| {
-        gpui_component::init(cx);
-        theme::apply(cx);
+    gpui_platform::application()
+        .with_assets(EmbeddedAssets)
+        .run(move |cx| {
+            gpui_component::init(cx);
+            theme::apply(cx);
 
-        let app_state_entity: Entity<AppState> = cx.new(|_| AppState::default());
-        let (publisher, mut wake_rx) = GpuiStatePublisher::new();
+            let app_state_entity: Entity<AppState> = cx.new(|_| AppState::default());
+            let (publisher, mut wake_rx) = GpuiStatePublisher::new();
 
-        let publisher_for_bridge = Arc::clone(&publisher);
-        let entity_for_bridge = app_state_entity.clone();
-        cx.spawn(async move |async_app: &mut AsyncApp| {
-            use futures::StreamExt;
-            while wake_rx.next().await.is_some() {
-                let snapshot = publisher_for_bridge.snapshot();
-                async_app.update_entity(&entity_for_bridge, |state, cx| {
-                    *state = snapshot;
-                    cx.notify();
-                });
-                // The overview's fastest useful cadence is 250 ms. A short
-                // pause caps repaint churn while queued wakes still collapse
-                // onto the latest authoritative snapshot.
-                async_app
-                    .background_executor()
-                    .timer(Duration::from_millis(100))
-                    .await;
-            }
-        })
-        .detach();
+            let publisher_for_bridge = Arc::clone(&publisher);
+            let entity_for_bridge = app_state_entity.clone();
+            cx.spawn(async move |async_app: &mut AsyncApp| {
+                use futures::StreamExt;
+                while wake_rx.next().await.is_some() {
+                    let snapshot = publisher_for_bridge.snapshot();
+                    async_app.update_entity(&entity_for_bridge, |state, cx| {
+                        *state = snapshot;
+                        cx.notify();
+                    });
+                    // The overview's fastest useful cadence is 250 ms. A short
+                    // pause caps repaint churn while queued wakes still collapse
+                    // onto the latest authoritative snapshot.
+                    async_app
+                        .background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
+                }
+            })
+            .detach();
 
-        let app = AppHandle::start_with_publisher(publisher);
-        let resident_state = Arc::new(Mutex::new(resident::ResidentUiState::default()));
-        let (resident_command_tx, resident_command_rx) = std::sync::mpsc::channel();
-        let window_visible = Arc::new(AtomicBool::new(matches!(
-            launch_mode,
-            resident::LaunchMode::Windowed
-        )));
+            let app = if read_only {
+                AppHandle::start_read_only(publisher)
+            } else {
+                AppHandle::start_with_publisher(publisher)
+            };
+            let resident_state = Arc::new(Mutex::new(resident::ResidentUiState::default()));
+            let (resident_command_tx, resident_command_rx) = std::sync::mpsc::channel();
+            let window_visible = Arc::new(AtomicBool::new(matches!(
+                launch_mode,
+                resident::LaunchMode::Windowed
+            )));
 
-        let app_for_window = app.clone();
-        let app_state_for_window = app_state_entity.clone();
-        let resident_state_for_window = Arc::clone(&resident_state);
-        let resident_commands_for_window = resident_command_tx.clone();
-        let bounds = WindowBounds::Windowed(Bounds {
-            origin: point(px(180.), px(90.)),
-            size: size(px(840.), px(560.)),
-        });
+            let app_for_window = app.clone();
+            let app_state_for_window = app_state_entity.clone();
+            let resident_state_for_window = Arc::clone(&resident_state);
+            let resident_commands_for_window = resident_command_tx.clone();
+            let bounds = WindowBounds::Windowed(Bounds {
+                origin: point(px(180.), px(90.)),
+                size: size(px(840.), px(560.)),
+            });
 
-        let main_window = cx
-            .open_window(
+            let main_window = match cx.open_window(
                 WindowOptions {
                     window_bounds: Some(bounds),
                     focus: matches!(launch_mode, resident::LaunchMode::Windowed),
@@ -229,124 +261,152 @@ fn main() {
                     });
                     cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
                 },
-            )
-            .expect("open window");
-
-        let tray = match resident::TrayRuntime::new(Arc::clone(&window_visible)) {
-            Ok(tray) => std::rc::Rc::new(tray),
-            Err(error) => {
-                message_box("phelper 托盘启动失败", &error);
-                shutdown_app(cx, &app, &shutting_down, "tray initialization failed");
-                return;
-            }
-        };
-
-        // Covers Windows logoff/shutdown and other platform-level quit
-        // requests. Tray exit sets the same flag before cx.quit(), so the
-        // hardware restoration path runs exactly once.
-        let app_for_platform_quit = app.clone();
-        let shutting_for_platform_quit = Arc::clone(&shutting_down);
-        cx.on_app_quit(move |_| {
-            if !shutting_for_platform_quit.swap(true, Ordering::AcqRel) {
-                app_for_platform_quit.shutdown(Duration::from_secs(40));
-            }
-            async {}
-        })
-        .detach();
-
-        let shutting_for_intercept = Arc::clone(&shutting_down);
-        let visible_for_intercept = Arc::clone(&window_visible);
-        let tray_for_intercept = std::rc::Rc::clone(&tray);
-        let _ = main_window.update(cx, move |_, window, app_cx| {
-            window.on_window_should_close(app_cx, move |window, _| {
-                if shutting_for_intercept.load(Ordering::Acquire) {
-                    return true;
+            ) {
+                Ok(window) => window,
+                Err(error) => {
+                    // Same style as the tray-init failure below: a visible
+                    // message + the AR-12 graceful shutdown, never a panic
+                    // with no stderr to land on (2026-09 audit).
+                    message_box("phelper 窗口创建失败", &error.to_string());
+                    shutdown_app(cx, &app, &shutting_down, "window creation failed");
+                    return;
                 }
-                set_window_visible(window, false);
-                visible_for_intercept.store(false, Ordering::Release);
-                tray_for_intercept.set_window_visible(false);
-                false
+            };
+
+            let tray = match resident::TrayRuntime::new(Arc::clone(&window_visible)) {
+                Ok(tray) => std::rc::Rc::new(tray),
+                Err(error) => {
+                    message_box("phelper 托盘启动失败", &error);
+                    shutdown_app(cx, &app, &shutting_down, "tray initialization failed");
+                    return;
+                }
+            };
+
+            // Covers Windows logoff/shutdown and other platform-level quit
+            // requests. Tray exit sets the same flag before cx.quit(), so the
+            // hardware restoration path runs exactly once.
+            let app_for_platform_quit = app.clone();
+            let shutting_for_platform_quit = Arc::clone(&shutting_down);
+            cx.on_app_quit(move |_| {
+                if !shutting_for_platform_quit.swap(true, Ordering::AcqRel) {
+                    app_for_platform_quit.shutdown(Duration::from_secs(40));
+                }
+                async {}
+            })
+            .detach();
+
+            let shutting_for_intercept = Arc::clone(&shutting_down);
+            let visible_for_intercept = Arc::clone(&window_visible);
+            let tray_for_intercept = std::rc::Rc::clone(&tray);
+            let app_for_intercept = app.clone();
+            let _ = main_window.update(cx, move |_, window, app_cx| {
+                window.on_window_should_close(app_cx, move |window, app_cx| {
+                    if shutting_for_intercept.load(Ordering::Acquire) {
+                        return true;
+                    }
+                    if read_only {
+                        // Match tray exit: finish engine teardown before
+                        // GPUI destroys native handles. Destroying first
+                        // produced invalid-window callbacks during quit.
+                        let app = app_for_intercept.clone();
+                        let shutting = Arc::clone(&shutting_for_intercept);
+                        app_cx
+                            .defer(move |cx| shutdown_app(cx, &app, &shutting, "read-only close"));
+                        return false;
+                    }
+                    set_window_visible(window, false);
+                    visible_for_intercept.store(false, Ordering::Release);
+                    tray_for_intercept.set_window_visible(false);
+                    false
+                });
             });
-        });
 
-        let main_window_for_resident = main_window;
-        let app_for_resident = app.clone();
-        let shutting_for_resident = Arc::clone(&shutting_down);
-        let tray_for_resident = std::rc::Rc::clone(&tray);
-        let resident_state_for_task = Arc::clone(&resident_state);
-        cx.spawn(async move |async_app: &mut AsyncApp| {
-            let initial_autostart = async_app
-                .background_executor()
-                .spawn(async { resident::autostart::reconcile() })
-                .await;
-            update_resident_autostart_state(&resident_state_for_task, initial_autostart);
-            let _ = main_window_for_resident.update(async_app, |_, _, cx| cx.notify());
-
-            loop {
-                async_app
+            let main_window_for_resident = main_window;
+            let app_for_resident = app.clone();
+            let shutting_for_resident = Arc::clone(&shutting_down);
+            let tray_for_resident = std::rc::Rc::clone(&tray);
+            let resident_state_for_task = Arc::clone(&resident_state);
+            cx.spawn(async move |async_app: &mut AsyncApp| {
+                let initial_autostart = async_app
                     .background_executor()
-                    .timer(Duration::from_millis(100))
+                    .spawn(async move {
+                        if read_only {
+                            Err("只读预览不修改开机启动设置".into())
+                        } else {
+                            resident::autostart::reconcile()
+                        }
+                    })
                     .await;
-                if shutting_for_resident.load(Ordering::Acquire) {
-                    break;
-                }
+                update_resident_autostart_state(&resident_state_for_task, initial_autostart);
+                let _ = main_window_for_resident.update(async_app, |_, _, cx| cx.notify());
 
-                let mut actions = tray_for_resident.drain_actions();
-                if show_signal_rx.try_recv().is_ok() {
-                    actions.push(resident::TrayAction::Show);
-                }
-                for action in actions {
-                    match action {
-                        resident::TrayAction::Show => {
-                            let _ = main_window_for_resident.update(async_app, |_, window, _| {
-                                set_window_visible(window, true);
-                                window.activate_window();
-                            });
-                            tray_for_resident.set_window_visible(true);
-                        }
-                        resident::TrayAction::Hide => {
-                            let _ = main_window_for_resident.update(async_app, |_, window, _| {
-                                set_window_visible(window, false);
-                            });
-                            tray_for_resident.set_window_visible(false);
-                        }
-                        resident::TrayAction::Exit => {
-                            async_app.update(|cx| {
-                                shutdown_app(
-                                    cx,
-                                    &app_for_resident,
-                                    &shutting_for_resident,
-                                    "tray exit",
-                                );
-                            });
-                            return;
+                loop {
+                    async_app
+                        .background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
+                    if shutting_for_resident.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    let mut actions = tray_for_resident.drain_actions();
+                    if show_signal_rx.try_recv().is_ok() {
+                        actions.push(resident::TrayAction::Show);
+                    }
+                    for action in actions {
+                        match action {
+                            resident::TrayAction::Show => {
+                                let _ =
+                                    main_window_for_resident.update(async_app, |_, window, _| {
+                                        set_window_visible(window, true);
+                                        window.activate_window();
+                                    });
+                                tray_for_resident.set_window_visible(true);
+                            }
+                            resident::TrayAction::Hide => {
+                                let _ =
+                                    main_window_for_resident.update(async_app, |_, window, _| {
+                                        set_window_visible(window, false);
+                                    });
+                                tray_for_resident.set_window_visible(false);
+                            }
+                            resident::TrayAction::Exit => {
+                                async_app.update(|cx| {
+                                    shutdown_app(
+                                        cx,
+                                        &app_for_resident,
+                                        &shutting_for_resident,
+                                        "tray exit",
+                                    );
+                                });
+                                return;
+                            }
                         }
                     }
-                }
 
-                while let Ok(command) = resident_command_rx.try_recv() {
-                    let resident::ResidentCommand::SetAutostart(desired) = command;
-                    let result = async_app
-                        .background_executor()
-                        .spawn(async move { resident::autostart::set_enabled(desired) })
-                        .await;
-                    update_resident_autostart_state(&resident_state_for_task, result);
-                    let _ = main_window_for_resident.update(async_app, |_, _, cx| cx.notify());
+                    while let Ok(command) = resident_command_rx.try_recv() {
+                        let resident::ResidentCommand::SetAutostart(desired) = command;
+                        let result = async_app
+                            .background_executor()
+                            .spawn(async move { resident::autostart::set_enabled(desired) })
+                            .await;
+                        update_resident_autostart_state(&resident_state_for_task, result);
+                        let _ = main_window_for_resident.update(async_app, |_, _, cx| cx.notify());
+                    }
                 }
-            }
-        })
-        .detach();
+            })
+            .detach();
 
-        let main_window_id = main_window.window_id();
-        let app_for_close = app.clone();
-        let shutting_for_close = Arc::clone(&shutting_down);
-        cx.on_window_closed(move |cx, closed_window_id| {
-            if closed_window_id == main_window_id {
-                shutdown_app(cx, &app_for_close, &shutting_for_close, "window closed");
-            }
-        })
-        .detach();
-    });
+            let main_window_id = main_window.window_id();
+            let app_for_close = app.clone();
+            let shutting_for_close = Arc::clone(&shutting_down);
+            cx.on_window_closed(move |cx, closed_window_id| {
+                if closed_window_id == main_window_id {
+                    shutdown_app(cx, &app_for_close, &shutting_for_close, "window closed");
+                }
+            })
+            .detach();
+        });
 
     shutting_after_run.store(true, Ordering::Release);
     let _ = show_listener.join();

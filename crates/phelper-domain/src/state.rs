@@ -27,15 +27,17 @@ pub struct DesiredState {
 /// - `Unknown`: never written/never read. (0x29 power limits sit here until
 ///   a write verifies against the MSR 0x610 telemetry readback — the §25
 ///   three-step runbook's step 2.)
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum ObservedValue<T> {
     Verified {
         value: T,
+        #[serde(rename = "age_ms", serialize_with = "serialize_age_ms")]
         at: Instant,
         source: &'static str,
     },
     TrustedWrite {
         value: T,
+        #[serde(rename = "age_ms", serialize_with = "serialize_age_ms")]
         at: Instant,
     },
     Unknown,
@@ -67,8 +69,14 @@ impl<T> Default for ObservedValue<T> {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ObservedState {
+    pub mux_status: String,
+    pub mux_write_verified: bool,
+    /// Last named profile that completed; cleared when control is interrupted.
+    /// User intent remains in DesiredState even after firmware takes ownership.
+    pub active_profile: Option<String>,
+    pub control_notice: Option<String>,
     pub thermal_mode: ObservedValue<ThermalMode>,
     pub fan_mode: ObservedValue<FanMode>,
     pub max_fan: ObservedValue<bool>,
@@ -87,4 +95,8 @@ pub struct ObservedState {
     pub max_performance_ac: ObservedValue<u8>,
     pub max_performance_dc: ObservedValue<u8>,
     pub power_limits: ObservedValue<crate::policy::CpuPowerLimits>,
+}
+
+fn serialize_age_ms<S: serde::Serializer>(at: &Instant, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_u64(at.elapsed().as_millis().min(u64::MAX as u128) as u64)
 }

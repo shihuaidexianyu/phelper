@@ -53,17 +53,28 @@ impl WindowsPdh {
                 }
                 Ok(counter)
             };
-            let s = Self {
-                query,
-                cpu: add(query, CPU_PATH)?,
-                disk_read: add(query, DISK_READ_PATH)?,
-                disk_write: add(query, DISK_WRITE_PATH)?,
-                net_rx: add(query, NET_RX_PATH)?,
-                net_tx: add(query, NET_TX_PATH)?,
-                primed: false,
-                degraded: None,
-            };
-            Ok(s)
+            let built: Result<Self, PlatformError> = (|| {
+                Ok(Self {
+                    query,
+                    cpu: add(query, CPU_PATH)?,
+                    disk_read: add(query, DISK_READ_PATH)?,
+                    disk_write: add(query, DISK_WRITE_PATH)?,
+                    net_rx: add(query, NET_RX_PATH)?,
+                    net_tx: add(query, NET_TX_PATH)?,
+                    primed: false,
+                    degraded: None,
+                })
+            })();
+            match built {
+                Ok(s) => Ok(s),
+                Err(error) => {
+                    // A partially built counter set never becomes Self, so
+                    // Drop never runs — close the query handle explicitly
+                    // or a failed open leaks it.
+                    let _ = PdhCloseQuery(query);
+                    Err(error)
+                }
+            }
         }
     }
 
@@ -72,6 +83,13 @@ impl WindowsPdh {
             let mut value = PDH_FMT_COUNTERVALUE::default();
             let status = PdhGetFormattedCounterValue(counter, PDH_FMT_DOUBLE, None, &mut value);
             if status != 0 {
+                return None;
+            }
+            // A zero API status does not imply usable data: a failed counter
+            // reports it in CStatus (e.g. PDH_CSTATUS_INVALID_DATA) and the
+            // double is then garbage. Mirror counter_array_sum (CStatus == 0
+            // is PDH_CSTATUS_VALID_DATA) — never publish a fabricated value.
+            if value.CStatus != 0 {
                 return None;
             }
             Some(value.Anonymous.doubleValue)
@@ -90,21 +108,23 @@ impl WindowsPdh {
             if size == 0 {
                 return None;
             }
-            let mut buf = vec![0u8; size as usize];
+            // Item-typed buffer: a Vec<u8> has alignment 1, so casting its
+            // storage to PDH_FMT_COUNTERVALUE_ITEM_W (align 8) would be
+            // misaligned. `size` stays the byte count PDH sized for us.
+            let item_size = std::mem::size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>();
+            let mut buf =
+                vec![PDH_FMT_COUNTERVALUE_ITEM_W::default(); (size as usize).div_ceil(item_size)];
             let status = PdhGetFormattedCounterArrayW(
                 counter,
                 PDH_FMT_DOUBLE,
                 &mut size,
                 &mut count,
-                Some(buf.as_mut_ptr().cast()),
+                Some(buf.as_mut_ptr()),
             );
             if status != 0 {
                 return None;
             }
-            let items = std::slice::from_raw_parts(
-                buf.as_ptr() as *const PDH_FMT_COUNTERVALUE_ITEM_W,
-                count as usize,
-            );
+            let items = std::slice::from_raw_parts(buf.as_ptr(), count as usize);
             let mut sum = 0.0;
             for item in items {
                 if item.FmtValue.CStatus == 0 {

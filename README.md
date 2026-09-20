@@ -20,10 +20,14 @@ Windows 11
 
 ## 界面
 
-现在有三个页面：
+当前页面：
 
 - 概览：CPU、GPU、左右风扇的实时状态
 - 配置档：应用内置性能配置
+- 性能控制：编辑和保存自定义配置、风扇曲线
+- 自动切换：按程序与电源状态应用规则
+- 验证：采集帧率和硬件状态、比较测量报告
+- 硬件能力：查看支持状态与生成诊断报告
 - 设置：开机启动
 
 内置配置档：
@@ -44,10 +48,12 @@ Windows 11
 安装包生成在：
 
 ```text
-dist\phelper-Setup-0.1.0.exe
+dist\phelper-Setup-0.2.0.exe
 ```
 
 安装到 Program Files 后，开始菜单会出现 phelper；桌面快捷方式是可选的。卸载程序会删除 phelper 自己的开机任务，但不会删除 `%LOCALAPPDATA%\phelper` 里的日志和配置。
+
+安装包包含 PresentMon 2.5.1 便携控制台和应用所需的 Visual C++ 运行库，帧率测试无需再手动下载。首次构建安装包会下载并核验该工具；安装时无需联网。构建结果旁同时生成 SHA-256 校验文件。
 
 更新或卸载前，先从托盘退出正在运行的 phelper。
 
@@ -67,13 +73,13 @@ cargo build -p phelper-desktop --release
 编译安装包需要 Inno Setup 6：
 
 ```powershell
-.\installer\build-installer.ps1 -Version 0.1.0
+.\installer\build-installer.ps1 -Version 0.2.0
 ```
 
 如果 Release exe 已经是最新的，可以跳过 Rust 编译：
 
 ```powershell
-.\installer\build-installer.ps1 -SkipBuild -Version 0.1.0
+.\installer\build-installer.ps1 -SkipBuild -Version 0.2.0
 ```
 
 应用图标、PawnIO 模块和运行资源都已嵌入 exe，不需要在程序旁边放额外的 assets 目录。
@@ -119,7 +125,7 @@ New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\phelper\profiles" | Out-N
 cargo run -p phelper-cli -- control profile export gaming > "$env:LOCALAPPDATA\phelper\profiles\my-gaming.toml"
 ```
 
-桌面端目前只显示内置配置档。
+桌面性能控制页可编辑、保存并应用自定义配置档。各阶段的实机验收状态见 [当前实现状态](docs/ogh-milestones.md)。
 
 ## 数据目录
 

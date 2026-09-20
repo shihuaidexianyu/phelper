@@ -10,7 +10,10 @@ use phelper_domain::telemetry::{
 };
 
 /// Per-metric capacity. Worst cadence is 250 ms → 30 min ≈ 7200 samples;
-/// 8192 covers it with headroom and bounds memory (~30 metrics × ~48 B).
+/// 8192 covers it with headroom. Worst-case resident memory is bounded by
+/// registered metrics × capacity × ~48 B/sample (41 × 8192 × 48 B ≈ 16 MB) —
+/// acceptable for a desktop app, but NOT the "~1.4 KB" this comment once
+/// claimed (that figure was a single tick, not the rings).
 const RING_CAPACITY: usize = 8192;
 
 #[derive(Default)]
@@ -71,10 +74,20 @@ impl TelemetryStore {
         let Some(&newest) = ring.back().map(|s| &s.timestamp) else {
             return Vec::new();
         };
-        ring.iter()
-            .filter(|s| newest.duration_since(s.timestamp) <= window)
+        // Samples are appended in timestamp order, so scanning backwards
+        // stops at the first out-of-window entry: history older than the
+        // window is never iterated (this runs under the read lock that all
+        // workers need for writes — keep the O(n) part strictly window-
+        // sized). The clones themselves must stay under the lock since the
+        // data lives here; the guard is held only for this one call.
+        let mut out: Vec<_> = ring
+            .iter()
+            .rev()
+            .take_while(|s| newest.duration_since(s.timestamp) <= window)
             .cloned()
-            .collect()
+            .collect();
+        out.reverse();
+        out
     }
 
     pub(crate) fn stats(&self, id: MetricId, window: Duration) -> Option<WindowStats> {

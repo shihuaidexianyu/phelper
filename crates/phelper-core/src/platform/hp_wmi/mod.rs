@@ -7,9 +7,10 @@
 //! (IWbemServices::ExecMethod) invoker drops in behind the same seam —
 //! nothing above `raw_execute` can tell the difference.
 //!
-//! Threading: the transport is created and used on ONE thread (the HpActor
-//! in M1; the probe's main thread in M0). COM apartment affinity is not
-//! something we gamble on.
+//! Threading: the transport is created and used on ONE thread. The HpActor
+//! connects inside its own thread; the CLI probe's main thread does the
+//! same. COM apartment affinity is not something we gamble on — the wmi
+//! crate itself forces `!Send` on connections, and we respect that.
 //!
 //! Provenance (architecture.md §54 — source reliability tiers): the
 //! authoritative protocol reference for everything in this module is the
@@ -60,13 +61,22 @@ mod imp {
     pub(crate) struct WmiCrateInvoker {
         conn: WMIConnection,
         instance_path: String,
+        /// Cached static MOF class objects (I4): `hpqBDataIn` and `hpqBIntM`
+        /// are schema definitions that never change between invocations —
+        /// fetching them per call tripled the WMI round-trips of every
+        /// firmware call. Method definitions are NOT cached: the method
+        /// name varies per OutputSize and `get_method` returns a fresh
+        /// in-params template each call.
+        data_class: IWbemClassWrapper,
+        hpq_class: IWbemClassWrapper,
     }
 
-    // SAFETY: the wmi crate initializes COM as MTA (COINIT_MULTITHREADED),
-    // so interface pointers are usable from any MTA-initialized thread.
-    // Design invariant: each WmiCrateInvoker is created and used on ONE
-    // thread (the HpActor, or the probe's main thread); Send exists only to
-    // satisfy the port bounds, never for concurrent use.
+    // SAFETY: the wmi crate initializes COM as MTA (COINCREMENTMTAUSAGE,
+    // process-wide implicit MTA), so interface pointers are usable from any
+    // MTA-initialized thread. Design invariant: this invoker is created
+    // AND used on the same thread — since the 2026-09 review, HpActor
+    // connects inside its own thread, so no cross-thread move happens at
+    // all; Send remains only to satisfy the port bounds.
     unsafe impl Send for WmiCrateInvoker {}
 
     #[derive(Deserialize)]
@@ -100,9 +110,19 @@ mod imp {
             conn.get_object(&path)
                 .map_err(|_| HpWmiError::ProbeFailed("hpqBIntM instance path did not resolve"))?;
             info!(%path, "hpqBIntM instance found");
+            // Cache the static class objects once (I4). Fetched here on the
+            // thread that will use them — see the Send note on the struct.
+            let data_class = conn
+                .get_object("hpqBDataIn")
+                .map_err(|e| HpWmiError::Transport(format!("get hpqBDataIn class: {e}")))?;
+            let hpq_class = conn
+                .get_object("hpqBIntM")
+                .map_err(|e| HpWmiError::Transport(format!("get hpqBIntM class: {e}")))?;
             Ok(Self {
                 conn,
                 instance_path: path,
+                data_class,
+                hpq_class,
             })
         }
 
@@ -114,12 +134,10 @@ mod imp {
 
     impl BiosInvoker for WmiCrateInvoker {
         fn invoke(&self, method: &str, args: &BiosArgs) -> Result<BiosResponse, HpWmiError> {
-            // Build hpqBDataIn embedded instance.
-            let data_class = self
-                .conn
-                .get_object("hpqBDataIn")
-                .map_err(|e| HpWmiError::Transport(format!("get hpqBDataIn class: {e}")))?;
-            let data = data_class
+            // Build hpqBDataIn embedded instance from the cached class
+            // object (spawn_instance takes &self, so the shared cache works).
+            let data = self
+                .data_class
                 .spawn_instance()
                 .map_err(|e| HpWmiError::Transport(format!("spawn hpqBDataIn: {e}")))?;
             Self::put_u32(&data, "Command", args.command)?;
@@ -133,11 +151,8 @@ mod imp {
                 .map_err(|e| HpWmiError::Transport(format!("put Sign: {e}")))?;
 
             // Build the method's __InParameters with Data = the instance.
-            let class = self
-                .conn
-                .get_object("hpqBIntM")
-                .map_err(|e| HpWmiError::Transport(format!("get hpqBIntM class: {e}")))?;
-            let in_params_class = class
+            let in_params_class = self
+                .hpq_class
                 .get_method(method)
                 .map_err(|e| HpWmiError::Transport(format!("get method {method}: {e}")))?
                 .ok_or(HpWmiError::ProbeFailed("method not found on hpqBIntM"))?;
@@ -252,13 +267,6 @@ mod imp {
             Ok(Self { invoker, insize })
         }
 
-        /// Constructor with an explicit invoker (tests).
-        #[cfg(test)]
-        #[allow(dead_code)] // used by M1 actor tests
-        pub(crate) fn with_invoker(invoker: Box<dyn BiosInvoker>, insize: InsizeMode) -> Self {
-            Self { invoker, insize }
-        }
-
         fn probe_insize(invoker: &dyn BiosInvoker) -> Result<InsizeMode, HpWmiError> {
             let args = BiosArgs::read(HpCommandGroup::Gaming, cmd::FAN_COUNT_GET, &[], true);
             match invoker.invoke(OutputSize::Small4.method_name(), &args) {
@@ -364,7 +372,6 @@ mod imp {
             Err(last_err.unwrap_or(HpWmiError::InvalidResponse("write: no outsize attempted")))
         }
 
-        #[allow(dead_code)] // M1 actor reports this in ProviderStatus
         pub(crate) fn insize_mode(&self) -> InsizeMode {
             self.insize
         }
@@ -372,6 +379,18 @@ mod imp {
 
     #[cfg(feature = "control")]
     impl phelper_domain::ports::HpControl for HpWmiTransport {
+        #[cfg(feature = "experimental-mux")]
+        fn set_mux_mode(&self, mode: MuxMode) -> Result<(), HpWmiError> {
+            // Linux hp-wmi: HPWMI_WRITE / 0x52, four input/output bytes.
+            // No alternative output sizes or automatic retry of a mutation.
+            self.raw_execute(
+                HpCommandGroup::GpuModeWrite,
+                cmd::MUX,
+                &commands::encode_mux(mode)?,
+                OutputSize::Small4,
+            )
+            .map(|_| ())
+        }
         fn set_thermal_mode(
             &self,
             mode: phelper_domain::policy::ThermalMode,

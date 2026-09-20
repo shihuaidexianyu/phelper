@@ -1,9 +1,12 @@
 //! The app pump (§43/§44): ONE thread ("app-pump") owns the `Engine` and is
 //! the only telemetry subscriber; the GPUI thread never touches a channel
 //! or a hardware handle. The pump publishes AppState updates through a
-//! `StatePublisher` bridge — that bridge is what moves ownership from
-//! `Arc<RwLock<AppState>>` (lock-based, owned by pump) to GPUI's
-//! `Entity<AppState>` (framework-managed, observed by the shell).
+//! `StatePublisher` bridge. In production that bridge is the desktop's
+//! `GpuiStatePublisher`: a lock-backed authoritative `AppState` plus a
+//! 1-capacity wake channel — the GPUI side drains the wake and pokes an
+//! `Entity<AppState>` purely as an observer token, and observers then pull
+//! the publisher's snapshot. Repaint coalescing comes from the channel
+//! capacity, not from per-tick fingerprints.
 //!
 //! Loop (up to 100 ms idle cadence):
 //! 1. telemetry snapshots (drain to latest);
@@ -31,20 +34,31 @@ use super::{now_epoch_ms, validate};
 
 enum PumpMsg {
     Dispatch(KnobId, ControlCommand),
+    SaveProfile(String, phelper_domain::profile::PerformanceProfile),
+    RefreshProfiles,
+    StartCapture {
+        pid: u32,
+        seconds: u32,
+        label: String,
+    },
+    StopCapture,
+    UseCaptureBaseline,
+    ExportDiagnostics,
+    ConfigureAutomation(crate::automation::AutomationConfig),
     Shutdown(mpsc::Sender<()>),
 }
 
 /// Bridge from the pump thread to whatever owns the live `AppState`. The
-/// GPUI shell injects a GPUI-backed publisher that maps to `Entity<AppState>`;
-/// tests inject an `RwLockStatePublisher` so they can drive the pump without
-/// pulling in gpui. Either way the pump writes through this trait and never
-/// touches a GPUI handle directly (phelper-core has no gpui dep).
+/// GPUI shell injects a publisher backed by a lock plus a coalescing wake
+/// signal that feeds an `Entity<AppState>` observer token; tests inject an
+/// `RwLockStatePublisher` so they can drive the pump without pulling in
+/// gpui. Either way the pump writes through this trait and never touches a
+/// GPUI handle directly (phelper-core has no gpui dep).
 pub trait StatePublisher: Send + Sync + 'static {
-    /// Apply a batch of mutations and trigger observer notifications.
-    /// Implementations must notify any registered observers iff the state
-    /// actually changed (caller fingerprint) — for simplicity the pump's
-    /// apply closure is opaque, so the publisher is expected to ALWAYS
-    /// notify and let observer-side fingerprints filter.
+    /// Apply a batch of mutations and signal observers. The pump's apply
+    /// closure is opaque, so implementations signal on every update and own
+    /// the coalescing policy (the desktop's 1-capacity wake channel
+    /// collapses a burst of updates into one repaint).
     fn update(&self, apply: Box<dyn FnOnce(&mut AppState) + Send>);
 
     /// Snapshot the current state for profile validation and UI reads.
@@ -113,6 +127,14 @@ impl AppHandle {
     /// that used to mutate the AppState lock now flows through the publisher
     /// (which, in production, is a GPUI `Entity<AppState>` bridge).
     pub fn start_with_publisher(publisher: Arc<dyn StatePublisher>) -> Self {
+        Self::start_mode(publisher, false)
+    }
+
+    pub fn start_read_only(publisher: Arc<dyn StatePublisher>) -> Self {
+        Self::start_mode(publisher, true)
+    }
+
+    fn start_mode(publisher: Arc<dyn StatePublisher>, read_only: bool) -> Self {
         let (to_pump, rx) = mpsc::channel();
         let handle = Self {
             publisher: Arc::clone(&publisher),
@@ -120,7 +142,7 @@ impl AppHandle {
         };
         std::thread::Builder::new()
             .name("app-pump".into())
-            .spawn(move || pump_main(publisher, rx))
+            .spawn(move || pump_main(publisher, rx, read_only))
             .expect("spawn app-pump thread");
         handle
     }
@@ -137,18 +159,53 @@ impl AppHandle {
         let _ = self.to_pump.send(PumpMsg::Dispatch(knob, cmd));
     }
 
-    /// AR-12 graceful shutdown: restores firmware automatic state, then
-    /// acks. Blocks up to `timeout`; safe to call more than once.
-    pub fn shutdown(&self, timeout: Duration) {
+    pub fn save_profile(&self, name: String, profile: phelper_domain::profile::PerformanceProfile) {
+        let _ = self.to_pump.send(PumpMsg::SaveProfile(name, profile));
+    }
+
+    pub fn start_capture(&self, pid: u32, seconds: u32, label: String) {
+        let _ = self.to_pump.send(PumpMsg::StartCapture {
+            pid,
+            seconds,
+            label,
+        });
+    }
+    pub fn stop_capture(&self) {
+        let _ = self.to_pump.send(PumpMsg::StopCapture);
+    }
+    pub fn use_capture_baseline(&self) {
+        let _ = self.to_pump.send(PumpMsg::UseCaptureBaseline);
+    }
+    pub fn export_diagnostics(&self) {
+        let _ = self.to_pump.send(PumpMsg::ExportDiagnostics);
+    }
+
+    pub fn configure_automation(&self, config: crate::automation::AutomationConfig) {
+        let _ = self.to_pump.send(PumpMsg::ConfigureAutomation(config));
+    }
+
+    pub fn refresh_profiles(&self) {
+        let _ = self.to_pump.send(PumpMsg::RefreshProfiles);
+    }
+
+    /// AR-12 barrier: dependent workers and restoration finish before the
+    /// desktop may terminate. Backend calls have their own bounded waits.
+    /// Keep the duration parameter for existing callers; it cannot override
+    /// the hardware teardown barrier.
+    pub fn shutdown(&self, _timeout: Duration) {
         let (ack_tx, ack_rx) = mpsc::channel();
         if self.to_pump.send(PumpMsg::Shutdown(ack_tx)).is_ok() {
-            let _ = ack_rx.recv_timeout(timeout);
+            let _ = ack_rx.recv();
         }
     }
 }
 
-fn pump_main(publisher: Arc<dyn StatePublisher>, rx: mpsc::Receiver<PumpMsg>) {
-    let engine = match Engine::start_without_ogh_scan() {
+fn pump_main(publisher: Arc<dyn StatePublisher>, rx: mpsc::Receiver<PumpMsg>, read_only: bool) {
+    let engine = match if read_only {
+        Engine::start_read_only()
+    } else {
+        Engine::start_without_ogh_scan()
+    } {
         Ok(e) => Some(e),
         Err(e) => {
             let message = e.to_string();
@@ -162,10 +219,49 @@ fn pump_main(publisher: Arc<dyn StatePublisher>, rx: mpsc::Receiver<PumpMsg>) {
         serve_shutdown_only(&rx);
         return;
     };
+    let identity = engine.identity().clone();
+    let caps = engine.capability_report().capabilities.clone();
+    let initial_ppm = engine.capability_report().windows_ppm.clone();
+    let initial_mux = engine.capability_report().mux;
+    let control_reason = engine.control_unavailable_reason().map(str::to_owned);
+    let hardware = crate::hardware_status::HardwareStatus::probe();
+    publisher.update(Box::new(move |s| {
+        s.identity = Some(identity);
+        s.caps = Some(caps);
+        s.windows_ppm = initial_ppm;
+        s.observed.control_notice = control_reason;
+        if let Some(value) = initial_mux {
+            s.observed.mux = phelper_domain::state::ObservedValue::Verified {
+                value,
+                at: Instant::now(),
+                source: "hp-wmi 0x52 initial probe",
+            };
+        }
+        s.hardware = hardware;
+    }));
+    let capture = CaptureContext {
+        telemetry: engine.telemetry().clone(),
+        stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        worker: std::sync::Mutex::new(None),
+    };
     let control = engine.control().cloned();
+    let automation = control
+        .clone()
+        .map(crate::automation::AutomationHandle::start);
+    if automation.is_none() {
+        let config = crate::automation::load_config().unwrap_or_default();
+        publisher.update(Box::new(move |s| {
+            s.automation = crate::automation::AutomationSnapshot {
+                initialized: true,
+                config,
+                message: Some("只读模式：规则不会运行或写入。".into()),
+                ..Default::default()
+            }
+        }));
+    }
     // The remaining UI exposes built-ins only, so do not scan user profile
     // files a second time after Engine startup.
-    let registry = crate::profiles::ProfileRegistry::with_builtins();
+    let mut registry = crate::profiles::ProfileRegistry::load_default();
 
     // Initial state: clone every Arc-shaped handle into the closure so the
     // 'static-bound on `Box<dyn FnOnce + Send>` is satisfied without
@@ -178,6 +274,7 @@ fn pump_main(publisher: Arc<dyn StatePublisher>, rx: mpsc::Receiver<PumpMsg>) {
             s.caps = Some(caps);
             s.desired = c.desired();
             s.observed = c.observed();
+            s.windows_ppm = c.windows_ppm_state();
             s.engine = EngineStatus::Running;
         } else {
             s.engine = EngineStatus::TelemetryOnly;
@@ -201,7 +298,14 @@ fn pump_main(publisher: Arc<dyn StatePublisher>, rx: mpsc::Receiver<PumpMsg>) {
     let mut engine = Some(engine);
     let mut coalescer = Coalescer::new();
     let mut in_flight: BTreeMap<u64, (KnobId, mpsc::Receiver<ControlOutcome>)> = BTreeMap::new();
-    let mut last_state_refresh = Instant::now() - Duration::from_secs(60);
+    // Seed "long ago" so the first loop iteration refreshes immediately.
+    // `Instant - Duration` PANICS when system uptime is below the delta —
+    // exactly the autostart-at-logon case on a fast-boot machine — so the
+    // subtraction must be checked (falling back to "now" merely defers the
+    // first refresh by one 2 s cadence; state was just stamped above).
+    let mut last_state_refresh = Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .unwrap_or_else(Instant::now);
     let mut last_observed_reprobe = Instant::now();
 
     loop {
@@ -213,6 +317,12 @@ fn pump_main(publisher: Arc<dyn StatePublisher>, rx: mpsc::Receiver<PumpMsg>) {
         let iter_start = Instant::now();
         let mut stages = [Duration::ZERO; 4];
 
+        if let Some(automation) = &automation {
+            let snapshot = automation.snapshot();
+            if publisher.snapshot().automation != snapshot {
+                publisher.update(Box::new(move |s| s.automation = snapshot));
+            }
+        }
         // 1. Telemetry: drain to the latest snapshot only. Do not wait on
         // this channel: waiting here used to make a user command sit behind
         // the 100 ms telemetry timeout. The UI channel below is now the
@@ -233,6 +343,9 @@ fn pump_main(publisher: Arc<dyn StatePublisher>, rx: mpsc::Receiver<PumpMsg>) {
                     s.engine = EngineStatus::Failed("遥测协调器意外断开".into());
                 }));
                 if let Some(e) = engine.take() {
+                    if let Some(a) = &automation {
+                        a.shutdown();
+                    }
                     e.shutdown();
                 }
                 serve_shutdown_only(&rx);
@@ -255,16 +368,25 @@ fn pump_main(publisher: Arc<dyn StatePublisher>, rx: mpsc::Receiver<PumpMsg>) {
         };
         match rx.recv_timeout(ui_wait) {
             Ok(msg) => {
-                shutdown_ack =
-                    handle_pump_msg(msg, &publisher, &registry, &mut coalescer, control.as_ref());
+                shutdown_ack = handle_pump_msg(
+                    msg,
+                    &publisher,
+                    &mut registry,
+                    &mut coalescer,
+                    control.as_ref(),
+                    automation.as_ref(),
+                    &capture,
+                );
                 if shutdown_ack.is_none() {
                     while let Ok(msg) = rx.try_recv() {
                         shutdown_ack = handle_pump_msg(
                             msg,
                             &publisher,
-                            &registry,
+                            &mut registry,
                             &mut coalescer,
                             control.as_ref(),
+                            automation.as_ref(),
+                            &capture,
                         );
                         if shutdown_ack.is_some() {
                             break;
@@ -274,7 +396,11 @@ fn pump_main(publisher: Arc<dyn StatePublisher>, rx: mpsc::Receiver<PumpMsg>) {
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                capture.stop_and_join();
                 if let Some(e) = engine.take() {
+                    if let Some(a) = &automation {
+                        a.shutdown();
+                    }
                     e.shutdown();
                 }
                 return;
@@ -283,6 +409,9 @@ fn pump_main(publisher: Arc<dyn StatePublisher>, rx: mpsc::Receiver<PumpMsg>) {
         if let Some(ack) = shutdown_ack {
             let t_sd = Instant::now();
             if let Some(e) = engine.take() {
+                if let Some(a) = &automation {
+                    a.shutdown();
+                }
                 e.shutdown();
             }
             tracing::info!(
@@ -390,6 +519,7 @@ fn pump_main(publisher: Arc<dyn StatePublisher>, rx: mpsc::Receiver<PumpMsg>) {
                 publisher.update(Box::new(move |s| {
                     s.desired = c.desired();
                     s.observed = c.observed();
+                    s.windows_ppm = c.windows_ppm_state();
                 }));
             }
         }
@@ -400,6 +530,7 @@ fn pump_main(publisher: Arc<dyn StatePublisher>, rx: mpsc::Receiver<PumpMsg>) {
                 publisher.update(Box::new(move |s| {
                     s.desired = c.desired();
                     s.observed = c.observed();
+                    s.windows_ppm = c.windows_ppm_state();
                 }));
             }
         }
@@ -430,17 +561,108 @@ fn pump_main(publisher: Arc<dyn StatePublisher>, rx: mpsc::Receiver<PumpMsg>) {
     }
 }
 
+struct CaptureContext {
+    telemetry: crate::telemetry::TelemetryHandle,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+impl CaptureContext {
+    fn stop_and_join(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(worker) = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = worker.join();
+        }
+    }
+}
+impl Drop for CaptureContext {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
 /// Apply one pump message. Returning a shutdown acknowledgement keeps the
 /// engine-owning shutdown path in `pump_main`, while allowing the message
 /// receive itself to be event-driven.
 fn handle_pump_msg(
     msg: PumpMsg,
     publisher: &Arc<dyn StatePublisher>,
-    registry: &crate::profiles::ProfileRegistry,
+    registry: &mut crate::profiles::ProfileRegistry,
     coalescer: &mut Coalescer,
     control: Option<&crate::control::ControlHandle>,
+    automation: Option<&crate::automation::AutomationHandle>,
+    capture: &CaptureContext,
 ) -> Option<mpsc::Sender<()>> {
     match msg {
+        PumpMsg::StartCapture {
+            pid,
+            seconds,
+            label,
+        } => {
+            if publisher.snapshot().capture_running {
+                return None;
+            }
+            let context = publisher.snapshot().diagnostic_json();
+            publisher.update(Box::new(|s| {
+                s.capture_running = true;
+                s.capture_notice = Some("正在采集帧时间…".into());
+            }));
+            capture.stop_and_join();
+            capture
+                .stop
+                .store(false, std::sync::atomic::Ordering::Release);
+            let stop = Arc::clone(&capture.stop);
+            let telemetry = capture.telemetry.clone();
+            let publisher = Arc::clone(publisher);
+            let worker = std::thread::spawn(move || {
+                let result =
+                    crate::measurements::capture(pid, seconds, label, telemetry, context, stop);
+                publisher.update(Box::new(move |s| {
+                    s.capture_running = false;
+                    match result {
+                        Ok(report) => {
+                            s.capture_notice =
+                                Some(format!("采集完成：{}", report.json_path.display()));
+                            s.capture_report = Some(Arc::new(report));
+                        }
+                        Err(e) => s.capture_notice = Some(e),
+                    }
+                }));
+            });
+            *capture.worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(worker);
+            None
+        }
+        PumpMsg::StopCapture => {
+            capture
+                .stop
+                .store(true, std::sync::atomic::Ordering::Release);
+            None
+        }
+        PumpMsg::UseCaptureBaseline => {
+            publisher.update(Box::new(|s| s.capture_baseline = s.capture_report.clone()));
+            None
+        }
+        PumpMsg::ExportDiagnostics => {
+            let mut json = publisher.snapshot().diagnostic_json();
+            let journal = crate::control::journal::ControlJournal::default_path();
+            json["journal_tail"] = crate::control::journal::diagnostic_tail(&journal);
+            for (key, extension) in [("recovery", "recovery.json"), ("mux_lifecycle", "mux.json")] {
+                if let Ok(text) = std::fs::read_to_string(journal.with_extension(extension)) {
+                    json[key] = serde_json::from_str(&text)
+                        .unwrap_or_else(|e| serde_json::json!({"read_error": e.to_string()}));
+                }
+            }
+            let path = crate::persistence::data_dir()
+                .join("reports")
+                .join(format!("diagnostics-{}.json", now_epoch_ms()));
+            let result = crate::persistence::write_atomic(&path, &json.to_string());
+            publisher.update(Box::new(move |s| {
+                s.diagnostic_path = Some(match result {
+                    Ok(()) => path.display().to_string(),
+                    Err(e) => e.to_string(),
+                })
+            }));
+            None
+        }
         PumpMsg::Dispatch(knob, cmd) => {
             let fail = dispatch_gate(&cmd, registry, publisher, control.is_some());
             if let Some(err) = fail {
@@ -462,7 +684,48 @@ fn handle_pump_msg(
             }
             None
         }
-        PumpMsg::Shutdown(ack) => Some(ack),
+        PumpMsg::SaveProfile(name, profile) => {
+            let result = crate::profiles::save_user_profile(&name, &profile);
+            let notice = match result {
+                Ok(()) => {
+                    *registry = crate::profiles::ProfileRegistry::load_default();
+                    if let Some(c) = control {
+                        c.replace_profiles(registry.clone());
+                    }
+                    format!("已保存配置档：{name}")
+                }
+                Err(error) => error,
+            };
+            let profiles = registry.clone();
+            publisher.update(Box::new(move |s| {
+                s.set_profiles(&profiles);
+                s.profile_notice = Some(notice);
+            }));
+            None
+        }
+        PumpMsg::RefreshProfiles => {
+            *registry = crate::profiles::ProfileRegistry::load_default();
+            if let Some(c) = control {
+                c.replace_profiles(registry.clone());
+            }
+            let profiles = registry.clone();
+            publisher.update(Box::new(move |s| {
+                s.profile_notice =
+                    (!profiles.warnings.is_empty()).then(|| profiles.warnings.join("\n"));
+                s.set_profiles(&profiles);
+            }));
+            None
+        }
+        PumpMsg::ConfigureAutomation(config) => {
+            if let Some(automation) = automation {
+                automation.configure(config);
+            }
+            None
+        }
+        PumpMsg::Shutdown(ack) => {
+            capture.stop_and_join();
+            Some(ack)
+        }
     }
 }
 
@@ -477,6 +740,13 @@ fn dispatch_gate(
     if !has_control {
         return Some(ControlError::BackendUnavailable {
             what: "控制协调器（遥测-only 模式）".into(),
+        });
+    }
+    if matches!(cmd, ControlCommand::SetMuxMode(_))
+        && !publisher.snapshot().observed.mux_write_verified
+    {
+        return Some(ControlError::UnsafeRequest {
+            reason: "本机 MUX 尚未完成双向重启验证；桌面写入未开放".into(),
         });
     }
     if let ControlCommand::ApplyProfile { profile } = cmd {

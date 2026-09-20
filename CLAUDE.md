@@ -1,3 +1,15 @@
+# Current scope update — 2026-09-05
+
+The user approved OGH replacement stages 1–4. The authoritative implementation
+and acceptance status is [docs/ogh-milestones.md](docs/ogh-milestones.md).
+This supersedes the dated minimal-UI reduction below: the desktop now includes
+Performance, Automation, Validation and Hardware pages. Historical HIL results
+do not certify the new control/automation/MUX paths. MUX is dev-feature gated;
+desktop writes additionally require same-board, same-BIOS round-trip reboot
+evidence. Undervolting remains unavailable: OEM XTU components were found but
+ABI/readback/recovery are unverified, and VBS is running on the reference machine.
+No EC or MSR write path was added.
+
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
@@ -23,6 +35,8 @@ The former workload/frame-telemetry experiment was removed from the product scop
 2026-08-27 responsiveness pass: the existing control path was measured against the reference machine's journal (EPP/Boost execution is typically ~80–130 ms). The app pump now drains telemetry non-blocking and waits on the UI channel, so a control request wakes it immediately instead of waiting behind the old 100 ms telemetry timeout; while a command/pending drag is active, outcome and next-dispatch polling use a 10 ms cadence. CPU-policy knobs use a 50 ms coalescing interval; firmware-sensitive knobs retain 250 ms. The desktop state ticker is 50 ms so the lifecycle badge does not wait a quarter second to reflect the outcome. No safety gate, single-writer rule, firmware verification, or fan 1 Hz rule was weakened.
 
 2026-08-30 minimal-UI reduction: the desktop user surface has Dashboard, Profiles, and a one-row Settings page for Task Scheduler autostart. Performance controls are expressed through profiles; Monitor, theme selection, application scheduling, OMEN-key integration, overlay, diagnostics, and report export are not part of the current desktop product. The resident lifecycle is intentionally retained: close hides the window, the minimal tray owns only show/hide + explicit graceful exit, and `--background` starts without showing the main window. Core/CLI facilities remain where they have an independent engineering use.
+
+2026-09-01 state-bridge/documentation reconciliation: the desktop state path described in the v0.2 (per-page fingerprint) and 2026-08-27 (50 ms ticker) notes has been replaced. The current bridge is pump → `StatePublisher.update` → `GpuiStatePublisher` (lock-backed authoritative `AppState` + 1-capacity wake channel) → GPUI drain → `Entity<AppState>` as a pure observer token → the shell pulls the publisher snapshot. There are no tickers and no fingerprints; repaint coalescing is the wake-channel capacity. The M6-deferred real .ico has since shipped (`apps/desktop/assets/phelper.ico` embedded via `phelper.rc` + build.rs). A stale-comment pass replaced the "wired in W5/W11/W15" `#[allow]` annotations with durable feature-gate reasons, removed genuinely redundant allows (cfg-`control` items reachable from their trait impls), deleted the unused test-only `HpWmiTransport::with_invoker`, and made the default (no-`control`) phelper-core build warning-free — the 9 warnings there were pre-existing; the gated all-features configuration was always clean. Test total corrected to 157 (the "168"/"163+6" figures were stale). Note: the v0.2 resource numbers (2.7% CPU / ~183 MB) predate both this bridge and the minimal UI — treat them as historical until a fresh release-build soak re-measures the current shell.
 
 Current scope decision: MUX graphics-mode switching is explicitly deferred/out of scope. The reference machine can report MUX capability/current mode, but switching requires a reboot and does not improve the current hot-reload performance-control loop. Keep the read-only probe/state model for support diagnostics; do not add a MUX write control, UI control, or profile field without a separate reboot/rollback/HIL plan.
 
@@ -86,7 +100,7 @@ Phase 0 is a **CLI hardware probe** (DeviceIdentity, Board ID, BIOS, ThermalPoli
 
 Standard Cargo workspace:
 
-- `cargo build --workspace` / `cargo test --workspace` / `cargo clippy --workspace` (all clean; current all-feature workspace run: 168 tests)
+- `cargo build --workspace` / `cargo test --workspace` / `cargo clippy --workspace` (all clean; 157 tests in the 2026-09-01 all-features run)
 - `cargo run -p phelper-desktop` — the minimal GPUI shell. **Self-elevates via runas** (UAC prompt on unelevated launch) and enforces a named-mutex single instance. It has no product feature flags and contains only Dashboard + Profiles. Resource/perf measurements must use `--release` (debug GPUI numbers are meaningless). Logs: `%LOCALAPPDATA%\phelper\logs\phelper-desktop.log`; journal: `%LOCALAPPDATA%\phelper\state\control-journal.jsonl`.
 - `cargo run -p phelper-cli -- probe [--json PATH] [--record-fixtures DIR] [--emit-board-profile PATH]` — read-only capability probe. **Must run elevated** (`root\wmi` ACL is admin-only → 0x80041003 otherwise); unelevated it degrades to identity-only.
 - `cargo run -p phelper-cli -- telemetry [--interval-ms N] [--duration S] [--metrics SUBSTR]...` — live metric table (repeat `--metrics` per substring). Ctrl+C now shuts the engine down GRACEFULLY (the engine includes the control coordinator since M2 — an ungraceful kill leaves fan/thermal state to the ~120 s firmware clawback).
@@ -120,7 +134,8 @@ PowrProf scheme separately from Windows 11's configured mode and effective mode.
 EPP/EPP1, maximum frequency, minimum/maximum processor performance, and Boost
 are read and written as AC/DC-specific PPM indexes with immediate readback;
 configured/effective modes are read-only context and are never silently switched.
-Capability probing reuses the startup snapshot, and the UI keeps bounds behind
-“更多参数” so the main page remains compact. `control status` exposes the full
-snapshot. Core has 163 tests plus 6 domain tests green with all features; see
+Capability probing reuses the startup snapshot. `control status` exposes the
+full snapshot — the fine-grained knobs are a CLI surface, while the minimal
+desktop expresses performance through profiles. The workspace suite is green
+with all features; see
 `docs/windows-power-policy.md` for the design boundary and official API links.

@@ -1,5 +1,4 @@
 target/
-target-release-check/
 dist/
 probe-out/
 *.rs.bk

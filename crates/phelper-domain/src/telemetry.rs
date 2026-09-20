@@ -95,6 +95,72 @@ pub mod ids {
     // Power source
     pub const POWER_AC_ONLINE: MetricId = MetricId("power.ac_online");
     pub const POWER_BATTERY_PERCENT: MetricId = MetricId("power.battery_percent");
+
+    /// Every declared metric id, in declaration order. `phelper-core`'s
+    /// registry test iterates this to enforce that each id has a REGISTRY
+    /// entry (a missing entry panics the collector's cadence lookup).
+    /// When adding an id above, add it here in the same group — the test
+    /// below fails on duplicates, and the core-side test fails on missing
+    /// REGISTRY entries.
+    pub const ALL: &[MetricId] = &[
+        CPU_PKG_TEMP_C,
+        CPU_TJ_MAX_C,
+        CPU_PKG_POWER_W,
+        CPU_EFFECTIVE_CLOCK_MHZ,
+        CPU_THERMAL_STATUS_RAW,
+        CPU_PL1_W,
+        CPU_PL2_W,
+        CPU_PL4_W,
+        CPU_POWER_LIMIT_RAW,
+        CPU_EPP_AC,
+        CPU_EPP_DC,
+        CPU_EPP1_AC,
+        CPU_EPP1_DC,
+        CPU_MAX_FREQ_AC,
+        CPU_MAX_FREQ_DC,
+        CPU_MIN_PERF_AC,
+        CPU_MIN_PERF_DC,
+        CPU_MAX_PERF_AC,
+        CPU_MAX_PERF_DC,
+        CPU_BOOST_AC,
+        CPU_BOOST_DC,
+        CPU_UTIL_PERCENT,
+        MEM_USED_BYTES,
+        MEM_TOTAL_BYTES,
+        DISK_READ_BPS,
+        DISK_WRITE_BPS,
+        NET_RX_BPS,
+        NET_TX_BPS,
+        GPU_TEMP_C,
+        GPU_POWER_W,
+        GPU_UTIL_PERCENT,
+        GPU_CORE_CLOCK_MHZ,
+        GPU_MEM_CLOCK_MHZ,
+        GPU_PSTATE,
+        GPU_THROTTLE_REASONS_RAW,
+        GPU_VRAM_USED_BYTES,
+        GPU_POWER_LIMIT_W,
+        FAN_LEFT_RPM,
+        FAN_RIGHT_RPM,
+        POWER_AC_ONLINE,
+        POWER_BATTERY_PERCENT,
+    ];
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// ALL must not contain duplicates — a copy-paste slip here would
+        /// silently shrink the registry-consistency coverage in core.
+        #[test]
+        fn all_ids_are_unique() {
+            let mut sorted: Vec<_> = ALL.to_vec();
+            sorted.sort();
+            let len = sorted.len();
+            sorted.dedup();
+            assert_eq!(sorted.len(), len, "ids::ALL contains duplicates");
+        }
+    }
 }
 
 /// Where a sample came from. Part of the canonical model so the UI can show

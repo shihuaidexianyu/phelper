@@ -1,6 +1,6 @@
 [package]
 name = "phelper-desktop"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 description = "GPUI desktop shell for phelper (OMEN 16-wf0032TX / board 8BAB). Self-elevating (runas relaunch) — see below."
@@ -22,6 +22,11 @@ name = "phelper-desktop"
 path = "src/main.rs"
 test = true
 bench = false
+
+[features]
+default = []
+experimental = ["phelper-core/experimental-hp-power-limits"]
+experimental-mux = ["phelper-core/experimental-mux"]
 
 [dependencies]
 phelper-core = { path = "../../crates/phelper-core", features = ["control"] }

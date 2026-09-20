@@ -2,6 +2,7 @@
 //! This is a DEV HARNESS surface for the probe CLI — M1 turns these into
 //! scheduled collectors behind the TelemetryCoordinator.
 
+#[cfg(any(feature = "pawnio", feature = "nvidia"))]
 use phelper_domain::error::PlatformError;
 #[cfg(feature = "nvidia")]
 use phelper_domain::ports::GpuTelemetry;
@@ -15,6 +16,7 @@ pub struct SmokeRow {
     pub detail: Option<String>,
 }
 
+#[cfg(any(feature = "pawnio", feature = "nvidia"))]
 impl SmokeRow {
     fn ok(provider: &'static str, detail: String) -> Self {
         Self {

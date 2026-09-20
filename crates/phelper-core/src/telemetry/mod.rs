@@ -1,12 +1,9 @@
 //! Telemetry engine (M1): per-cadence collectors, bounded store, single
-//! coordinator thread.
+//! provider workers and a coalescing publication thread.
 //!
-//! Threading (D2): one `telemetry-coord` thread runs every collector
-//! sequentially, scheduled by per-collector cadence from the registry. The
-//! HP fan collector's WMI call rides the HpActor's 5 s timeout — a wedged
-//! firmware call can stall the loop for that bound; accepted for M1
-//! (firmware round-trips measured on 8BAB are milliseconds) and documented
-//! here so M2 doesn't "discover" it later.
+//! Providers collect independently; HP WMI stalls cannot delay CPU thermals.
+//! The PawnIO worker alone is pinned to logical processor 0 for APERF/MPERF.
+//! Shared state is locked only while publishing completed samples.
 //!
 //! Failure model (D3): collectors don't throw — failures downgrade
 //! ProviderStatus and skip the metric; staleness is expressed by sample
@@ -17,7 +14,7 @@ pub mod registry;
 mod store;
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -26,7 +23,7 @@ use phelper_domain::error::EngineError;
 use phelper_domain::telemetry::{
     MetricId, MetricSample, ProviderStatus, TelemetrySnapshot, WindowStats,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use collectors::Collector;
 use store::TelemetryStore;
@@ -54,7 +51,28 @@ fn pin_to_core_zero() {
 /// Provider status is reported under this key in the snapshot.
 pub(crate) type CollectorBox = Box<dyn Collector>;
 
+/// Lock poisoning must never take this thread — or, via SnapshotFeed, the
+/// CONTROL coordinator — down with it (2026-09 audit). A panic while a
+/// guard was held can only have LOST updates in this plain-data store
+/// (Rust keeps it memory-safe), so recovering the inner store is sound;
+/// at worst a sample is stale, and the safety layer's freshness gates
+/// already treat stale as absent (fail closed).
+fn read_store(store: &RwLock<TelemetryStore>) -> std::sync::RwLockReadGuard<'_, TelemetryStore> {
+    store.read().unwrap_or_else(|e| {
+        warn!("telemetry store read-lock poisoned — recovering inner store");
+        e.into_inner()
+    })
+}
+
+fn write_store(store: &RwLock<TelemetryStore>) -> std::sync::RwLockWriteGuard<'_, TelemetryStore> {
+    store.write().unwrap_or_else(|e| {
+        warn!("telemetry store write-lock poisoned — recovering inner store");
+        e.into_inner()
+    })
+}
+
 enum Command {
+    Collected,
     /// Out-of-cadence refresh of every collector (per-collector firmware
     /// guards still apply — the HP 1 Hz fan rule is not bypassable).
     RefreshNow,
@@ -74,28 +92,21 @@ pub struct TelemetryHandle {
 
 impl TelemetryHandle {
     pub fn snapshot(&self) -> TelemetrySnapshot {
-        self.store.read().expect("store poisoned").snapshot()
+        read_store(&self.store).snapshot()
     }
 
     pub fn history(&self, id: MetricId, window: Duration) -> Vec<MetricSample> {
-        self.store
-            .read()
-            .expect("store poisoned")
-            .history(id, window)
+        read_store(&self.store).history(id, window)
     }
 
     pub fn stats(&self, id: MetricId, window: Duration) -> Option<WindowStats> {
-        self.store.read().expect("store poisoned").stats(id, window)
+        read_store(&self.store).stats(id, window)
     }
 
     /// Per-collector worst scheduling lateness since start (M1 acceptance:
     /// 250 ms domain jitter must stay < 50 ms).
     pub fn scheduler_jitter(&self) -> BTreeMap<&'static str, Duration> {
-        self.store
-            .read()
-            .expect("store poisoned")
-            .scheduler_jitter()
-            .clone()
+        read_store(&self.store).scheduler_jitter().clone()
     }
 
     /// Monotonic loop counter — freezes if the coordinator stalls.
@@ -118,13 +129,17 @@ impl TelemetryHandle {
         let _ = self.cmd.send(Command::RefreshNow);
     }
 
-    /// Stop the coordinator thread. Waits for the thread to exit.
+    /// Stop the coordinator thread. Waits (bounded) for the thread to exit.
     pub(crate) fn shutdown(&self) {
         let (tx, rx) = mpsc::channel();
         if self.cmd.send(Command::Shutdown(tx)).is_ok() {
             // Engine teardown must not stop the HP actor while a collector
-            // still owns an in-flight read against it.
-            let _ = rx.recv();
+            // still owns an in-flight read against it. The wait is bounded:
+            // a collector wedged in a firmware call must not hang process
+            // exit forever (2026-09 audit) — the OS reaps the thread.
+            if rx.recv_timeout(Duration::from_secs(10)).is_err() {
+                warn!("telemetry coordinator did not ack shutdown within 10 s (wedged collector?)");
+            }
         }
     }
 }
@@ -134,6 +149,7 @@ pub(crate) struct TelemetryCoordinator {
     store: Arc<RwLock<TelemetryStore>>,
     rx: Receiver<Command>,
     heartbeat: Arc<AtomicU64>,
+    notifications: Sender<Command>,
 }
 
 impl TelemetryCoordinator {
@@ -146,7 +162,7 @@ impl TelemetryCoordinator {
     ) -> Result<TelemetryHandle, EngineError> {
         let store = Arc::new(RwLock::new(TelemetryStore::default()));
         {
-            let mut guard = store.write().expect("store poisoned");
+            let mut guard = write_store(&store);
             for (name, why) in unavailable {
                 guard.set_provider(name, ProviderStatus::Unavailable(why));
             }
@@ -158,6 +174,7 @@ impl TelemetryCoordinator {
             store: Arc::clone(&store),
             rx,
             heartbeat: Arc::clone(&heartbeat),
+            notifications: tx.clone(),
         };
         std::thread::Builder::new()
             .name("telemetry-coord".into())
@@ -170,100 +187,124 @@ impl TelemetryCoordinator {
         })
     }
 
-    fn run(mut self) {
-        pin_to_core_zero();
-        info!(
-            collectors = self.collectors.len(),
-            "telemetry coordinator running"
-        );
-        let mut next_due: Vec<Instant> = vec![Instant::now(); self.collectors.len()];
-        let mut subscribers: Vec<SyncSender<Arc<TelemetrySnapshot>>> = Vec::new();
-
+    fn run(self) {
+        // Each provider owns its cadence and thread. In particular HP WMI
+        // cannot stall CPU thermals, and only the MSR reader is core-pinned.
+        let pending = Arc::new(AtomicBool::new(false));
+        let mut workers = Vec::new();
+        for mut collector in self.collectors {
+            let (tx, rx) = mpsc::sync_channel::<bool>(1);
+            let store = Arc::clone(&self.store);
+            let notify = self.notifications.clone();
+            let pending = Arc::clone(&pending);
+            let name = collector.name();
+            let worker = std::thread::Builder::new()
+                .name(format!("telemetry-{name}"))
+                .spawn(move || {
+                    #[cfg(windows)]
+                    if name == "pawnio/cpu-silicon" {
+                        pin_to_core_zero();
+                    }
+                    let mut due = Instant::now();
+                    loop {
+                        match rx.recv_timeout(due.saturating_duration_since(Instant::now())) {
+                            Ok(false) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                            Ok(true) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        }
+                        let started = Instant::now();
+                        // cadence() reads the registry with `.expect` — a
+                        // forgotten entry must surface as an Unavailable
+                        // provider row, not a silently dead worker thread
+                        // (the GUI has no stderr to show the panic). Keep it
+                        // inside the same unwind guard as collect().
+                        let (samples, cadence) =
+                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                (collector.collect(), collector.cadence())
+                            })) {
+                                Ok(pair) => pair,
+                                Err(_) => {
+                                    write_store(&store).set_provider(
+                                        name,
+                                        ProviderStatus::Unavailable("collector panicked".into()),
+                                    );
+                                    if !pending.swap(true, Ordering::AcqRel) {
+                                        let _ = notify.send(Command::Collected);
+                                    }
+                                    return;
+                                }
+                            };
+                        {
+                            let mut guard = write_store(&store);
+                            guard.note_jitter(name, started.saturating_duration_since(due));
+                            for sample in samples {
+                                guard.push(sample);
+                            }
+                            guard.set_provider(name, collector.status());
+                        }
+                        // Never make up missed samples or spin after a slow
+                        // call. A provider resumes at its own normal cadence.
+                        due = Instant::now() + cadence;
+                        if !pending.swap(true, Ordering::AcqRel) {
+                            let _ = notify.send(Command::Collected);
+                        }
+                    }
+                });
+            match worker {
+                Ok(join) => workers.push((tx, join)),
+                Err(error) => write_store(&self.store).set_provider(
+                    name,
+                    ProviderStatus::Unavailable(format!("collector thread: {error}")),
+                ),
+            }
+        }
+        let mut subscribers = Vec::new();
         loop {
             self.heartbeat.fetch_add(1, Ordering::Relaxed);
-            let now = Instant::now();
-            let wait = next_due
-                .iter()
-                .copied()
-                .min()
-                .map(|d| d.saturating_duration_since(now))
-                .unwrap_or(Duration::from_secs(3600));
-
-            match self.rx.recv_timeout(wait) {
-                Ok(Command::Shutdown(ack)) => {
-                    let jitter = self
-                        .store
-                        .read()
-                        .expect("store poisoned")
-                        .scheduler_jitter()
-                        .clone();
-                    info!(
-                        ?jitter,
-                        "telemetry coordinator shutting down (max jitter per collector)"
-                    );
-                    let _ = ack.send(());
-                    return;
-                }
-                Ok(Command::RefreshNow) => {
-                    debug!("refresh-now requested");
-                    self.collect_where(&mut next_due, |_| true);
+            match self.rx.recv() {
+                Ok(Command::Collected) => {
+                    pending.store(false, Ordering::Release);
                     Self::publish(&self.store, &mut subscribers);
                 }
+                Ok(Command::RefreshNow) => {
+                    // Capacity one coalesces refreshes. Firmware collectors
+                    // retain their own minimum-interval checks.
+                    for (worker, _) in &workers {
+                        let _ = worker.try_send(true);
+                    }
+                }
                 Ok(Command::Subscribe(tx)) => {
-                    // The first collection round can finish before the app
-                    // pump registers its subscriber. Deliver the current
-                    // store immediately so it does not wait for the next
-                    // cadence just to receive data that already exists.
-                    let snap = Arc::new(self.store.read().expect("store poisoned").snapshot());
+                    let snap = Arc::new(read_store(&self.store).snapshot());
                     if !snap.samples.is_empty() {
-                        let _ = tx.send(snap);
+                        let _ = tx.try_send(snap);
                     }
                     subscribers.push(tx);
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    let now = Instant::now();
-                    self.collect_where(&mut next_due, |due| now >= *due);
-                    Self::publish(&self.store, &mut subscribers);
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    warn!("telemetry command channel closed without shutdown");
+                Ok(Command::Shutdown(ack)) => {
+                    let joins: Vec<_> = workers
+                        .into_iter()
+                        .map(|(tx, join)| {
+                            let _ = tx.try_send(false);
+                            drop(tx);
+                            join
+                        })
+                        .collect();
+                    let deadline = Instant::now() + Duration::from_secs(9);
+                    while joins.iter().any(|join| !join.is_finished()) && Instant::now() < deadline
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    for join in joins {
+                        if join.is_finished() {
+                            let _ = join.join();
+                        } else {
+                            warn!("collector still stopping; backend may be stalled");
+                        }
+                    }
+                    let _ = ack.send(());
                     return;
                 }
+                Err(_) => return,
             }
-        }
-    }
-
-    /// Run every collector whose `due` matches `fired`, push samples, update
-    /// provider status, record scheduling jitter, and reschedule.
-    fn collect_where(&mut self, next_due: &mut [Instant], fired: impl Fn(&Instant) -> bool) {
-        for (i, c) in self.collectors.iter_mut().enumerate() {
-            if !fired(&next_due[i]) {
-                continue;
-            }
-            let start = Instant::now();
-            let lateness = start.saturating_duration_since(next_due[i]);
-            {
-                let mut guard = self.store.write().expect("store poisoned");
-                guard.note_jitter(c.name(), lateness);
-            }
-            let samples = c.collect();
-            let status = c.status();
-            {
-                let mut guard = self.store.write().expect("store poisoned");
-                for s in samples {
-                    guard.push(s);
-                }
-                guard.set_provider(c.name(), status);
-            }
-            let elapsed = start.elapsed();
-            if elapsed > c.cadence() / 2 {
-                warn!(
-                    collector = c.name(),
-                    ?elapsed,
-                    "collector consumed over half its cadence"
-                );
-            }
-            next_due[i] = start + c.cadence();
         }
     }
 
@@ -274,7 +315,7 @@ impl TelemetryCoordinator {
         if subscribers.is_empty() {
             return;
         }
-        let snap = Arc::new(store.read().expect("store poisoned").snapshot());
+        let snap = Arc::new(read_store(store).snapshot());
         subscribers.retain(|tx| match tx.try_send(Arc::clone(&snap)) {
             Ok(()) | Err(TrySendError::Full(_)) => true,
             Err(TrySendError::Disconnected(_)) => false,
@@ -310,5 +351,58 @@ mod tests {
         drop(rx);
         TelemetryCoordinator::publish(&store, &mut subscribers);
         assert!(subscribers.is_empty());
+    }
+    #[test]
+    fn slow_provider_does_not_delay_fast_samples() {
+        struct Source {
+            slow: bool,
+            count: Arc<AtomicU64>,
+        }
+        impl Collector for Source {
+            fn name(&self) -> &'static str {
+                if self.slow { "test-slow" } else { "test-fast" }
+            }
+            fn cadence(&self) -> Duration {
+                Duration::from_millis(10)
+            }
+            fn collect(&mut self) -> Vec<MetricSample> {
+                if self.slow {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                self.count.fetch_add(1, Ordering::Relaxed);
+                vec![]
+            }
+            fn status(&self) -> ProviderStatus {
+                ProviderStatus::Ok
+            }
+        }
+        let fast = Arc::new(AtomicU64::new(0));
+        let slow = Arc::new(AtomicU64::new(0));
+        let handle = TelemetryCoordinator::start(
+            vec![
+                Box::new(Source {
+                    slow: true,
+                    count: slow.clone(),
+                }),
+                Box::new(Source {
+                    slow: false,
+                    count: fast.clone(),
+                }),
+            ],
+            vec![],
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while fast.load(Ordering::Relaxed) < 5 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let fast_count = fast.load(Ordering::Relaxed);
+        let slow_count = slow.load(Ordering::Relaxed);
+        handle.shutdown();
+        assert!(fast_count >= 5);
+        assert_eq!(
+            slow_count, 0,
+            "fast collection should advance during the first slow call"
+        );
     }
 }

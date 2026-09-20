@@ -6,10 +6,14 @@
 
 pub mod app;
 pub mod automatic_scheduler;
+#[cfg(feature = "control")]
+pub mod automation;
 pub mod capability;
 #[cfg(feature = "control")]
 pub mod control;
 mod engine;
+pub mod hardware_status;
+pub mod measurements;
 pub mod os_policy;
 pub mod persistence;
 mod platform;

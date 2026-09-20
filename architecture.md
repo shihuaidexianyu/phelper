@@ -1,3 +1,11 @@
+# 2026-09-05 implementation addendum
+
+The user-approved OGH replacement stages 1–4 supersede the dated desktop scope
+reduction in this document. See [current implementation and acceptance status](docs/ogh-milestones.md)
+for worker isolation, durable recovery/MUX lifecycle, scoped automation,
+PresentMon measurement, build gates and remaining hardware validation.
+Historical HIL measurements are not new validation evidence.
+
 # Phelper — Architecture Baseline
 
 > Status: Architecture Baseline v0.1  
@@ -2948,7 +2956,7 @@ Windows 设置中的“最佳节能/均衡/最佳性能”通过
 
 ---
 
-## Phase 3 — GPUI Shell
+## Phase 3 — GPUI Shell（已完成，8BAB 实机验证；后经 2026-08-30 最小化收缩）
 
 历史阶段最初建立：
 
@@ -3264,4 +3272,4 @@ Diff apply / readback / restore
 4. **Observed vs Desired State**  
    不假设命令成功，而是尽可能验证实际状态。
 
-如果这四层从项目第一天就建立好，那么 UI、Profile、游戏调优、更多 OMEN 型号甚至未来的自动性能策略，都可以在不破坏核心架构的情况下继续增长。 
+如果这四层从项目第一天就建立好，那么 UI、Profile、游戏调优、更多 OMEN 型号甚至未来的自动性能策略，都可以在不破坏核心架构的情况下继续增长。

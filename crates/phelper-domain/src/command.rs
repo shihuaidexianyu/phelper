@@ -11,8 +11,21 @@ use crate::profile::GpuPolicyPatch;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlCommand {
+    /// Restore only fields owned by this session or its persisted recovery ledger.
+    RestoreSession,
     ApplyProfile {
         profile: String,
+    },
+    /// A reviewed editor draft, subject to the same full-plan validation as named profiles.
+    ApplyProfileDefinition {
+        profile: Box<crate::profile::PerformanceProfile>,
+    },
+    ApplyScopedProfile {
+        profile: String,
+        session_id: u64,
+    },
+    RestoreScopedProfile {
+        session_id: u64,
     },
     SetCpuPolicy(CpuPolicy),
     SetThermalMode(ThermalMode),

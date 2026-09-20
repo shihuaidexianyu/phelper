@@ -139,6 +139,53 @@ pub fn to_toml(profile: &PerformanceProfile) -> Result<String, toml::ser::Error>
     toml::to_string_pretty(profile)
 }
 
+/// Save an explicitly named custom profile; no path traversal or built-in overwrite.
+pub fn save_user_profile(name: &str, profile: &PerformanceProfile) -> Result<(), String> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("名称限 1–64 个英文字母、数字、短横线或下划线".into());
+    }
+    if ProfileRegistry::with_builtins().is_builtin(name) {
+        return Err("内置配置档不能覆盖，请使用新名称".into());
+    }
+    if let Some(FanMode::Curve(curve)) = profile.fan {
+        curve.validate().map_err(str::to_owned)?;
+    }
+    let cpu = &profile.cpu;
+    if [
+        cpu.epp_ac,
+        cpu.epp_dc,
+        cpu.epp1_ac,
+        cpu.epp1_dc,
+        cpu.min_performance_ac,
+        cpu.min_performance_dc,
+        cpu.max_performance_ac,
+        cpu.max_performance_dc,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|v| v > 100)
+    {
+        return Err("EPP 与性能百分比必须在 0–100 之间".into());
+    }
+    if [
+        (cpu.min_performance_ac, cpu.max_performance_ac),
+        (cpu.min_performance_dc, cpu.max_performance_dc),
+    ]
+    .into_iter()
+    .any(|(min, max)| min.zip(max).is_some_and(|(min, max)| min > max))
+    {
+        return Err("性能下限不能大于性能上限".into());
+    }
+    let text = to_toml(profile).map_err(|e| e.to_string())?;
+    crate::persistence::write_atomic(&profiles_dir().join(format!("{name}.toml")), &text)
+        .map_err(|e| e.to_string())
+}
+
 /// The shipped presets. Values are starting points grounded in 8BAB HIL
 /// evidence (M1–M4), not guesses: the idle fan-stop fact, the reference
 /// PPM defaults, and the 0x21 stock readback. Power limits are deliberately
@@ -244,6 +291,20 @@ fn builtins() -> Vec<(&'static str, PerformanceProfile)> {
             },
         ),
     ]
+    .into_iter()
+    .map(|(name, mut profile)| {
+        // Presets fully own the PPM constraints. A previous custom cap must
+        // not silently survive a switch to Gaming or CPU Max. These are
+        // explicit unconstrained settings, not a claim about OEM defaults.
+        profile.cpu.max_freq_mhz_ac.get_or_insert(0);
+        profile.cpu.max_freq_mhz_dc.get_or_insert(0);
+        profile.cpu.min_performance_ac.get_or_insert(0);
+        profile.cpu.min_performance_dc.get_or_insert(0);
+        profile.cpu.max_performance_ac.get_or_insert(100);
+        profile.cpu.max_performance_dc.get_or_insert(100);
+        (name, profile)
+    })
+    .collect()
 }
 
 #[cfg(test)]

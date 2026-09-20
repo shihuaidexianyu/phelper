@@ -22,7 +22,7 @@ pub(crate) enum HpCommandGroup {
     /// 0x01 — legacy read path (MUX get).
     LegacyRead = 0x01,
     /// 0x02 — GPU mode write path (MUX set).
-    #[allow(dead_code)] // M3
+    #[allow(dead_code)] // MUX writes are out of scope (§3.3); kept for protocol completeness
     GpuModeWrite = 0x02,
     /// 0x20008 — main gaming command group.
     Gaming = 0x20008,
@@ -35,30 +35,30 @@ pub(crate) mod cmd {
     pub(crate) const FAN_COUNT_GET: u8 = 0x10;
     /// Thermal/performance mode set, payload {0xFF, mode}, outsize=0
     /// (hp-wmi.c HPWMI_SET_PERFORMANCE_MODE via HPWMI_GM).
-    #[allow(dead_code)] // call sites live behind `control` (W5); kept unconditional for tests
+    #[allow(dead_code)] // call sites are behind the `control` feature; kept unconditional so tests pin the wire format
     pub(crate) const SET_PERFORMANCE_MODE: u8 = 0x1A;
     /// GPU platform policy (cTGP/PPAB/dstate/slowdown) get.
     pub(crate) const GPU_POLICY_GET: u8 = 0x21;
-    /// GPU platform policy set. M3.
-    #[allow(dead_code)]
+    /// GPU platform policy set.
+    #[allow(dead_code)] // call sites are behind the `control` feature
     pub(crate) const GPU_POLICY_SET: u8 = 0x22;
     /// Max fan get — DIAGNOSTICS ONLY, unreliable (hp-wmi.c 46be1453e6).
     pub(crate) const MAX_FAN_GET: u8 = 0x26;
     /// Max fan set, payload = 4-byte LE int 1/0, outsize=0
     /// (hp-wmi.c HPWMI_FAN_SPEED_MAX_SET_QUERY: `int enabled`).
-    #[allow(dead_code)] // call sites live behind `control` (W5)
+    #[allow(dead_code)] // call sites are behind the `control` feature
     pub(crate) const MAX_FAN_SET: u8 = 0x27;
     /// System design data.
     pub(crate) const SYSTEM_DESIGN_DATA: u8 = 0x28;
-    /// Power limits {pl1,pl2,pl4,concurrent} — EXPERIMENTAL, M3.
-    #[allow(dead_code)]
+    /// Power limits {pl1,pl2,pl4,concurrent} — EXPERIMENTAL (permanent gate, §25).
+    #[allow(dead_code)] // call sites are behind the `control` feature + the experimental gate
     pub(crate) const POWER_LIMITS: u8 = 0x29;
     /// Fan levels get (128-byte buffer; per-fan byte * 100 = RPM on V1).
     pub(crate) const FAN_LEVELS_GET: u8 = 0x2D;
     /// Fan levels set, payload `u8[2] {channel0, channel1}` in 100-RPM units,
     /// presented as `{left, right}` on 8BAB; 0 = auto,
     /// outsize=0 (hp-wmi.c HPWMI_VICTUS_S_FAN_SPEED_SET_QUERY).
-    #[allow(dead_code)] // call sites live behind `control` (W5)
+    #[allow(dead_code)] // call sites are behind the `control` feature
     pub(crate) const FAN_LEVELS_SET: u8 = 0x2E;
     /// Fan table get (4 zero bytes in, 128-byte table out).
     pub(crate) const FAN_TABLE_GET: u8 = 0x2F;
@@ -71,7 +71,7 @@ pub(crate) mod cmd {
 pub(crate) enum OutputSize {
     /// Write ops whose response is empty (hpqBIOSInt0) — 0x1A/0x27/0x2E all
     /// use outsize=0 (hp-wmi.c call sites).
-    #[allow(dead_code)] // write call sites live behind `control` (W5)
+    #[allow(dead_code)] // constructed by write paths behind the `control` feature
     Zero,
     Small4,
     Medium128,
@@ -126,7 +126,7 @@ impl BiosArgs {
     /// fills `args->datasize = insize` for every set call (verified
     /// 2026-08-26 against master: 0x1A insize=2, 0x2E insize=2, 0x27
     /// insize=4, all outsize=0).
-    #[allow(dead_code)] // call sites live behind `control` (W5); unconditional for tests
+    #[allow(dead_code)] // call sites are behind the `control` feature; kept unconditional so tests pin the wire format
     pub(crate) fn write(group: HpCommandGroup, cmd_type: u8, input: &[u8]) -> Self {
         Self {
             signature: SIGNATURE,
@@ -227,6 +227,20 @@ pub(crate) fn decode_mux(buf: &[u8]) -> Result<MuxMode, HpWmiError> {
     }
 }
 
+#[cfg(feature = "experimental-mux")]
+pub(crate) fn encode_mux(mode: MuxMode) -> Result<[u8; 4], HpWmiError> {
+    let value = match mode {
+        MuxMode::Hybrid => 0,
+        MuxMode::Discrete => 1,
+        _ => {
+            return Err(HpWmiError::InvalidInput(
+                "only Hybrid/Discrete are validated protocol targets",
+            ));
+        }
+    };
+    Ok([value, 0, 0, 0])
+}
+
 /// 0x26 → byte 0 != 0. DIAGNOSTICS ONLY (unreliable on this firmware).
 pub(crate) fn decode_max_fan_diag(buf: &[u8]) -> Result<bool, HpWmiError> {
     need(buf, 1, "max fan diag needs >= 1 byte")?;
@@ -239,7 +253,7 @@ pub(crate) fn decode_max_fan_diag(buf: &[u8]) -> Result<bool, HpWmiError> {
 /// 0x1A thermal mode set, V1 mapping (8BAB is statically V1 — BoardProfile
 /// locks it). Kernel: `char buffer[2] = {-1, mode}` via
 /// HPWMI_SET_PERFORMANCE_MODE/HPWMI_GM, insize=2, outsize=0.
-#[allow(dead_code)] // call sites live behind `control` (W5); unconditional for tests
+#[allow(dead_code)] // call sites are behind the `control` feature; kept unconditional so tests pin the wire format
 pub(crate) fn encode_thermal_mode_v1(mode: ThermalMode) -> [u8; 2] {
     let v1 = match mode {
         ThermalMode::Balanced => 0x30,    // HP_OMEN_V1_THERMAL_PROFILE_DEFAULT
@@ -254,7 +268,7 @@ pub(crate) fn encode_thermal_mode_v1(mode: ThermalMode) -> [u8; 2] {
 /// outsize=0). The wire is u8 per channel — anything above 255 krpm-units
 /// cannot be encoded; the safety layer's clamp check runs long before this
 /// guard, and both fail closed rather than truncate.
-#[allow(dead_code)] // call sites live behind `control` (W5); unconditional for tests
+#[allow(dead_code)] // call sites are behind the `control` feature; kept unconditional so tests pin the wire format
 pub(crate) fn encode_fan_levels(levels: FanLevels) -> Result<[u8; 2], HpWmiError> {
     let left =
         u8::try_from(levels.left).map_err(|_| HpWmiError::InvalidInput("left fan level > 255"))?;
@@ -265,7 +279,7 @@ pub(crate) fn encode_fan_levels(levels: FanLevels) -> Result<[u8; 2], HpWmiError
 
 /// 0x27 max fan set: 4-byte LE `int enabled` (hp-wmi.c
 /// HPWMI_FAN_SPEED_MAX_SET_QUERY, insize=4, outsize=0).
-#[allow(dead_code)] // call sites live behind `control` (W5); unconditional for tests
+#[allow(dead_code)] // call sites are behind the `control` feature; kept unconditional so tests pin the wire format
 pub(crate) fn encode_max_fan(on: bool) -> [u8; 4] {
     (on as u32).to_le_bytes()
 }
@@ -275,7 +289,7 @@ pub(crate) fn encode_max_fan(on: bool) -> [u8; 4] {
 /// HPWMI_GM; OSH SetGpuPowerState same layout). Full 4-byte write — callers
 /// read-modify-write via 0x21 to preserve untouched fields (the kernel
 /// preserves `gpu_slowdown_temp` this way).
-#[allow(dead_code)] // call sites live behind `control` (M3); unconditional for tests
+#[allow(dead_code)] // call sites are behind the `control` feature; kept unconditional so tests pin the wire format
 pub(crate) fn encode_gpu_policy(p: GpuPlatformPolicy) -> [u8; 4] {
     [
         u8::from(p.ctgp),
@@ -304,15 +318,16 @@ pub(crate) const POWER_LIMIT_NO_CHANGE: u8 = 0xFF;
 
 /// Candidate A — kernel struct order `{pl1, pl2, 0xFF, 0xFF}`.
 /// **PROVEN WRONG on 8BAB** (M3 S2 arbitration, 2026-08-26): this encoding
-/// wrote intent PL1=45/PL2=90 and MSR 0x610 read back PL1=90/PL2=45. Kept
-/// only so `power-spike --order kernel` can re-run the experiment.
-#[allow(dead_code)] // M3 S2 arbitration
+/// wrote intent PL1=45/PL2=90 and MSR 0x610 read back PL1=90/PL2=45. The
+/// dev power-spike that ran the A/B has been retired; the unit tests keep
+/// the arbitration record executable.
+#[allow(dead_code)] // no stable caller since the dev power-spike was retired; tests pin the record
 pub(crate) fn encode_power_limits_kernel(pl1_w: u8, pl2_w: u8) -> [u8; 4] {
     [pl1_w, pl2_w, POWER_LIMIT_NO_CHANGE, POWER_LIMIT_NO_CHANGE]
 }
 
 /// Candidate B — swapped pl1/pl2 (the documented "OSH order" reading).
-#[allow(dead_code)] // M3 S2 arbitration
+#[allow(dead_code)] // no stable caller since the dev power-spike was retired; tests pin the record
 pub(crate) fn encode_power_limits_swapped(pl1_w: u8, pl2_w: u8) -> [u8; 4] {
     [pl2_w, pl1_w, POWER_LIMIT_NO_CHANGE, POWER_LIMIT_NO_CHANGE]
 }
@@ -323,6 +338,7 @@ pub(crate) fn encode_power_limits_swapped(pl1_w: u8, pl2_w: u8) -> [u8; 4] {
 /// the kernel order — that is exactly the trap §25's mandatory three-step
 /// verification exists for. cc always goes out as 0xFF (NO_CHANGE): it has
 /// no readback channel and no restore semantics — permanently unwritable.
+#[allow(dead_code)] // call sites are behind the `control` feature
 pub(crate) fn encode_power_limits(l: &CpuPowerLimits) -> [u8; 4] {
     [
         l.pl2_w,
@@ -342,7 +358,7 @@ pub(crate) fn encode_power_limits(l: &CpuPowerLimits) -> [u8; 4] {
 
 /// Restore firmware default PL1/PL2: `{0x00, 0x00, 0xFF, 0xFF}` — the exact
 /// write the kernel issues on AC/DC power-source events.
-#[allow(dead_code)] // M3
+#[allow(dead_code)] // no stable caller since the dev power-spike was retired; tests pin the wire format
 pub(crate) fn encode_power_limits_restore_default() -> [u8; 4] {
     [
         POWER_LIMIT_DEFAULT,
@@ -356,7 +372,7 @@ pub(crate) fn encode_power_limits_restore_default() -> [u8; 4] {
 /// other bytes NO_CHANGE. Used by `pl4-spike` to verify the MCHBAR 0x59B0
 /// readback channel; NOT wired into any stable path (the transport rejects
 /// pl4≠0 until that verification lands).
-#[allow(dead_code)] // M4-mini spike
+#[allow(dead_code)] // no stable caller since the dev pl4-spike was retired; tests pin the wire format
 pub(crate) fn encode_power_limits_pl4_only(pl4_w: u8) -> [u8; 4] {
     [
         POWER_LIMIT_NO_CHANGE,

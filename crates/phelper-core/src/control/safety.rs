@@ -4,10 +4,15 @@
 //!
 //! Layer 1 — thermal hysteresis: while the USER holds the fans (manual
 //! levels or max fan), the firmware curve no longer protects the machine.
-//! If cpu.pkg_temp_c reaches FORCE_MAX_FAN_AT_C the supervisor forces max
-//! fan and remembers the user's mode; at RELEASE_MAX_FAN_AT_C it hands the
-//! saved mode back. FirmwareAuto is exempt: there the firmware is already
-//! the safety net (AR-12) and we must not second-guess it.
+//! If a fresh cpu.pkg_temp_c OR gpu.temp_c sample reaches FORCE_MAX_FAN_AT_C
+//! the supervisor forces max fan and remembers the user's mode; when BOTH
+//! are back at or below RELEASE_MAX_FAN_AT_C it hands the saved mode back.
+//! FirmwareAuto is exempt: there the firmware is already the safety net
+//! (AR-12) and we must not second-guess it. The GPU is an ADDITIONAL
+//! trigger only (2026-09 decision): the software curve already responds to
+//! max(cpu,gpu), so the net must not stay blind to a GPU-only load while
+//! the CPU is cool; a missing/stale GPU sample never trips on its own,
+//! which degrades the net to the M2-verified CPU-only behavior.
 //!
 //! Layer 2 — sensor-freeze watchdog: a blind controller is worse than no
 //! controller. If temperature or fan samples stop flowing while the user
@@ -116,13 +121,30 @@ impl SafetySupervisor {
         observed: &ObservedState,
     ) -> Result<(), ControlError> {
         match cmd {
+            ControlCommand::RestoreSession => Ok(()),
             // Unreachable by construction: the coordinator EXPANDS a profile
             // into concrete Set* commands first and validates each of those
             // individually (M5) — the whole profile is rejected before any
             // write if any expanded field fails its per-command gate.
             // Kept hard-rejecting as the fail-closed guard.
-            ControlCommand::ApplyProfile { .. } => Err(ControlError::Unsupported),
-            ControlCommand::SetMuxMode(_) => Err(ControlError::Unsupported),
+            ControlCommand::ApplyProfile { .. }
+            | ControlCommand::ApplyProfileDefinition { .. }
+            | ControlCommand::ApplyScopedProfile { .. }
+            | ControlCommand::RestoreScopedProfile { .. } => Err(ControlError::Unsupported),
+            ControlCommand::SetMuxMode(mode) => {
+                if !cfg!(feature = "experimental-mux")
+                    || !caps.known_board
+                    || caps.mux != Support::Supported
+                    || !matches!(
+                        mode,
+                        phelper_domain::policy::MuxMode::Hybrid
+                            | phelper_domain::policy::MuxMode::Discrete
+                    )
+                {
+                    return Err(ControlError::Unsupported);
+                }
+                require_elevated(caps)
+            }
 
             ControlCommand::SetPowerLimits(l) => {
                 // Two independent gates, both required (§25/§54/§57):
@@ -172,6 +194,32 @@ impl SafetySupervisor {
                 if l.pl2_w < l.pl1_w {
                     return Err(ControlError::UnsafeRequest {
                         reason: format!("PL2 {}W < PL1 {}W", l.pl2_w, l.pl1_w),
+                    });
+                }
+                // R4-symmetry (2026-09 audit): the 0x610 telemetry channel is
+                // not just verification — it is also the BASELINE source for
+                // the shutdown restore, and 8BAB has no 0x29 clawback (M3).
+                // A blind write could never be honestly restored, so the
+                // freshness gate mirrors the manual-fan R4 rule.
+                match feed.power_limits_w() {
+                    Some((_, _, at)) if at.elapsed() <= PREWRITE_TEMP_FRESH => {}
+                    _ => {
+                        return Err(ControlError::UnsafeRequest {
+                            reason: "no fresh MSR 0x610 power-limit readback (≤5s); \
+                                     refusing blind 0x29 write"
+                                .into(),
+                        });
+                    }
+                }
+                // Byte2 (PL4) is judged ONLY through the MCHBAR 0x59B0
+                // channel; without it the write is unverifiable by
+                // construction — reject pre-write instead of landing a
+                // guaranteed-Failed write on the hardware.
+                if l.pl4_w != 0 && feed.pl4_w().is_none() {
+                    return Err(ControlError::UnsafeRequest {
+                        reason: "PL4 write requested but the MCHBAR 0x59B0 readback channel \
+                                 is absent; refusing unverifiable 0x29 byte2 write"
+                            .into(),
                     });
                 }
                 Ok(())
@@ -254,6 +302,18 @@ impl SafetySupervisor {
                 // before the manual write. The thermal override is checked
                 // above, so this direct transition cannot bypass the safety
                 // layer's forced-max state.
+                if levels.is_auto() {
+                    // {0,0} on the 0x2E wire is the FIRMWARE HANDOFF, not
+                    // "manual 0 RPM" (M7). Stamping it Manual would make the
+                    // keep-alive re-assert a firmware-auto state forever —
+                    // pure heartbeat noise hiding a semantic lie. The escape
+                    // hatch already exists: FirmwareAuto.
+                    return Err(ControlError::UnsafeRequest {
+                        reason: "manual levels {0,0} are the firmware handoff on 8BAB; \
+                                 use FanMode::FirmwareAuto instead"
+                            .into(),
+                    });
+                }
                 self.validate_fan_levels(*levels, caps)?;
                 // R4: never fly blind. The hysteresis net depends on fresh
                 // temperature; without it manual fan is unsafe by definition.
@@ -399,7 +459,9 @@ impl SafetySupervisor {
         caps: &CapabilitySet,
     ) -> Result<(), ControlError> {
         if levels.is_auto() {
-            // Manual(AUTO) is just FirmwareAuto with extra steps; harmless.
+            // Both-zero is the firmware handoff. The Manual command arm and
+            // FanCurve::validate reject zeros before reaching here; accepting
+            // it here is defense in depth for internal callers only.
             return Ok(());
         }
         let (Some(lo), Some(hi)) = (caps.fan.clamp_min, caps.fan.clamp_max) else {
@@ -410,7 +472,18 @@ impl SafetySupervisor {
         };
         for (channel, v) in [("left", levels.left), ("right", levels.right)] {
             if v == 0 {
-                continue; // 0 = leave that channel on firmware auto
+                // A single zero channel has NO verified wire semantics on
+                // 8BAB (one fan firmware-auto while the other is manual?).
+                // The CLI rejects mixed-zero client-side; reject it here too
+                // so a hand-written TOML profile cannot sneak it past the
+                // safety layer (fail closed, AR-11).
+                return Err(ControlError::UnsafeRequest {
+                    reason: format!(
+                        "{channel} fan level 0 while the other channel is set: \
+                         single-channel auto is unverified on 8BAB \
+                         (only both-zero = firmware handoff is meaningful)"
+                    ),
+                });
             }
             if v < lo || v > hi {
                 return Err(ControlError::UnsafeRequest {
@@ -468,24 +541,39 @@ impl SafetySupervisor {
 
         // Hysteresis release.
         if let Some(saved) = self.override_saved {
+            let cpu_fresh = feed
+                .pkg_temp_c()
+                .filter(|(_, at)| now.duration_since(*at) <= PREWRITE_TEMP_FRESH);
+            let gpu_fresh = feed
+                .gpu_temp_c()
+                .filter(|(_, at)| now.duration_since(*at) <= PREWRITE_TEMP_FRESH);
+            // The GPU joins the release gate as a SECOND constraint only:
+            // no provider at all → no constraint (GPU-less operation is
+            // supported); a present-but-stale GPU sample BLOCKS the
+            // release — handing the fans back while blind about a
+            // known-present heat source is what the freshness gates exist
+            // to prevent. (FirmwareAuto stays the always-allowed escape.)
+            let gpu_clear = match feed.gpu_temp_c() {
+                None => true,
+                Some(_) => gpu_fresh.is_some_and(|(t, _)| t <= RELEASE_MAX_FAN_AT_C),
+            };
             // A release is a write to the fan controller too.  The 90 s
             // watchdog window is intentionally much looser than this gate;
             // handing control back to a curve with a stale temperature could
             // immediately remove the only known thermal protection.
-            if let Some((t, at)) = feed.pkg_temp_c()
-                && now.duration_since(at) <= PREWRITE_TEMP_FRESH
+            if let Some((t, _)) = cpu_fresh
                 && t <= RELEASE_MAX_FAN_AT_C
+                && gpu_clear
             {
                 self.override_saved = None;
                 return Some(SafetyAction::ReleaseTo(saved));
             }
 
             // A failed max-fan write must not be a one-shot event.  Keep
-            // retrying while the temperature is fresh and hot; the
+            // retrying while EITHER temperature is fresh and hot; the
             // coordinator reports the failed write but remains fail-safe.
-            if let Some((t, at)) = feed.pkg_temp_c()
-                && now.duration_since(at) <= PREWRITE_TEMP_FRESH
-                && t >= FORCE_MAX_FAN_AT_C
+            if (cpu_fresh.is_some_and(|(t, _)| t >= FORCE_MAX_FAN_AT_C)
+                || gpu_fresh.is_some_and(|(t, _)| t >= FORCE_MAX_FAN_AT_C))
                 && observed.max_fan.value() != Some(&true)
             {
                 return Some(SafetyAction::ForceMaxFan);
@@ -493,14 +581,20 @@ impl SafetySupervisor {
             return None;
         }
 
-        // Hysteresis engage (only while the user holds the fans).
+        // Hysteresis engage (only while the user holds the fans). Either a
+        // fresh CPU or a fresh GPU sample at the ceiling trips it; a
+        // missing/stale GPU sample never trips on its own (degrades to the
+        // M2 CPU-only behavior).
+        let hot = |sample: Option<(f64, Instant)>| {
+            sample.is_some_and(|(t, at)| {
+                now.duration_since(at) <= SENSOR_STALE_AFTER && t >= FORCE_MAX_FAN_AT_C
+            })
+        };
         if (matches!(
             observed.fan_mode.value(),
             Some(FanMode::Manual(_) | FanMode::Curve(_))
         ) || matches!(observed.max_fan.value(), Some(true)))
-            && let Some((t, at)) = feed.pkg_temp_c()
-            && now.duration_since(at) <= SENSOR_STALE_AFTER
-            && t >= FORCE_MAX_FAN_AT_C
+            && (hot(feed.pkg_temp_c()) || hot(feed.gpu_temp_c()))
         {
             let current = observed
                 .fan_mode
@@ -540,6 +634,9 @@ mod tests {
     struct FakeFeed {
         temp: Option<(f64, Instant)>,
         fans: Option<(FanLevels, Instant)>,
+        power: Option<(f64, f64, Instant)>,
+        pl4: Option<(f64, Instant)>,
+        gpu: Option<(f64, Instant)>,
     }
 
     impl FakeFeed {
@@ -547,6 +644,9 @@ mod tests {
             Self {
                 temp: Some((temp_c, Instant::now())),
                 fans: Some((FanLevels::new(30, 30), Instant::now())),
+                power: Some((55.0, 130.0, Instant::now())),
+                pl4: Some((200.0, Instant::now())),
+                gpu: Some((65.0, Instant::now())),
             }
         }
         fn stale() -> Self {
@@ -554,6 +654,9 @@ mod tests {
             Self {
                 temp: Some((70.0, old)),
                 fans: Some((FanLevels::new(30, 30), old)),
+                power: Some((55.0, 130.0, old)),
+                pl4: Some((200.0, old)),
+                gpu: Some((65.0, old)),
             }
         }
     }
@@ -562,11 +665,17 @@ mod tests {
         fn pkg_temp_c(&self) -> Option<(f64, Instant)> {
             self.temp
         }
+        fn gpu_temp_c(&self) -> Option<(f64, Instant)> {
+            self.gpu
+        }
         fn fan_levels(&self) -> Option<(FanLevels, Instant)> {
             self.fans
         }
         fn power_limits_w(&self) -> Option<(f64, f64, Instant)> {
-            Some((55.0, 130.0, Instant::now()))
+            self.power
+        }
+        fn pl4_w(&self) -> Option<(f64, Instant)> {
+            self.pl4
         }
     }
 
@@ -973,6 +1082,63 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "experimental-hp-power-limits")]
+    #[test]
+    fn power_limits_blind_write_rejected() {
+        // 2026-09 audit: the 0x610 telemetry channel is also the restore
+        // BASELINE source, and 8BAB has no 0x29 clawback — a blind write
+        // would be unrestorable. Missing or stale feed → rejected,
+        // mirroring the manual-fan R4 freshness gate.
+        let s = SafetySupervisor::new();
+        let mut caps = caps_full();
+        caps.power_limits = Support::Experimental;
+        let o = ObservedState::default();
+        let mut feed = FakeFeed::fresh(70.0);
+        feed.power = None;
+        let e = s
+            .validate(
+                &ControlCommand::SetPowerLimits(pl(45, 90)),
+                &caps,
+                &feed,
+                &o,
+            )
+            .unwrap_err();
+        assert!(matches!(e, ControlError::UnsafeRequest { .. }));
+        feed.power = Some((55.0, 130.0, Instant::now() - Duration::from_secs(10)));
+        let e = s
+            .validate(
+                &ControlCommand::SetPowerLimits(pl(45, 90)),
+                &caps,
+                &feed,
+                &o,
+            )
+            .unwrap_err();
+        assert!(matches!(e, ControlError::UnsafeRequest { .. }));
+    }
+
+    #[cfg(feature = "experimental-hp-power-limits")]
+    #[test]
+    fn pl4_write_requires_mchbar_channel() {
+        // 2026-09 audit: 0x29 byte2 is judged only via the MCHBAR 0x59B0
+        // channel; without it a pl4 write is unverifiable by construction
+        // and must be rejected pre-write.
+        let s = SafetySupervisor::new();
+        let mut caps = caps_full();
+        caps.power_limits = Support::Experimental;
+        let o = ObservedState::default();
+        let mut l = pl(45, 90);
+        l.pl4_w = 150;
+        let mut feed = FakeFeed::fresh(70.0);
+        feed.pl4 = None;
+        let e = s
+            .validate(&ControlCommand::SetPowerLimits(l), &caps, &feed, &o)
+            .unwrap_err();
+        assert!(matches!(e, ControlError::UnsafeRequest { .. }));
+        feed.pl4 = Some((200.0, Instant::now()));
+        s.validate(&ControlCommand::SetPowerLimits(l), &caps, &feed, &o)
+            .unwrap();
+    }
+
     #[test]
     fn unelevated_ppm_write_denied() {
         let s = SafetySupervisor::new();
@@ -1168,12 +1334,51 @@ mod tests {
         let feed = FakeFeed {
             temp: Some((70.0, Instant::now() - Duration::from_secs(10))),
             fans: None,
+            power: None,
+            pl4: None,
+            gpu: None,
         };
         let e = s
             .validate(
                 &ControlCommand::SetFanMode(FanMode::Manual(FanLevels::new(30, 30))),
                 &caps_full(),
                 &feed,
+                &ObservedState::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(e, ControlError::UnsafeRequest { .. }));
+    }
+
+    #[test]
+    fn manual_fan_mixed_zero_rejected() {
+        // Single-channel zero has no verified wire semantics on 8BAB; the
+        // CLI rejects it client-side and the safety layer must too, so a
+        // TOML profile cannot bypass the rule (2026-09 audit).
+        let s = SafetySupervisor::new();
+        for bad in [FanLevels::new(0, 30), FanLevels::new(30, 0)] {
+            let e = s
+                .validate(
+                    &ControlCommand::SetFanMode(FanMode::Manual(bad)),
+                    &caps_full(),
+                    &FakeFeed::fresh(70.0),
+                    &ObservedState::default(),
+                )
+                .unwrap_err();
+            assert!(matches!(e, ControlError::UnsafeRequest { .. }));
+        }
+    }
+
+    #[test]
+    fn manual_fan_auto_levels_redirected_to_firmware_auto() {
+        // Manual({0,0}) is the firmware handoff on the wire (M7) — as a
+        // user command it would only produce a noise heartbeat. Rejected
+        // with a pointer to the real escape hatch (2026-09 audit).
+        let s = SafetySupervisor::new();
+        let e = s
+            .validate(
+                &ControlCommand::SetFanMode(FanMode::Manual(FanLevels::AUTO)),
+                &caps_full(),
+                &FakeFeed::fresh(70.0),
                 &ObservedState::default(),
             )
             .unwrap_err();
@@ -1328,6 +1533,9 @@ mod tests {
         let feed = FakeFeed {
             temp: Some((80.0, old)),
             fans: Some((FanLevels::new(20, 20), old)),
+            power: None,
+            pl4: None,
+            gpu: None,
         };
         assert_eq!(s.evaluate(&feed, &o, now), None);
         assert!(s.override_active());
@@ -1358,6 +1566,75 @@ mod tests {
                 Instant::now()
             ),
             None
+        );
+    }
+
+    // ---- evaluate: GPU temperature in the hysteresis (2026-09) ----
+
+    #[test]
+    fn gpu_temp_alone_engages_and_co_latches_the_override() {
+        let mut s = SafetySupervisor::new();
+        let o = observed_manual(FanLevels::new(20, 20));
+        // CPU cool, GPU at the ceiling → engage.
+        let mut feed = FakeFeed::fresh(70.0);
+        feed.gpu = Some((92.0, Instant::now()));
+        assert_eq!(
+            s.evaluate(&feed, &o, Instant::now()),
+            Some(SafetyAction::ForceMaxFan)
+        );
+        assert!(s.override_active());
+        // CPU cool, GPU still above release → latched.
+        feed.gpu = Some((86.0, Instant::now()));
+        assert_eq!(s.evaluate(&feed, &o, Instant::now()), None);
+        // Both at/below release → hand the saved mode back.
+        feed.gpu = Some((85.0, Instant::now()));
+        assert_eq!(
+            s.evaluate(&feed, &o, Instant::now()),
+            Some(SafetyAction::ReleaseTo(FanMode::Manual(FanLevels::new(
+                20, 20
+            ))))
+        );
+    }
+
+    #[test]
+    fn stale_gpu_sample_blocks_the_release() {
+        let mut s = SafetySupervisor::new();
+        let o = observed_manual(FanLevels::new(20, 20));
+        let mut feed = FakeFeed::fresh(70.0);
+        feed.gpu = Some((92.0, Instant::now()));
+        assert_eq!(
+            s.evaluate(&feed, &o, Instant::now()),
+            Some(SafetyAction::ForceMaxFan)
+        );
+        // CPU cool and fresh, but the GPU sample froze: stay at max fan —
+        // releasing while blind about a known-present heat source is what
+        // the freshness gates exist to prevent.
+        feed.gpu = Some((
+            92.0,
+            Instant::now() - PREWRITE_TEMP_FRESH - Duration::from_secs(1),
+        ));
+        assert_eq!(s.evaluate(&feed, &o, Instant::now()), None);
+        assert!(s.override_active());
+    }
+
+    #[test]
+    fn absent_gpu_provider_is_never_a_constraint() {
+        // No GPU provider at all: the CPU-only M2 behavior applies — engage
+        // on CPU, release on CPU.
+        let mut s = SafetySupervisor::new();
+        let o = observed_manual(FanLevels::new(20, 20));
+        let mut feed = FakeFeed::fresh(90.0);
+        feed.gpu = None;
+        assert_eq!(
+            s.evaluate(&feed, &o, Instant::now()),
+            Some(SafetyAction::ForceMaxFan)
+        );
+        feed.temp = Some((85.0, Instant::now()));
+        assert_eq!(
+            s.evaluate(&feed, &o, Instant::now()),
+            Some(SafetyAction::ReleaseTo(FanMode::Manual(FanLevels::new(
+                20, 20
+            ))))
         );
     }
 

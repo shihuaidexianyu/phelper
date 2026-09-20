@@ -31,6 +31,11 @@ pub trait HpPlatform: Send {
     fn fan_table(&self) -> Result<FanTable, HpWmiError>;
     /// 0x2D current fan levels (100-RPM units on V1).
     fn fan_levels(&self) -> Result<FanLevels, HpWmiError>;
+    /// Original sample time, preserved when the actor shares its 1 Hz cache.
+    fn fan_levels_sample(&self) -> Result<(FanLevels, std::time::Instant), HpWmiError> {
+        self.fan_levels()
+            .map(|levels| (levels, std::time::Instant::now()))
+    }
     /// 0x21 GPU platform policy read.
     fn gpu_platform_policy(&self) -> Result<GpuPlatformPolicy, HpWmiError>;
     /// 0x52 MUX read (command group 0x01).
@@ -70,6 +75,10 @@ pub trait PowerStatus: Send {
 /// (Tier A); every method maps to exactly one typed firmware op — no raw
 /// payload channel exists (§50).
 pub trait HpControl: Send {
+    /// Experimental legacy 0x52 request; effect must be checked after reboot.
+    fn set_mux_mode(&self, _mode: MuxMode) -> Result<(), HpWmiError> {
+        Err(HpWmiError::NotAvailable("MUX write backend"))
+    }
     /// 0x1A thermal mode set, payload `{0xFF, mode}` (V1: 0x30/0x31),
     /// outsize=0 (hp-wmi.c `HPWMI_SET_PERFORMANCE_MODE` via HPWMI_GM).
     fn set_thermal_mode(&self, mode: ThermalMode) -> Result<(), HpWmiError>;
@@ -88,12 +97,13 @@ pub trait HpControl: Send {
         &self,
         p: crate::policy::GpuPlatformPolicy,
     ) -> Result<(), HpWmiError>;
-    /// 0x29 CPU power limits (PL1/PL2). On 8BAB the wire order is
-    /// `{PL2, PL1, 0xFF, 0xFF}` (S2-arbitrated 2026-08-26 — NOT the kernel
-    /// struct order). pl4/cc are not writable yet: implementations reject
-    /// nonzero `pl4_w`/`cpu_gpu_concurrent_w` (0 = NO_CHANGE). AUTHORIZATION
-    /// (Experimental caps + cargo feature) lives in the safety layer —
-    /// domain traits carry no cargo-feature gates.
+    /// 0x29 CPU power limits. On 8BAB the wire order is
+    /// `{PL2, PL1, PL4, 0xFF}` (S2-arbitrated 2026-08-26 — NOT the kernel
+    /// struct order). Since M4.1, byte2 = `pl4_w` is writable (0 = NO_CHANGE,
+    /// verified via the MCHBAR 0x59B0 readback channel); `cpu_gpu_concurrent_w`
+    /// (byte3) remains permanently rejected — its firmware behavior is
+    /// uncharacterized. AUTHORIZATION (Experimental caps + cargo feature)
+    /// lives in the safety layer — domain traits carry no cargo-feature gates.
     fn set_power_limits(&self, l: crate::policy::CpuPowerLimits) -> Result<(), HpWmiError>;
 }
 

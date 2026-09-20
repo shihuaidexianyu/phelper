@@ -26,7 +26,7 @@ use phelper_domain::error::PlatformError;
 use phelper_domain::ports::GpuTelemetry;
 use phelper_domain::telemetry::{GpuSample, ProviderStatus};
 use tracing::debug;
-use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Foundation::{FreeLibrary, HMODULE};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::core::PCWSTR;
 
@@ -239,7 +239,10 @@ impl Nvml {
             let lib = LoadLibraryW(PCWSTR(
                 "nvml.dll\0".encode_utf16().collect::<Vec<u16>>().as_ptr(),
             ))
-            .map_err(|_| PlatformError::NotAvailable("nvml.dll not found"))?;
+            // Name the actual failing step: this is the LoadLibraryW call,
+            // and its failure is not necessarily "not found" (wrong arch,
+            // missing dependency, or DllMain failure surface identically).
+            .map_err(|_| PlatformError::NotAvailable("nvml.dll load failed"))?;
             macro_rules! g {
                 ($name:literal) => {{ GetProcAddress(lib, windows::core::s!($name)).map(|p| std::mem::transmute(p)) }};
             }
@@ -250,10 +253,17 @@ impl Nvml {
                 get_power_usage: g!("nvmlDeviceGetPowerUsage"),
                 get_enforced_power_limit: g!("nvmlDeviceGetEnforcedPowerLimit"),
             };
-            let init = nvml
-                .init
-                .ok_or(PlatformError::NotAvailable("nvmlInit_v2 missing"))?;
+            let Some(init) = nvml.init else {
+                // LoadLibraryW succeeded above, so release the module handle
+                // on every error path from here on. nvmlInit was never
+                // called, so no nvmlShutdown is owed.
+                let _ = FreeLibrary(lib);
+                return Err(PlatformError::NotAvailable("nvmlInit_v2 missing"));
+            };
             if init() != 0 {
+                // nvmlInit failed → nothing was initialized, so no
+                // nvmlShutdown; still release the module handle.
+                let _ = FreeLibrary(lib);
                 return Err(PlatformError::Driver("nvmlInit failed".into()));
             }
             Ok(nvml)
@@ -357,8 +367,14 @@ impl NvApi {
             })?;
 
             let query: QueryInterface = {
-                let p = GetProcAddress(lib, windows::core::s!("nvapi_QueryInterface"))
-                    .ok_or(PlatformError::NotAvailable("nvapi_QueryInterface missing"))?;
+                let p = GetProcAddress(lib, windows::core::s!("nvapi_QueryInterface"));
+                let Some(p) = p else {
+                    // LoadLibraryW succeeded, so release the module handle
+                    // on every error path from here on (same rule as the
+                    // NVML loader above).
+                    let _ = FreeLibrary(lib);
+                    return Err(PlatformError::NotAvailable("nvapi_QueryInterface missing"));
+                };
                 std::mem::transmute(p)
             };
 
@@ -387,11 +403,15 @@ impl NvApi {
                 client_power_topology_get_status: q!(ID_CLIENT_POWER_TOPOLOGY_GET_STATUS),
             };
 
-            let init = api
-                .initialize
-                .ok_or(PlatformError::NotAvailable("NvAPI_Initialize missing"))?;
+            let Some(init) = api.initialize else {
+                let _ = FreeLibrary(lib);
+                return Err(PlatformError::NotAvailable("NvAPI_Initialize missing"));
+            };
             let rc = init();
             if rc != NVAPI_GENERIC_OK {
+                // Init failed → nothing to uninitialize; still release the
+                // module handle.
+                let _ = FreeLibrary(lib);
                 return Err(PlatformError::Driver(format!("NvAPI_Initialize rc={rc}")));
             }
             Ok(api)
@@ -592,7 +612,7 @@ impl GpuTelemetry for NvidiaGpu {
                 None => (None, None),
             },
         };
-        let mut s = GpuSample {
+        let s = GpuSample {
             temp_c: self.thermal(),
             power_w,
             power_source,
@@ -607,15 +627,18 @@ impl GpuTelemetry for NvidiaGpu {
             power_limit_w: self.nvml.as_ref().and_then(|n| n.power_limit_w()),
         };
         if s.temp_c.is_none() && s.util_percent.is_none() {
-            self.degraded.push("thermal+util both unreadable".into());
+            // Overwrite, don't accumulate: `degraded` is the CURRENT round's
+            // status, matching WindowsPdh's per-sample reset semantics. A
+            // historical ledger of every failure would keep the provider
+            // Degraded forever after one transient blip.
+            self.degraded = vec!["thermal+util both unreadable".into()];
             return Err(PlatformError::Driver("NVAPI sample empty".into()));
         }
-        if s.power_w.is_none() {
-            // Known on this machine when the dGPU is in deep sleep AND the
-            // only working source (NVML) is momentarily unreadable — the
-            // collector marks the metric, never fails the provider.
-            s.power_w = None;
-        }
+        // A missing power_w alone is NOT a degradation: on this machine the
+        // dGPU in deep sleep makes the only working source (NVML) briefly
+        // unreadable — the collector publishes the gap through the metric's
+        // absence, never through the provider status.
+        self.degraded.clear();
         Ok(s)
     }
 

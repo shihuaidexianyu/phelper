@@ -65,6 +65,44 @@ pub fn write_text(path: &std::path::Path, text: &str) -> Result<(), EngineError>
         .map_err(|e| EngineError::Persistence(format!("write {}: {e}", path.display())))
 }
 
+/// Flush a complete replacement before atomically publishing it. A crash
+/// leaves either the previous record or the complete new record.
+pub fn write_atomic(path: &std::path::Path, text: &str) -> Result<(), EngineError> {
+    use std::io::Write;
+    let result = (|| -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows::Win32::Storage::FileSystem::{
+                MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+            };
+            use windows::core::PCWSTR;
+            let source: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+            let target: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            unsafe {
+                MoveFileExW(
+                    PCWSTR(source.as_ptr()),
+                    PCWSTR(target.as_ptr()),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+                .map_err(std::io::Error::other)?;
+            }
+        }
+        #[cfg(not(windows))]
+        std::fs::rename(temp, path)?;
+        Ok(())
+    })();
+    result.map_err(|e| EngineError::Persistence(format!("atomic write {}: {e}", path.display())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
