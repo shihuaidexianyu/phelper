@@ -55,7 +55,20 @@ impl HardwareStatus {
                 .and_then(|rows| rows.into_iter().next())
                 .map(|row| row.status);
         }
-        result.notes.push("UVP 与电压偏移尚无经过验证的读取接口；降压、CPU/内存超频与充电上限的硬件支持均未确定。".into());
+        // 2026-09-22 实测结论（hpqBIntM Gaming 0x20008 与 LegacyRead 0x1 两
+        // 组 commandtype 0x00–0x5F 只读全扫，证据见 ogh-milestones.md 当日
+        // 记录）：
+        // - 电池充电上限：两组命令空间均无阈值接口；Linux 主线 hp-wmi 亦无
+        //   实现（TLP 电池阈值支持列表不含 HP）→ 本机固件不支持，已从
+        //   "未确定"升级为"已探测不存在"。
+        // - 内存超频：同一扫描无任何内存相关命令 → 本机固件未暴露。
+        // - CPU 降压/超频：XTU3SERVICE 与 HPOmenCap 在运行（OEM 驱动栈在
+        //   位），但 VBS 正在运行，Intel 文档将其列为运行时降压限制条件 →
+        //   后端存在、可用性受阻，仍属 §57 五阶段调研范围。
+        // 附带发现：LegacyRead 0x07 电池信息查询真实可用（电芯电压/组电压
+        // 12.756V/序列号 1963 与 powercfg 报告对照一致，0x10 返回制造日期
+        // 20230226）——登记 backlog，完整字段解码需另行交叉验证。
+        result.notes.push("电池充电上限与内存超频：本机固件未暴露接口（hpqBIntM 两组命令空间 0x00–0x5F 已实测）。CPU 降压/超频：XTU 服务在运行，但本机 VBS 已激活，Intel 将其列为降压限制条件；待 v0.4.0 立项。".into());
         result
     }
 }

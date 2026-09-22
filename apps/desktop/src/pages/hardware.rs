@@ -46,12 +46,12 @@ pub fn render(state: &AppState, app: &AppHandle, cx: &mut Context<ShellView>) ->
             state.hardware.xtu_service_running.map_or("未知", |v| if v { "是" } else { "否" }),
             if state.hardware.oem_intel_sdk.is_some() { "已发现" } else { "未发现" },
             match state.hardware.vbs_status { Some(0) => "未启用", Some(1) => "已启用但未运行", Some(2) => "正在运行", _ => "未知" })))
-        .child(div().text_sm().text_color(theme.muted_foreground).child("已安装的服务与 SDK 文件不足以确认降压可用；电压读回、UVP 状态、恢复机制和接口使用条件仍需核验。"));
+        .child(div().text_sm().text_color(theme.muted_foreground).child("以下能力按 2026-09-22 实机探测结论披露（hpqBIntM 两条命令空间只读全扫）；证据记录见 ogh-milestones.md。"));
     for (name, reason) in [
-        ("CPU 降压", "应用后端未接通；固件支持未确定"),
-        ("CPU 超频", "应用后端未接通；与 Windows 睿频策略独立"),
-        ("内存超频", "应用后端未接通；尚未验证本机 BIOS 接口"),
-        ("电池充电上限", "应用后端未接通；尚未验证本机固件接口"),
+        ("CPU 降压", "XTU 服务在运行，但本机 VBS 已激活（Intel 列为降压限制条件）；待 v0.4.0 立项"),
+        ("CPU 超频", "与降压同走 XTU/OC 通道；实用部分已由功耗墙（EXPERIMENTAL）覆盖"),
+        ("内存超频", "已实测：固件两条命令空间（0x00–0x5F）未暴露任何内存超频接口"),
+        ("电池充电上限", "已实测：固件无此接口（Linux hp-wmi 亦无实现，TLP 支持列表不含 HP）"),
     ] {
         content = content.child(div().text_sm().child(format!("{name}：{reason}")));
     }

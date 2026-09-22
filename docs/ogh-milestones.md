@@ -136,3 +136,40 @@ journal 完整转存 `.1.jsonl`（rename 保留原 mtime）；随后一次幂等
 0x22（startup 值）→ 0x1A balanced，四步全部 accepted，总耗时 1070 ms；
 recovery 账本义务清零；退出后 0x21 读回 ctgp=false/ppab=false/dstate=1 与
 startup 捕获值一致。
+
+## 2026-09-22 硬件页四项"未接通"能力探测轮（电池充电上限/内存超频/CPU 降压·超频）
+
+背景：硬件页"降压与超频"区块四项 UI 披露为"应用后端未接通；尚未验证"。
+本轮以只读探测将其升级为实测结论（探测先行，§57 纪律）。
+
+**命令空间全扫（两条组，只读形态，空 payload / Size=0）**：
+- Gaming 组（Command=0x20008）commandtype 0x00–0x5F：参照 0x10（风扇数 2）、
+  0x2D（37/40 档）、0x21（GPU 策略与退出后 startup 值一致）全部验证通道
+  正确后全扫。0x02–0x09/0x0b/0x0e–0x19/0x1b–0x20/0x24–0x25/0x30–0x34 返回
+  rc=0 + 全零（命令受理但无实现）；0x38–0x5F rc=3（无效命令）；0x0c–0x0d/
+  0x23/0x35–0x37 CIM 层常规故障。**无任何电池充电阈值或内存超频命令。**
+- LegacyRead 组（Command=0x1）0x00–0x5F + 对 rc=4/5/6 命令的 1B/4B 输入
+  重试：0x52 MUX 参照通过；**0x07（Linux HPWMI_BATTERY_QUERY）带 1 字节
+  输入返回 86 字节真实电池数据**；0x10 返回 ASCII "20230226"（制造日期）。
+  同样**无充电阈值接口**。
+- 交叉佐证：Linux 主线 hp-wmi.c 无电池阈值实现（BATTERY 枚举为死项）；
+  TLP 电池阈值支持列表不含 HP。此前搜索所得"Ubuntu battery_charging_
+  thresholds"一说出自 AI 内容农场，不足为据。
+
+**意外收获（LegacyRead 0x07/0x10 电池信息，登记 backlog）**：0x07 数据与
+`powercfg /batteryreport` 对照——序列号 1963 ↔ 数据内 ASCII "0196…" ✓；
+`95 10 a0 10 9e 10` = 4245/4256/4254 mV 三节电芯电压、`d4 31` = 12756 mV
+组电压（3S×4.25 V）✓；0x10 制造日期 2023-02-26（Windows 报告该字段为空，
+固件通道更全）。完整字段解码需另行交叉验证，暂不进稳定路径。
+
+**降压/超频环境实测**：XTU3SERVICE 与 HPOmenCap 均在运行（OEM 驱动栈在位，
+为 OGH 残留）；但 VBS 正在运行（Win32_DeviceGuard Status=2，
+SecurityServices={2}）——Intel 文档列为运行时降压限制条件。CPU 降压/超频
+路径存在但可用性受阻，维持 v0.4.0 §57 立项范围。
+
+**结论落码**：`hardware_status.rs` notes 与硬件页 UI 披露文案已从"尚未
+验证"升级为实测结论（电池充电上限/内存超频=固件未暴露；降压/超频=XTU
+在位但 VBS 受限）。core+control 177 测试通过，desktop 构建通过。
+证据：`probe-out/hp-cmd-scan.txt`（Gaming 组）、`hp-cmd-scan-legacy.txt`
+（LegacyRead 组）、`hp-battery-retry.txt`（输入重试）、`battery-report.xml`
+（字段对照）。
