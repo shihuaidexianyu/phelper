@@ -101,4 +101,38 @@ MUX 开发工具：`cargo build --release -p phelper-cli --features experimental
 - 发布版只读 UI：检查概览、性能编辑/载入/滚动、自动切换、测量/诊断、硬件页；成功从界面导出并解析诊断 JSON（主板 8BAB、BIOS F.30、30 项遥测条目）。
 - 诊断导出的后续版本也已检查：控制日志尾部为 100 条。只读关闭复测进程约 55 ms 退出，Engine 清理约 10 ms，未再出现先销毁窗口造成的 GPUI 句柄错误。这次运行没有可用的 HP/PawnIO 控制后端，不能代表真实硬件恢复耗时。
 - PresentMon 便携文件 SHA-256 与版本/参数检查通过；实际 ETW 会话被权限拒绝，未生成有效游戏帧时间实测报告。
-- 初始已有改动完整保留，开始前补丁另存于工作区之外；未提交或部署安装。
+- 初始已有改动完整保留，开始前补丁另存于工作区之外；未提交或部署。
+
+## 2026-09-22 W-A 会话 A 准备段记录
+
+被测 commit `3850ce0`。管理员会话（UAC 协助模式）；操作手册见
+[`v0.3.0-wa-runbook.md`](v0.3.0-wa-runbook.md)。
+
+**能力基线复测**：probe 与 30 s telemetry 自检均通过，与 v0.2.0 提权基线零
+回归（HP 域全 SUPPORTED、SDD V1/PL4=200W/MUX Hybrid、6 provider 全 ok、调度
+抖动 14–19 ms）。v0.3.0 的 ports.rs（heartbeat 拆分等）改动无实机影响。
+证据：`probe-out/wa-session-A-probe.txt`、`wa-session-A-telemetry30.txt`。
+
+**发现 A（严重，修复已实测）**：v0.2.0 的 journal append-time 轮转
+（copy + truncate）在 journal 跨过 8 MiB 后每次 `os error 5`，append 全部
+失败——`phelper-desktop.log` 累计 50,861 条 `journal append failed`。期间
+硬件写入本身全部成功（0x27/0x2E accepted），但 §56 证据丢失，含一次完整
+shutdown 恢复序列。失败链中对 append 模式句柄执行 `set_len(0)` 是首要嫌疑
+环节，未逐段归因（修复优先于归因）。v0.3.0 的统一路径（fsync→rename→
+reopen，`ef7eff9`）实测确认修复：open-time rotation 将 8,388,890 字节旧
+journal 完整转存 `.1.jsonl`（rename 保留原 mtime）；随后一次幂等 EPP 写入
+（AC/DC 0）落盘 674 字节完整 JSONL 条目，write→readback→Verified 97 ms。
+证据：`probe-out/wa-journal-fix-status.txt`、`wa-journal-fix-epp.txt`。
+断裂数据无法补录，本记录即为该窗口的替代证据。
+
+**发现 B（V7 素材）**：重负载（CPU avg 86.5 °C / max 100 °C）下安全层在
+`ForceMaxFan(≥90 °C)` 与 `ReleaseTo(Curve)(≤85 °C)` 之间以 2–4 s 周期振荡
+——曲线 85 °C 点位（55 档 = 5500 RPM）压制力不足以退出迟滞带。行为符合
+迟滞设计语义，但每次振荡伴随一对 0x27/0x2E 写；V7 soak 需评估安全释放与
+曲线求解之间是否加入最小保持时间。证据：`phelper-desktop.log`
+09:00:13Z–09:02:57Z（UTC）段。
+
+**账本与退出语义顺带确认**：托盘正常退出执行 0x27 off → 0x2E auto →
+0x22（startup 值）→ 0x1A balanced，四步全部 accepted，总耗时 1070 ms；
+recovery 账本义务清零；退出后 0x21 读回 ctgp=false/ppab=false/dstate=1 与
+startup 捕获值一致。
