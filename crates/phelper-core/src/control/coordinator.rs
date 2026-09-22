@@ -296,6 +296,22 @@ impl ControlHandle {
     }
 }
 
+/// One arm of the shared restore-and-verify path (`restore_hp_domain`, A3:
+/// replaces the two verbatim-duplicated restore blocks that previously
+/// lived inline in `restore_firmware_auto`).
+struct RestoreArm<'a, F>
+where
+    F: FnOnce() -> Result<(), HpWmiError>,
+{
+    steps: &'a mut Vec<StepOutcome>,
+    step: &'static str,
+    backend: &'static str,
+    write: F,
+    target: VerificationTarget,
+    after: Option<String>,
+    deadline: Instant,
+}
+
 pub(crate) struct ControlCoordinator<H, P, F> {
     rx: Receiver<ControlRequest>,
     caps: CapabilitySet,
@@ -2448,7 +2464,7 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
             return;
         }
 
-        let mut failed: Option<HpWmiError> = hp.fan_count().err();
+        let mut failed: Option<HpWmiError> = hp.heartbeat().err();
         if failed.is_none() {
             let observed = self.observed();
             for what in tracked {
@@ -2606,32 +2622,15 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 }
             }
             if restore_gpu && let Some(startup) = self.gpu_policy_startup {
-                match hp.set_gpu_platform_policy(startup) {
-                    Ok(()) => {
-                        let verification = self.verify_restoration(
-                            VerificationTarget::Gpu(startup, false),
-                            verify_deadline,
-                        );
-                        gpu_ok = verification == Verification::Verified;
-                        steps.push(StepOutcome {
-                            step: "restore gpu policy (startup value)".into(),
-                            backend: "hp-wmi 0x22".into(),
-                            firmware_return: Some("rc=0".into()),
-                            before: Some("restore".into()),
-                            after: None,
-                            verification,
-                        });
-                    }
-                    Err(e) => {
-                        gpu_ok = false;
-                        steps.push(failed_step(
-                            "restore gpu policy (startup value)",
-                            "hp-wmi 0x22",
-                            &e,
-                            "restore".into(),
-                        ));
-                    }
-                }
+                gpu_ok = self.restore_hp_domain(RestoreArm {
+                    steps: &mut steps,
+                    step: "restore gpu policy (startup value)",
+                    backend: "hp-wmi 0x22",
+                    write: || hp.set_gpu_platform_policy(startup),
+                    target: VerificationTarget::Gpu(startup, false),
+                    after: None,
+                    deadline: verify_deadline,
+                });
             }
             if restore_power && let Some((b1, b2, b4)) = self.power_limits_baseline {
                 let baseline = CpuPowerLimits {
@@ -2640,36 +2639,20 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                     pl4_w: b4,
                     cpu_gpu_concurrent_w: 0,
                 };
-                match hp.set_power_limits(baseline) {
-                    Ok(()) => {
-                        let verification = self.verify_restoration(
-                            VerificationTarget::Power(baseline),
-                            verify_deadline,
-                        );
-                        power_ok = verification == Verification::Verified;
-                        steps.push(StepOutcome {
-                            step: "restore power limits (captured baseline)".into(),
-                            backend: "hp-wmi 0x29".into(),
-                            firmware_return: Some("rc=0".into()),
-                            before: Some("restore".into()),
-                            after: Some(if b4 != 0 {
-                                format!("pl1={b1}W pl2={b2}W pl4={b4}W")
-                            } else {
-                                format!("pl1={b1}W pl2={b2}W (pl4 untouched)")
-                            }),
-                            verification,
-                        });
-                    }
-                    Err(e) => {
-                        power_ok = false;
-                        steps.push(failed_step(
-                            "restore power limits (captured baseline)",
-                            "hp-wmi 0x29",
-                            &e,
-                            "restore".into(),
-                        ));
-                    }
-                }
+                let after = Some(if b4 != 0 {
+                    format!("pl1={b1}W pl2={b2}W pl4={b4}W")
+                } else {
+                    format!("pl1={b1}W pl2={b2}W (pl4 untouched)")
+                });
+                power_ok = self.restore_hp_domain(RestoreArm {
+                    steps: &mut steps,
+                    step: "restore power limits (captured baseline)",
+                    backend: "hp-wmi 0x29",
+                    write: || hp.set_power_limits(baseline),
+                    target: VerificationTarget::Power(baseline),
+                    after,
+                    deadline: verify_deadline,
+                });
             }
             if restore_thermal {
                 match hp.set_thermal_mode(ThermalMode::Balanced) {
@@ -2975,6 +2958,38 @@ impl<H: HpBackend + 'static, P: CpuPolicyBackend + 'static, F: ThermalFeed + Sen
                 .as_ref()
                 .unwrap_or(&self.recovery_record()),
         )
+    }
+
+    /// One restore-and-verify arm for the two readback-verified HP domains
+    /// (0x22 GPU policy, 0x29 power limits). The two arms in
+    /// `restore_firmware_auto` previously repeated this 25-line shape
+    /// verbatim (2026-09 review A3) — the restore evidence and
+    /// verified-ok semantics now live in exactly one place.
+    #[must_use = "the ok flag feeds the restore ledger summary"]
+    fn restore_hp_domain<W>(&self, arm: RestoreArm<'_, W>) -> bool
+    where
+        W: FnOnce() -> Result<(), HpWmiError>,
+    {
+        match (arm.write)() {
+            Ok(()) => {
+                let verification = self.verify_restoration(arm.target, arm.deadline);
+                let ok = verification == Verification::Verified;
+                arm.steps.push(StepOutcome {
+                    step: arm.step.into(),
+                    backend: arm.backend.into(),
+                    firmware_return: Some("rc=0".into()),
+                    before: Some("restore".into()),
+                    after: arm.after,
+                    verification,
+                });
+                ok
+            }
+            Err(e) => {
+                arm.steps
+                    .push(failed_step(arm.step, arm.backend, &e, "restore".into()));
+                false
+            }
+        }
     }
 
     /// Synchronous restore verification on the control thread. `deadline`
@@ -3289,6 +3304,10 @@ mod tests {
                 return Ok(s.readback_script.remove(0));
             }
             Ok(s.readback_script.first().copied().unwrap_or(s.fan_levels))
+        }
+        fn fan_levels_sample(&self) -> Result<(FanLevels, std::time::Instant), HpWmiError> {
+            self.fan_levels()
+                .map(|levels| (levels, std::time::Instant::now()))
         }
         fn gpu_platform_policy(&self) -> Result<GpuPlatformPolicy, HpWmiError> {
             let s = self.state();

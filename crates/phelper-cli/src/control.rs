@@ -12,8 +12,7 @@
 //! PPM commands (epp / epp1 / max-freq / min-perf / max-perf / boost) are
 //! Windows-native settings: they persist across process exit and need no hold.
 
-use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
@@ -234,6 +233,12 @@ impl From<ThermalArg> for ThermalMode {
     }
 }
 
+/// clap value enum mirroring `BoostPolicy`. The orphan rule forbids
+/// `impl clap::ValueEnum for BoostPolicy` in this crate (neither the
+/// trait nor the type is local), so the mirror exists — but it is pinned
+/// to `BoostPolicy::ALL` by the test below: a domain variant added or
+/// reordered without updating this table fails the build, the drift the
+/// 2026-09 review flagged.
 #[derive(Clone, Copy, ValueEnum)]
 enum BoostArg {
     Disabled,
@@ -255,6 +260,30 @@ impl From<BoostArg> for BoostPolicy {
             BoostArg::EfficientAggressive => BoostPolicy::EfficientAggressive,
             BoostArg::AggressiveGuaranteed => BoostPolicy::AggressiveGuaranteed,
             BoostArg::EfficientAggressiveGuaranteed => BoostPolicy::EfficientAggressiveGuaranteed,
+        }
+    }
+}
+
+#[cfg(test)]
+mod boost_arg_tests {
+    use super::*;
+    use clap::ValueEnum;
+
+    /// The CLI mirror must cover the exact `BoostPolicy` variant set —
+    /// `BoostPolicy::ALL` (domain) is the single ordering source.
+    #[test]
+    fn boost_arg_covers_every_policy_variant() {
+        assert_eq!(
+            BoostArg::value_variants().len(),
+            BoostPolicy::ALL.len(),
+            "BoostArg no longer mirrors BoostPolicy — update the table"
+        );
+        for policy in BoostPolicy::ALL {
+            let arg = BoostArg::value_variants()
+                .iter()
+                .find(|v| Into::<BoostPolicy>::into(**v) == policy)
+                .unwrap_or_else(|| panic!("no BoostArg maps to {policy:?}"));
+            assert_eq!(Into::<BoostPolicy>::into(*arg), policy);
         }
     }
 }
@@ -633,17 +662,14 @@ fn run_hp_state(engine: Engine, cmd: ControlCommand, hold: u64) -> Result<()> {
 
 fn hold_loop(hold_secs: u64) -> Result<()> {
     let stop = ctrlc_flag()?;
-    let deadline = Instant::now() + Duration::from_secs(hold_secs);
     eprintln!("\nholding {hold_secs} s (KeepAlive heartbeat active; Ctrl+C = graceful restore)…");
-    while !stop.load(Ordering::Relaxed) {
-        let now = Instant::now();
-        if now >= deadline {
-            eprintln!("hold elapsed — restoring firmware auto");
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(200).min(deadline - now));
+    // plan() rejects hold == 0 before the engine ever starts, so the
+    // bounded variant is the only shape reachable here.
+    if crate::hold_bounded(&stop, hold_secs) {
+        eprintln!("Ctrl+C — restoring firmware auto");
+    } else {
+        eprintln!("hold elapsed — restoring firmware auto");
     }
-    eprintln!("Ctrl+C — restoring firmware auto");
     Ok(())
 }
 

@@ -442,7 +442,13 @@ mod imp {
             )?;
             commands::decode_fan_count(&buf)
         }
-
+        /// Direct transport (no shared cache): the sample time IS the call
+        /// time. The trait method exists precisely so the ACTOR's cached
+        /// variant cannot silently fall back to this behavior (A9-2).
+        fn fan_levels_sample(&self) -> Result<(FanLevels, std::time::Instant), HpWmiError> {
+            self.fan_levels()
+                .map(|levels| (levels, std::time::Instant::now()))
+        }
         fn system_design_data(&self) -> Result<SystemDesignData, HpWmiError> {
             let buf = self.raw_execute(
                 HpCommandGroup::Gaming,

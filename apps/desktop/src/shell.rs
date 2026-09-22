@@ -79,20 +79,7 @@ impl ShellView {
         // publisher is authoritative and provides a lock-backed snapshot.
         let app_state_sub = cx.observe(&app_state, |this, _, cx| {
             let next = this.app.state();
-            let control_changed = this.state.capture_running != next.capture_running
-                || this.state.capture_notice != next.capture_notice
-                || this.state.diagnostic_path != next.diagnostic_path
-                || this.state.capture_baseline.as_ref().map(|r| &r.json_path)
-                    != next.capture_baseline.as_ref().map(|r| &r.json_path)
-                || this.state.automation != next.automation
-                || this.state.engine != next.engine
-                || this.state.desired != next.desired
-                || this.state.observed != next.observed
-                || this.state.profile_status != next.profile_status
-                || this.state.knobs != next.knobs
-                || this.state.profiles != next.profiles
-                || this.state.profile_notice != next.profile_notice
-                || this.state.windows_ppm != next.windows_ppm;
+            let control_changed = this.state.control_changed(&next);
             let telemetry_due = matches!(this.page, PageId::Dashboard | PageId::Validation)
                 && this.last_telemetry_paint.elapsed() >= std::time::Duration::from_secs(1);
             this.state = next;

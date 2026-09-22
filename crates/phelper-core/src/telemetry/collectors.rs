@@ -23,6 +23,22 @@ pub(crate) trait Collector: Send {
     /// simply absent.
     fn collect(&mut self) -> Vec<MetricSample>;
     fn status(&self) -> ProviderStatus;
+    /// Whether this collector's worker must be pinned to logical processor
+    /// 0 (PawnIO: APERF/MPERF are per-core MSRs — same-core consecutive
+    /// reads only). A typed marker instead of a name-string match so a
+    /// rename can never silently break the pinning.
+    fn pins_core_zero(&self) -> bool {
+        false
+    }
+}
+
+/// Resolve a collector's cadence from the registry. Single expect point:
+/// the registry-consistency tests in `super::registry` make a missing
+/// entry a TEST failure long before this can panic in production.
+fn registered_cadence(id: phelper_domain::telemetry::MetricId) -> Duration {
+    registry::meta(id)
+        .expect("registry entry (guarded by registry-consistency tests)")
+        .cadence
 }
 
 fn fresh(
@@ -108,9 +124,11 @@ impl Collector for PawnioCollector {
     }
 
     fn cadence(&self) -> Duration {
-        registry::meta(ids::CPU_PKG_TEMP_C)
-            .expect("registry entry")
-            .cadence
+        registered_cadence(ids::CPU_PKG_TEMP_C)
+    }
+
+    fn pins_core_zero(&self) -> bool {
+        true
     }
 
     fn collect(&mut self) -> Vec<MetricSample> {
@@ -272,9 +290,7 @@ impl Collector for NvapiCollector {
     }
 
     fn cadence(&self) -> Duration {
-        registry::meta(ids::GPU_TEMP_C)
-            .expect("registry entry")
-            .cadence
+        registered_cadence(ids::GPU_TEMP_C)
     }
 
     fn collect(&mut self) -> Vec<MetricSample> {
@@ -362,9 +378,7 @@ impl Collector for PdhCollector {
     }
 
     fn cadence(&self) -> Duration {
-        registry::meta(ids::CPU_UTIL_PERCENT)
-            .expect("registry entry")
-            .cadence
+        registered_cadence(ids::CPU_UTIL_PERCENT)
     }
 
     fn collect(&mut self) -> Vec<MetricSample> {
@@ -425,9 +439,7 @@ impl Collector for BatteryCollector {
     }
 
     fn cadence(&self) -> Duration {
-        registry::meta(ids::POWER_AC_ONLINE)
-            .expect("registry entry")
-            .cadence
+        registered_cadence(ids::POWER_AC_ONLINE)
     }
 
     fn collect(&mut self) -> Vec<MetricSample> {
@@ -476,9 +488,7 @@ impl Collector for PpmCollector {
     }
 
     fn cadence(&self) -> Duration {
-        registry::meta(ids::CPU_EPP_AC)
-            .expect("registry entry")
-            .cadence
+        registered_cadence(ids::CPU_EPP_AC)
     }
 
     fn collect(&mut self) -> Vec<MetricSample> {
@@ -604,9 +614,7 @@ impl<H: HpPlatform + Sync> Collector for HpFanCollector<H> {
     }
 
     fn cadence(&self) -> Duration {
-        registry::meta(ids::FAN_LEFT_RPM)
-            .expect("registry entry")
-            .cadence
+        registered_cadence(ids::FAN_LEFT_RPM)
     }
 
     fn collect(&mut self) -> Vec<MetricSample> {
@@ -683,6 +691,10 @@ mod tests {
                 .expect("fake hp")
                 .pop_front()
                 .unwrap_or(Err(HpWmiError::NotAvailable("test")))
+        }
+        fn fan_levels_sample(&self) -> Result<(FanLevels, std::time::Instant), HpWmiError> {
+            self.fan_levels()
+                .map(|levels| (levels, std::time::Instant::now()))
         }
         fn gpu_platform_policy(&self) -> Result<GpuPlatformPolicy, HpWmiError> {
             Err(HpWmiError::NotAvailable("test"))

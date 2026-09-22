@@ -62,7 +62,7 @@ pub enum Verification {
     Skipped,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StepOutcome {
     pub step: String,
     pub backend: String,
@@ -78,7 +78,7 @@ pub struct StepOutcome {
     pub verification: Verification,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlStatus {
     Applied {
@@ -93,7 +93,7 @@ pub enum ControlStatus {
 
 /// Full record of one dispatched command (architecture.md section 48:
 /// every write is journaled with firmware return + verification + duration).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ControlOutcome {
     pub receipt: ControlReceipt,
     pub command: ControlCommand,

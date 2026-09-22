@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// What this machine is. Gathered once at startup (probe step 1).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceIdentity {
     pub manufacturer: String,
     /// DMI product name, e.g. "OMEN by HP Gaming Laptop 16-wf0xxx".
@@ -14,12 +14,12 @@ pub struct DeviceIdentity {
     pub gpu: Vec<GpuIdentity>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CpuIdentity {
     pub name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GpuIdentity {
     pub name: String,
 }

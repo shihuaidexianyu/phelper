@@ -286,7 +286,14 @@ pub fn run(args: OsPolicyArgs) -> Result<()> {
             // handler installation fails, no process/thread state has yet
             // been changed and therefore no restore obligation is lost.
             let stop = ctrlc_flag()?;
+            // §56 evidence shape: before (requested intent) / command /
+            // after (applied + restored) — the captured live baseline stays
+            // inside the handle's ledger, which the journal-side surface owns.
+            println!("--- BEFORE (requested intent) ---");
+            println!("target: {target:?}");
+            println!("policy: {policy:?}");
             let result = handle.apply(target, policy)?;
+            println!("\n--- COMMAND ---");
             println!(
                 "applied {:?} to {}",
                 result.target,
@@ -297,19 +304,13 @@ pub fn run(args: OsPolicyArgs) -> Result<()> {
             }
             if args.hold == 0 {
                 eprintln!("holding until Ctrl+C (policy will be restored on exit)…");
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(200));
-                }
+                crate::hold_until_ctrlc(&stop);
             } else {
                 eprintln!("holding {} s; Ctrl+C restores early…", args.hold);
-                let deadline = std::time::Instant::now() + Duration::from_secs(args.hold);
-                while !stop.load(std::sync::atomic::Ordering::Relaxed)
-                    && std::time::Instant::now() < deadline
-                {
-                    std::thread::sleep(Duration::from_millis(200));
-                }
+                crate::hold_bounded(&stop, args.hold);
             }
             handle.restore(target)?;
+            println!("\n--- AFTER ---");
             println!("restored");
             Ok(())
         }
@@ -327,16 +328,10 @@ pub fn run(args: OsPolicyArgs) -> Result<()> {
                     let stop = ctrlc_flag()?;
                     if args.hold == 0 {
                         eprintln!("holding BatteryEfficiency until Ctrl+C…");
-                        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                            std::thread::sleep(Duration::from_millis(200));
-                        }
+                        crate::hold_until_ctrlc(&stop);
                     } else {
-                        let deadline = std::time::Instant::now() + Duration::from_secs(args.hold);
-                        while !stop.load(std::sync::atomic::Ordering::Relaxed)
-                            && std::time::Instant::now() < deadline
-                        {
-                            std::thread::sleep(Duration::from_millis(200));
-                        }
+                        eprintln!("holding BatteryEfficiency {} s…", args.hold);
+                        crate::hold_bounded(&stop, args.hold);
                     }
                     print_automatic_status(&scheduler);
                 }

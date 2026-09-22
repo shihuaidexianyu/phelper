@@ -2,7 +2,7 @@
 //! Finding an OEM DLL is not permission or proof that its ABI is callable.
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HardwareStatus {
     pub xtu_service_running: Option<bool>,
     pub oem_intel_sdk: Option<String>,

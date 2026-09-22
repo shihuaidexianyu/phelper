@@ -198,11 +198,14 @@ impl TelemetryCoordinator {
             let notify = self.notifications.clone();
             let pending = Arc::clone(&pending);
             let name = collector.name();
+            // Typed pinning marker (a name-string match broke silently on
+            // rename — 2026-09 review). Captured before the move below.
+            let pin_core_zero = collector.pins_core_zero();
             let worker = std::thread::Builder::new()
                 .name(format!("telemetry-{name}"))
                 .spawn(move || {
                     #[cfg(windows)]
-                    if name == "pawnio/cpu-silicon" {
+                    if pin_core_zero {
                         pin_to_core_zero();
                     }
                     let mut due = Instant::now();

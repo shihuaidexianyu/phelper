@@ -13,7 +13,7 @@
 use crate::error::{HpWmiError, PlatformError};
 use crate::hp::{FanTable, SystemDesignData};
 use crate::policy::{
-    BoostPolicy, CpuPolicy, FanLevels, GpuPlatformPolicy, MuxMode, ThermalMode, WindowsPpmState,
+    BoostPolicy, FanLevels, GpuPlatformPolicy, MuxMode, ThermalMode, WindowsPpmState,
 };
 use crate::telemetry::{CpuSiliconSample, GpuSample, PowerSample, ProviderStatus, SystemSample};
 
@@ -21,21 +21,30 @@ use crate::telemetry::{CpuSiliconSample, GpuSample, PowerSample, ProviderStatus,
 /// thread owns the WMI connection — COM apartment affinity + non-reentrant
 /// firmware AML make a single serialization point the correct shape).
 pub trait HpPlatform: Send {
-    /// 0x10 fan count. ALSO the keep-alive heartbeat op: calling it
-    /// maintains user-defined thermal/fan states (hp-wmi.c comment,
-    /// manual-fan series c203c59fb5).
+    /// 0x10 fan count read.
     fn fan_count(&self) -> Result<u8, HpWmiError>;
+    /// Keep-alive heartbeat (§33.1). The wire op IS the 0x10 fan-count read
+    /// — the firmware has no notion of caller identity and only watches
+    /// "was 0x10 called recently" (hp-wmi.c manual-fan series c203c59fb5).
+    /// The split exists to make INTENT visible: probes call `fan_count` as
+    /// a read, the KeepAliveService calls THIS method because maintaining
+    /// user-defined thermal/fan states is its purpose, not a hidden side
+    /// effect of "harmlessly querying the fan count".
+    fn heartbeat(&self) -> Result<u8, HpWmiError> {
+        self.fan_count()
+    }
     /// 0x28 system design data.
     fn system_design_data(&self) -> Result<SystemDesignData, HpWmiError>;
     /// 0x2F fan table (input: 4 zero bytes).
     fn fan_table(&self) -> Result<FanTable, HpWmiError>;
     /// 0x2D current fan levels (100-RPM units on V1).
     fn fan_levels(&self) -> Result<FanLevels, HpWmiError>;
-    /// Original sample time, preserved when the actor shares its 1 Hz cache.
-    fn fan_levels_sample(&self) -> Result<(FanLevels, std::time::Instant), HpWmiError> {
-        self.fan_levels()
-            .map(|levels| (levels, std::time::Instant::now()))
-    }
+    /// Fan levels together with the ORIGINAL sample time. Implementors that
+    /// share a cache (the actor's 1 Hz fan cache) must return the cached
+    /// timestamp, NOT the call time — that is the entire point of this
+    /// method. No default impl on purpose: a default returning
+    /// `Instant::now()` silently discarded exactly this contract (A9-2).
+    fn fan_levels_sample(&self) -> Result<(FanLevels, std::time::Instant), HpWmiError>;
     /// 0x21 GPU platform policy read.
     fn gpu_platform_policy(&self) -> Result<GpuPlatformPolicy, HpWmiError>;
     /// 0x52 MUX read (command group 0x01).
@@ -146,33 +155,5 @@ pub trait CpuPolicyBackend: Send {
     /// compatibility surface for the control path.
     fn read_windows_ppm_state(&self) -> Result<Option<WindowsPpmState>, PlatformError> {
         Ok(None)
-    }
-
-    /// Convert a complete backend read into the domain CPU model. This is a
-    /// convenience for future backends and makes the sparse-policy meaning
-    /// explicit at the port boundary.
-    fn read_cpu_policy(&self) -> Result<CpuPolicy, PlatformError> {
-        let (epp_ac, epp_dc) = self.read_epp()?;
-        let (epp1_ac, epp1_dc) = self.read_epp1()?;
-        let (max_freq_mhz_ac, max_freq_mhz_dc) = self.read_max_freq_mhz()?;
-        let (boost_policy_ac, boost_policy_dc) = self.read_boost_policy()?;
-        let (min_performance_ac, min_performance_dc) = self.read_min_performance()?;
-        let (max_performance_ac, max_performance_dc) = self.read_max_performance()?;
-        Ok(CpuPolicy {
-            epp_ac: Some(epp_ac),
-            epp_dc: Some(epp_dc),
-            epp1_ac: Some(epp1_ac),
-            epp1_dc: Some(epp1_dc),
-            max_freq_mhz_ac: Some(max_freq_mhz_ac),
-            max_freq_mhz_dc: Some(max_freq_mhz_dc),
-            boost_policy: None,
-            boost_policy_ac: Some(boost_policy_ac),
-            boost_policy_dc: Some(boost_policy_dc),
-            min_performance_ac: Some(min_performance_ac),
-            min_performance_dc: Some(min_performance_dc),
-            max_performance_ac: Some(max_performance_ac),
-            max_performance_dc: Some(max_performance_dc),
-            power_limits: None,
-        })
     }
 }

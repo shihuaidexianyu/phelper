@@ -46,11 +46,18 @@ pub struct ControlJournal {
     bios_version: String,
 }
 
-/// Rotate at open once the journal outgrows this. The old file becomes
-/// `<name>.1.jsonl` (exactly one generation kept) and a fresh file
-/// starts. Long-running sessions also checkpoint before truncating the
-/// active file; its previous contents remain durable in the backup.
+/// Rotate once the journal outgrows this: the active file becomes the
+/// one-generation backup `<name>.1.jsonl` and a fresh file starts. ONE
+/// rotation path (fsync → rename → reopen) serves both open-time and
+/// mid-session checkpoints (2026-09 review: open renamed while append
+/// copy+truncated — two paths, two subtle behaviors). The rename keeps
+/// the ~8 MB copy off the control thread.
+#[cfg(not(test))]
 const MAX_JOURNAL_BYTES: u64 = 8 * 1024 * 1024;
+/// Test builds shrink the threshold so the mid-session path is reachable
+/// without writing megabytes through fsync-per-entry appends.
+#[cfg(test)]
+const MAX_JOURNAL_BYTES: u64 = 1024;
 
 impl ControlJournal {
     /// Default location: `<data_dir>/state/control-journal.jsonl`.
@@ -70,9 +77,9 @@ impl ControlJournal {
             && meta.len() >= MAX_JOURNAL_BYTES
         {
             // One generation of history is enough for a single-machine
-            // tool. If the rename fails the file is opened in append mode
+            // tool. If the rotation fails the file is opened in append mode
             // anyway — keeping evidence beats keeping tidy.
-            let _ = std::fs::rename(path, path.with_extension("1.jsonl"));
+            let _ = Self::rotate_to_backup(path, None);
         }
         let file = OpenOptions::new()
             .create(true)
@@ -85,6 +92,31 @@ impl ControlJournal {
             board_id: board_id.to_string(),
             bios_version: bios_version.to_string(),
         })
+    }
+
+    /// The single rotation primitive (see MAX_JOURNAL_BYTES). `open_file` is
+    /// `Some` for mid-session checkpoints: it is flushed first, and the
+    /// CALLER MUST replace its handle with the returned one — writing
+    /// through the old handle after the rename would target the backup.
+    fn rotate_to_backup(
+        path: &Path,
+        open_file: Option<&std::fs::File>,
+    ) -> Result<std::fs::File, EngineError> {
+        if let Some(file) = open_file {
+            file.sync_all()
+                .map_err(|e| EngineError::Persistence(format!("journal fsync: {e}")))?;
+        }
+        let backup = path.with_extension("1.jsonl");
+        std::fs::rename(path, &backup).map_err(|e| {
+            EngineError::Persistence(format!("journal rotate to {}: {e}", backup.display()))
+        })?;
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| {
+                EngineError::Persistence(format!("journal reopen {}: {e}", path.display()))
+            })
     }
 
     pub fn new_entry(&self, origin: JournalOrigin, outcome: ControlOutcome) -> JournalEntry {
@@ -112,12 +144,10 @@ impl ControlJournal {
             .metadata()
             .is_ok_and(|m| m.len() >= MAX_JOURNAL_BYTES)
         {
-            let backup = self.path.with_extension("1.jsonl");
-            // Do not truncate if any checkpoint operation fails.
-            std::fs::copy(&self.path, &backup)
-                .and_then(|_| OpenOptions::new().write(true).open(backup)?.sync_all())
-                .and_then(|_| self.file.set_len(0))
-                .map_err(|e| EngineError::Persistence(format!("journal checkpoint: {e}")))?;
+            // Same rotation primitive as open-time. A checkpoint failure is
+            // an error (the entry is NOT written) — never truncate without
+            // the previous contents being durable in the backup.
+            self.file = Self::rotate_to_backup(&self.path, Some(&self.file))?;
         }
         self.file
             .write_all(line.as_bytes())
@@ -276,6 +306,59 @@ mod tests {
         }
         assert!(!path.with_extension("1.jsonl").exists());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"old\":true}\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mid_session_checkpoint_rotates_via_the_same_path() {
+        // Test builds shrink MAX_JOURNAL_BYTES to 1 KiB, so a handful of
+        // appends cross the threshold mid-session. The backup must hold
+        // everything written before the rotation, and the active file
+        // must start fresh — the exact contract the old copy+truncate
+        // path (and the rename path at open) must now share.
+        let dir =
+            std::env::temp_dir().join(format!("phelper-journal-midsession-{}", std::process::id()));
+        let path = dir.join("control-journal.jsonl");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut j = ControlJournal::open(&path, "8BAB", "F.30").unwrap();
+        let mut appended = 0usize;
+        while std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) < MAX_JOURNAL_BYTES {
+            let e = j.new_entry(JournalOrigin::User, sample_outcome());
+            j.append(&e).unwrap();
+            appended += 1;
+            assert!(appended < 64, "test entries never crossed the threshold");
+        }
+        let pre_count = std::fs::read_to_string(&path).unwrap().lines().count();
+        assert_eq!(pre_count, appended, "no rotation happened yet");
+
+        // The next append crosses the threshold and rotates.
+        let e = j.new_entry(JournalOrigin::User, sample_outcome());
+        j.append(&e).unwrap();
+
+        let backup = path.with_extension("1.jsonl");
+        let backup_text = std::fs::read_to_string(&backup).unwrap();
+        assert_eq!(
+            backup_text.lines().count(),
+            appended,
+            "backup holds exactly the pre-rotation entries"
+        );
+        let active = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            active.lines().count(),
+            1,
+            "the fresh active file holds only the post-rotation entry"
+        );
+        assert!(active.contains("\"origin\":\"user\""));
+
+        // And the journal keeps appending to the FRESH handle, not the backup.
+        let e = j.new_entry(JournalOrigin::Safety, sample_outcome());
+        j.append(&e).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
+        assert_eq!(backup_text.lines().count(), appended);
+
+        drop(j);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

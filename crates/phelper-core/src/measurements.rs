@@ -33,7 +33,7 @@ pub fn reports_dir() -> PathBuf {
     crate::persistence::data_dir().join("measurements")
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FrameSummary {
     pub pid: u32,
     pub swap_chain: String,
@@ -47,7 +47,7 @@ pub struct FrameSummary {
     pub rejected_rows: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CaptureReport {
     pub schema_version: u32,
     pub label: String,

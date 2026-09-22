@@ -316,6 +316,21 @@ pub enum BoostPolicy {
     EfficientAggressiveGuaranteed,
 }
 
+impl BoostPolicy {
+    /// Every variant, in wire order. The single ordering source for the CLI
+    /// value enumeration and the UI cycle picker — the front-ends each kept
+    /// a private mirror table before the 2026-09 review collapsed them.
+    pub const ALL: [BoostPolicy; 7] = [
+        BoostPolicy::Disabled,
+        BoostPolicy::Enabled,
+        BoostPolicy::Aggressive,
+        BoostPolicy::EfficientEnabled,
+        BoostPolicy::EfficientAggressive,
+        BoostPolicy::AggressiveGuaranteed,
+        BoostPolicy::EfficientAggressiveGuaranteed,
+    ];
+}
+
 /// Readback of the Windows processor-power-management settings for one
 /// power-source rail. `None` means that this setting is absent or could not
 /// be read on the current Windows/CPU combination.

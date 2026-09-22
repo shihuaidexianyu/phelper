@@ -69,7 +69,7 @@ pub struct ProfileSummary {
     pub builtin: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct AppState {
     pub engine: EngineStatus,
     pub identity: Option<phelper_domain::identity::DeviceIdentity>,
@@ -114,6 +114,21 @@ impl AppState {
     /// Write controls exist only when the coordinator is running.
     pub fn writes_available(&self) -> bool {
         matches!(self.engine, EngineStatus::Running)
+    }
+
+    /// UI repaint gate (shell.rs observer): has anything OUTSIDE the
+    /// telemetry snapshot changed? Implemented by comparing the whole
+    /// state with telemetry erased, so a field added to `AppState` JOINS
+    /// this gate automatically — the manual 14-field chain this replaces
+    /// (2026-09 review A7) had already silently missed `hardware`,
+    /// `identity` and `capture_report`. Telemetry-only changes are
+    /// throttled by the shell (1 Hz on live pages) instead.
+    pub fn control_changed(&self, other: &Self) -> bool {
+        let mut a = self.clone();
+        let mut b = other.clone();
+        a.telemetry = None;
+        b.telemetry = None;
+        a != b
     }
 
     // ---- reducers (pure; the pump drives them) ----
@@ -284,5 +299,60 @@ mod tests {
         let reg = crate::profiles::ProfileRegistry::with_builtins();
         s.set_profiles(&reg);
         assert!(s.profiles.len() >= 4);
+    }
+
+    #[test]
+    fn control_changed_ignores_telemetry_only_and_catches_every_field() {
+        // Telemetry-only changes must NOT wake the immediate-repaint gate.
+        let a = AppState::default();
+        let mut b = AppState {
+            telemetry: Some(Arc::new(TelemetrySnapshot::default())),
+            ..AppState::default()
+        };
+        assert!(!a.control_changed(&b));
+
+        // Every non-telemetry field participates — including `hardware` and
+        // `capture_report`, which the old manual 14-field chain in shell.rs
+        // had silently missed.
+        b.hardware.notes.push("x".into());
+        assert!(a.control_changed(&b));
+
+        let c = AppState::default();
+        let d = AppState {
+            capture_running: true,
+            ..AppState::default()
+        };
+        assert!(c.control_changed(&d));
+
+        // Arc'd reports compare by CONTENT, not pointer — same content
+        // behind a fresh Arc is still "unchanged".
+        let report = Arc::new(crate::measurements::CaptureReport {
+            schema_version: 1,
+            label: "l".into(),
+            executable: "e".into(),
+            process_creation_time: 0,
+            duration_s: 1.0,
+            presentmon_version: "v".into(),
+            frames: crate::measurements::FrameSummary {
+                pid: 1,
+                swap_chain: "s".into(),
+                frames: 1,
+                mean_fps: 60.0,
+                one_percent_low_fps: 40.0,
+                p95_ms: 10.0,
+                p99_ms: 20.0,
+                other_swap_chains: 0,
+                rejected_rows: 0,
+            },
+            hardware: Vec::new(),
+            csv_path: std::path::PathBuf::from("c"),
+            json_path: std::path::PathBuf::from("j"),
+            context: serde_json::Value::Null,
+        });
+        let mut e = AppState::default();
+        let mut f = AppState::default();
+        e.capture_report = Some(Arc::clone(&report));
+        f.capture_report = Some(Arc::clone(&report));
+        assert!(!e.control_changed(&f));
     }
 }

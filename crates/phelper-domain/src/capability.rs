@@ -37,7 +37,7 @@ pub enum FanScale {
     Percent,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FanCapabilities {
     pub count: u8,
     pub scale: FanScale,
@@ -61,7 +61,7 @@ impl Default for FanCapabilities {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PpmCapabilities {
     /// PERFEPP read/write via PowrProf.
     pub epp: Support,
@@ -95,7 +95,7 @@ impl PpmCapabilities {
 
 /// The full capability surface. Built by CapabilityService::probe() from the
 /// BoardProfile (upper bound) intersected with live probe results.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CapabilitySet {
     /// True when the board ID matched a known BoardProfile. False → the
     /// engine runs read-only diagnostics (AR-05/AR-06).

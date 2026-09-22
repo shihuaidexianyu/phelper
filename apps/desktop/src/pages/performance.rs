@@ -26,16 +26,20 @@ const CPU_ROWS: [&str; 5] = [
     "性能下限 %",
     "性能上限 %",
 ];
-const BOOSTS: [Option<BoostPolicy>; 8] = [
-    None,
-    Some(BoostPolicy::Disabled),
-    Some(BoostPolicy::Enabled),
-    Some(BoostPolicy::Aggressive),
-    Some(BoostPolicy::EfficientEnabled),
-    Some(BoostPolicy::EfficientAggressive),
-    Some(BoostPolicy::AggressiveGuaranteed),
-    Some(BoostPolicy::EfficientAggressiveGuaranteed),
-];
+// Boost cycle picker. Order is OWNED by `BoostPolicy::ALL` (domain): index
+// 0 is "inherit" (None), then every variant in wire order. Only the zh-CN
+// labels live here — an ALL reorder now fails the alignment test instead
+// of silently desyncing the labels (the two front-ends each kept a private
+// mirror table before the 2026-09 review collapsed them).
+const BOOSTS: [Option<BoostPolicy>; 8] = {
+    let mut all = [None; 8];
+    let mut i = 0;
+    while i < BoostPolicy::ALL.len() {
+        all[i + 1] = Some(BoostPolicy::ALL[i]);
+        i += 1;
+    }
+    all
+};
 const BOOST_LABELS: [&str; 8] = [
     "继承",
     "禁用睿频",
@@ -552,4 +556,24 @@ pub fn render(
             )
     });
     page_root("performance-scroll").child(content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The boost picker mirrors `BoostPolicy::ALL` — a domain reorder must
+    /// surface here, not as a silently wrong zh-CN label.
+    #[test]
+    fn boost_options_follow_domain_order() {
+        assert_eq!(BOOSTS[0], None, "index 0 is the inherit option");
+        for (i, policy) in BoostPolicy::ALL.iter().enumerate() {
+            assert_eq!(BOOSTS[i + 1], Some(*policy));
+        }
+        assert_eq!(
+            BOOSTS.len(),
+            BOOST_LABELS.len(),
+            "every option must have exactly one label"
+        );
+    }
 }

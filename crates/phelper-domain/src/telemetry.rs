@@ -277,7 +277,7 @@ impl ProviderStatus {
 }
 
 /// Point-in-time view of the whole telemetry state.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TelemetrySnapshot {
     pub samples: BTreeMap<MetricId, MetricSample>,
     pub providers: BTreeMap<&'static str, ProviderStatus>,

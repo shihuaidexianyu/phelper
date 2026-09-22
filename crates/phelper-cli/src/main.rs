@@ -63,6 +63,34 @@ pub(crate) fn ctrlc_flag() -> Result<Arc<AtomicBool>> {
     Ok(stop)
 }
 
+// Shared hold loops (2026-09 review: three hand-rolled copies had started
+// to drift). HP-state commands reject `hold == 0` in `plan()` — a firmware
+// write without a bounded heartbeat window would bypass the graceful-
+// restore contract — so they only ever use the bounded variant. Os-policy
+// verbs define `hold == 0` as "until Ctrl+C" (their restore rides on
+// process exit, not on a firmware lease).
+
+/// Sleep in 200 ms slices until Ctrl+C fires (returns `true`) or the
+/// deadline elapses (returns `false`).
+pub(crate) fn hold_bounded(stop: &AtomicBool, hold_secs: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(hold_secs);
+    while !stop.load(Ordering::Relaxed) {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200).min(deadline - now));
+    }
+    true
+}
+
+/// Sleep in 200 ms slices until Ctrl+C fires.
+pub(crate) fn hold_until_ctrlc(stop: &AtomicBool) {
+    while !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
