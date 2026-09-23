@@ -4,7 +4,7 @@
 ; PresentMon is a pinned portable console, installed with its license.
 
 #ifndef MyAppVersion
-#define MyAppVersion "0.2.0"
+#define MyAppVersion "0.3.0"
 #endif
 
 #ifndef BuildDir

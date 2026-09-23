@@ -1,14 +1,26 @@
-# Current scope update — 2026-09-05
+# Current scope update — 2026-09-23
 
-The user approved OGH replacement stages 1–4. The authoritative implementation
-and acceptance status is [docs/ogh-milestones.md](docs/ogh-milestones.md).
-This supersedes the dated minimal-UI reduction below: the desktop now includes
-Performance, Automation, Validation and Hardware pages. Historical HIL results
-do not certify the new control/automation/MUX paths. MUX is dev-feature gated;
-desktop writes additionally require same-board, same-BIOS round-trip reboot
-evidence. Undervolting remains unavailable: OEM XTU components were found but
-ABI/readback/recovery are unverified, and VBS is running on the reference machine.
-No EC or MSR write path was added.
+v0.3.0 shipped (theme: verification-debt + architecture-debt). W-B landed
+(A7/A9 + small items; journal rotation unified to fsync→rename→reopen — fixing
+the v0.2.0 append-time rotation that lost 50,861 §56 evidence entries on-device
+once the journal crossed 8 MiB), F1 low-battery hysteresis classifier landed,
+and the session-A baseline re-probe confirmed zero WMI-timing regression. The
+V1–V9 on-device verification round ([docs/v0.3.0-wa-runbook.md](docs/v0.3.0-wa-runbook.md))
+is intentionally allowed to run past this tag; its records append to
+[docs/ogh-milestones.md](docs/ogh-milestones.md) as sessions complete. A3's
+second half (exec_* skeleton generalization + coordinator file split) remains
+a registered special-topic pass.
+
+Hardware capability disclosures are now evidence-settled (probe rounds
+2026-09-22/23): battery charge threshold and memory OC — the firmware exposes
+no interface (both hpqBIntM command groups swept 0x00–0x5F read-only, plus the
+hpCpsPub serial channel exhausted); CPU undervolt/OC — **shelved by user
+decision** (runtime path double-locked by Intel UVP + VBS, and the HP laptop
+BIOS exposes no UVP switch; the only reachable path is OGH-style BIOS-variable
+pre-boot, which requires a reboot and conflicts with the
+runtime-transparent-control + restore-on-exit form factor). MUX stays
+dev-feature gated pending V4 dual-reboot evidence. No EC or MSR write path
+was added.
 
 # CLAUDE.md
 

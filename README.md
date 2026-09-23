@@ -73,13 +73,13 @@ cargo build -p phelper-desktop --release
 编译安装包需要 Inno Setup 6：
 
 ```powershell
-.\installer\build-installer.ps1 -Version 0.2.0
+.\installer\build-installer.ps1 -Version 0.3.0
 ```
 
 如果 Release exe 已经是最新的，可以跳过 Rust 编译：
 
 ```powershell
-.\installer\build-installer.ps1 -SkipBuild -Version 0.2.0
+.\installer\build-installer.ps1 -SkipBuild -Version 0.3.0
 ```
 
 应用图标、PawnIO 模块和运行资源都已嵌入 exe，不需要在程序旁边放额外的 assets 目录。

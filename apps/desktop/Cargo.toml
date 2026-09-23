@@ -1,6 +1,6 @@
 [package]
 name = "phelper-desktop"
-version = "0.2.0"
+version = "0.3.0"
 edition.workspace = true
 license.workspace = true
 description = "GPUI desktop shell for phelper (OMEN 16-wf0032TX / board 8BAB). Self-elevating (runas relaunch) — see below."
