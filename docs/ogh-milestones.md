@@ -173,3 +173,46 @@ SecurityServices={2}）——Intel 文档列为运行时降压限制条件。CPU
 证据：`probe-out/hp-cmd-scan.txt`（Gaming 组）、`hp-cmd-scan-legacy.txt`
 （LegacyRead 组）、`hp-battery-retry.txt`（输入重试）、`battery-report.xml`
 （字段对照）。
+
+## 2026-09-23 硬件能力深挖轮（hpCpsPub 穷尽 / XTU 栈 / Intel UVP 表）
+
+上一轮探测的后续深挖（UAC 协助模式 ×2 批次，全部只读）。
+
+**hpCpsPub 通道穷尽（电池充电上限终局）**：hpCpsPubGetSetCommand 实例
+`ACPI\PNP0C14\H19P_0` 仅有 Active/InstanceName 两属性，**无命令注册表**；
+hpCpsPubEvent 0 实例；root\WMI 全部 hp* 类（9 个）已完整枚举，无其他隐藏
+通道。字符串命令名无任何线索来源（注册表 HKLM\SOFTWARE\HP 无 battery 痕
+迹；无公开文档；OGH 已卸载无法抓包）。理论残余仅"重装 OGH 抓包"——成本
+远超收益。**电池充电上限判定：通道穷尽，本机不可达成立。**
+
+**XTU 驱动栈实测在位（降压/超频路径升级）**：XtuService.exe
+（SysWOW64）+ XTUComponent 内核驱动（iocbios2.sys，Running）+
+IntelOverclockingSDK.dll（783 KB，无导出=静态链接私有库）+
+IntelXTUOverclockingService.dll（导出 HPCreateService 工厂）+
+SdkWrapperForNativeCode.dll（46 个 C++ mangled 导出，OGH 调谐封装层，
+含 IsOverclockSupported/GetControl/ApplyChanges）+ Platform.dll（21 个
+C 导出，含 GetOCFuseStatus/IsVBSCheckRequired/SetCurrentVoltage，命名
+偏 AMD 栈）+ PawnIO.sys 运行中（用户所装监控工具残留）。另有
+AmdRyzenOverclockingService.dll 佐证双栈设计。
+
+**Intel UVP 官方配置表（文档 000094219）裁决**：VBS 激活时（本机
+Win32_DeviceGuard Status=2 运行中），无论 UVP 开关，runtime 降压与
+runtime OC 双双被禁；解锁路径 = 关闭 VBS（内存完整性）+ BIOS UVP 项
+（HP 笔记本通常不暴露）。13900HX 属 12 代+，UVP 默认启用（HP 默认）。
+v0.4.0 §57 立项条件从"ABI 可行性未知"升级为"ABI 已在位、门控源明确
+（VBS）、剩余为服务对象 ABI 逆向与 UVP 门控实测"。
+
+**LegacyRead 语义补遗（均登记待验证，不进稳定路径）**：
+- 0x08：静态（三次读数逐字节一致）13 值表 305/430/438/439/411/511/
+  611/612/413/613/614/615/616 + 0xFFFF 哨兵 + 尾部三连号 8602/8603/
+  8604。前段疑似 V/F 曲线点位，但尾部值无法用电压解释，语义无交叉验
+  证源。
+- 0x56：带任意非空输入可读，**动态**（两次采样部分字节缓慢增长，含
+  4 字节周期模式），疑似固件度量/计数器。
+- 0x5a：恒定 00 FF 状态对。
+- 0x51/0x53：空/零/非零 4B（1/2/3/FF）全部输入形态穷尽仍 rc=3/4，
+  需语义级输入，紧邻 MUX(0x52) 疑似 GPU 域，关闭。
+- BatteryStaticData 类提权下仍 CIM 常规故障（provider 层问题）；
+  powercfg /batteryreport 提供等价数据。
+
+证据：`probe-out/deep-probe-batch.txt`、`final-detail-probe.txt`。
