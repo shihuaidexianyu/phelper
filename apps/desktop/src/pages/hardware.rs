@@ -48,7 +48,7 @@ pub fn render(state: &AppState, app: &AppHandle, cx: &mut Context<ShellView>) ->
             match state.hardware.vbs_status { Some(0) => "未启用", Some(1) => "已启用但未运行", Some(2) => "正在运行", _ => "未知" })))
         .child(div().text_sm().text_color(theme.muted_foreground).child("以下能力按 2026-09-23 实机探测结论披露（hpqBIntM 两条命令空间只读全扫 + hpCpsPub 通道穷尽）；证据记录见 ogh-milestones.md。"));
     for (name, reason) in [
-        ("CPU 降压", "XTU 驱动栈在位（iocbios2+SDK），但本机 VBS 激活：Intel 官方裁决 runtime 降压禁用；待 v0.4.0 立项"),
+        ("CPU 降压", "runtime 路径被 UVP+VBS 双锁（HP BIOS 不暴露 UVP 开关，无解）；BIOS 路径需重启生效，已裁决搁置"),
         ("CPU 超频", "与降压同通道，VBS 激活下 runtime OC 同禁；实用部分已由功耗墙（EXPERIMENTAL）覆盖"),
         ("内存超频", "已实测：固件两条命令空间（0x00–0x5F）未暴露任何内存超频接口"),
         ("电池充电上限", "已实测：全部已知通道穷尽（两条命令空间 + hpCpsPub 串行通道），本机固件不提供"),

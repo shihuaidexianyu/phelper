@@ -63,12 +63,13 @@ impl HardwareStatus {
         //   "未确定"升级为"已探测不存在"。
         // - 内存超频：同一扫描无任何内存相关命令 → 本机固件未暴露。
         // - CPU 降压/超频：XTU3SERVICE 与 HPOmenCap 在运行（OEM 驱动栈在
-        //   位），但 VBS 正在运行，Intel 文档将其列为运行时降压限制条件 →
-        //   后端存在、可用性受阻，仍属 §57 五阶段调研范围。
+        //   位），但 runtime 路径被 UVP+VBS 双锁（UVP enabled 时无论 VBS
+        //   开关均禁，HP BIOS 不暴露 UVP 项）→ 已裁决搁置（2026-09-23，
+        //   见 v0.3.0-plan.md §9/§10）。
         // 附带发现：LegacyRead 0x07 电池信息查询真实可用（电芯电压/组电压
         // 12.756V/序列号 1963 与 powercfg 报告对照一致，0x10 返回制造日期
         // 20230226）——登记 backlog，完整字段解码需另行交叉验证。
-        result.notes.push("电池充电上限与内存超频：本机固件未暴露接口（hpqBIntM 两组命令空间 0x00–0x5F 已实测 + hpCpsPub 串行通道穷尽）。CPU 降压/超频：XTU 驱动栈在位（iocbios2 内核驱动 + IntelOverclockingSDK），但本机 VBS 激活，Intel 官方配置表裁决 runtime 降压/超频双禁；待 v0.4.0 立项。".into());
+        result.notes.push("电池充电上限与内存超频：本机固件未暴露接口（hpqBIntM 两组命令空间 0x00–0x5F 已实测 + hpCpsPub 串行通道穷尽）。CPU 降压：runtime 路径被 UVP+VBS 双锁（HP BIOS 不暴露 UVP 开关，无解），BIOS 预启动路径需重启生效——已裁决搁置（2026-09-23）；超频同通道，实用部分由功耗墙覆盖。".into());
         result
     }
 }
