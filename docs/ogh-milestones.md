@@ -216,3 +216,41 @@ v0.4.0 §57 立项条件从"ABI 可行性未知"升级为"ABI 已在位、门控
   powercfg /batteryreport 提供等价数据。
 
 证据：`probe-out/deep-probe-batch.txt`、`final-detail-probe.txt`。
+
+## 2026-09-23 外部验证轮（OGH 降压先例 / HP VBS 官方文档 / hpCpsPub 新假设）
+
+对本机探测结论做外部交叉验证（网络调查），三项佐证、一项修正、一条新假设：
+
+**佐证 1（HP 官方）**：HP 公告 ish_13030512（2022-03 生效，2025-09 修订）
+明确：VBS 启用时，使用 XTU SDK 的 HP 应用（OMEN Gaming Hub、HP Command
+Center）"降电压功能可能无法工作""英特尔超频功能可能无法工作"，并可能
+连带风扇/性能模式失效；适用范围含 OMEN 16-k/n、Victus 16-d/e 等系列。
+该公告**反向证明 OGH 在 OMEN 机型具备降压/超频功能**（VBS 关闭时可用）。
+
+**佐证 2（社区实测）**：TechPowerUp Victus 16-r1xxx（i7-14700HX，BIOS
+F.12）案例——ThrottleStop 降压被 BIOS 锁位（CFG Lock/OC Lock，Insyde
+EFI 写保护不可改）完全锁死，但 **OGH 降压功能可用**（仅 CPU Core）。
+ThrottleStop 作者 unclewebb 判定：OGH 走 **BIOS 变量预启动应用 + 锁位**，
+非运行时 MSR——解释了锁位为何挡不住 OGH。
+
+**佐证 3（ThrottleStop 作者，12900HX Lenovo 案例）**："ThrottleStop needs
+direct access to the voltage control register. That is not possible when
+VBS is enabled"——与 HP 公告、Intel UVP 表三方独立一致，本机"VBS 激活 →
+runtime 降压/OC 封堵"结论零修正。
+
+**修正**：phelper v0.4.0 降压立项从"可行性未知"升级为"**HP 自家已有先例
+（OGH 已实现）**，通道 = BIOS 变量预启动或 XTU SDK（VBS off）"。
+
+**新假设（hpCpsPub 通道重估）**：Victus 案例证明 OGH 能写 BIOS 级变量
+（降压锁变量），其通道可能即 hpCpsPub 字符串命令接口。"重装 OGH 抓包"
+的理论残余因此从"为电池阈值"转向"**为降压 BIOS 变量逆向**"，获得实际
+价值（v0.4.0 候选路径之一）。
+
+**电池充电上限维持不可达（OS 层）**：无任何第三方在 OMEN/Victus 游戏本
+上实现的证据；声称 OmenSuperHub 支持充电阈值的文章均为 AI 生成推广内容
+（无源码佐证，OSH 实查仅风扇/功耗/键盘灯命令）。**残留盲区**：BIOS
+Setup 菜单选项与 WMI 接口是两回事，F10 目验 Battery Health Manager /
+Adaptive Battery Optimizer 待用户操作后闭合（若 BIOS 有 80% 硬阈值，
+仅影响披露文案，不影响 OS 层接口结论）。
+
+**内存超频**：无翻案证据，维持死案。
